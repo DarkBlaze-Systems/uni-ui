@@ -18,11 +18,59 @@ use winit::window::{Window, WindowId};
 const SRC: &str = r#"
 Stack {
     padding: 24px;
-    spacing: 12px;
+    gap: 20px;
     background: #0a0a0a;
-    Text { content: "Uni-UI"; size: 48px; color: #ffffff; }
-    Text { content: "rendered from .uni"; size: 18px; color: #a3a3a3; }
-    Rect { width: 240px; height: 96px; color: #7d39eb; corner_radius: 16px; }
+
+    Text { content: "Uni-UI — real layout + frosted glass"; size: 32px; color: #ffffff; }
+
+    // A flex Row of two cards that grow to share the width equally.
+    Row {
+        gap: 16px;
+        height: 220px;
+
+        Stack {
+            grow: 1;
+            padding: 16px;
+            gap: 8px;
+            background: #1b1033;
+            corner_radius: 16px;
+            Text { content: "Card A"; size: 22px; color: #d6c7ff; }
+            Rect { height: 80px; color: #7d39eb; corner_radius: 12px; }
+        }
+
+        Stack {
+            grow: 1;
+            padding: 16px;
+            gap: 8px;
+            background: #07212b;
+            corner_radius: 16px;
+            Text { content: "Card B"; size: 22px; color: #b9eaff; }
+            Rect { height: 80px; color: #1fb6c8; corner_radius: 12px; }
+        }
+    }
+
+    // Colorful rects behind the glass, laid out in a Row.
+    Row {
+        gap: 12px;
+        height: 120px;
+        Rect { grow: 1; color: #eb3970; corner_radius: 12px; }
+        Rect { grow: 1; color: #ebc739; corner_radius: 12px; }
+        Rect { grow: 1; color: #39eb7d; corner_radius: 12px; }
+
+        // A translucent frosted panel floating *over* the colorful rects
+        // (absolute position, so it overlaps them rather than taking a column).
+        // It blurs everything painted before it in the scene (painter's order).
+        Frost {
+            position: "absolute";
+            left: 90px;
+            top: 16px;
+            width: 280px;
+            height: 88px;
+            tint: #ffffff40;
+            blur_radius: 14px;
+            corner_radius: 16px;
+        }
+    }
 }
 "#;
 
