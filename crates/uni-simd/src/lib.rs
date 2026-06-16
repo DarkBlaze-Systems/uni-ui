@@ -306,6 +306,132 @@ pub fn transform_points(points: &mut [(f32, f32)], m: [f32; 6]) {
     }
 }
 
+// ===========================================================================
+// 4. Batch spring integration — one semi-implicit (symplectic) Euler step
+//    over a whole pool of independent 1-D damped harmonic oscillators.
+//
+//    The per-spring math (see `uni-spring`) is:
+//
+//        accel = (-k*(x - target) - c*v) / m
+//        v += accel * dt          // velocity first
+//        x += v * dt              // then position, using the *new* v
+//
+//    All springs in a batch share one set of constants `(k, c, m)`; only the
+//    state (value / velocity / target) varies per channel. That is exactly the
+//    shape SIMD wants: broadcast the constants once, stream the state in planar
+//    SoA slices, and fuse-multiply whole registers at a time.
+// ===========================================================================
+
+/// Scalar reference: advance one symplectic-Euler step over `values` /
+/// `velocities` toward `targets`, using shared constants `k, c, inv_m` and
+/// timestep `dt`. The three state slices must be the same length.
+///
+/// `inv_m` is `1.0 / mass`, pre-reciprocated by the caller so the hot loop is
+/// pure multiply/add with no per-lane division.
+pub fn integrate_springs_scalar(
+    values: &mut [f32],
+    velocities: &mut [f32],
+    targets: &[f32],
+    k: f32,
+    c: f32,
+    inv_m: f32,
+    dt: f32,
+) {
+    assert_eq!(
+        values.len(),
+        velocities.len(),
+        "value/velocity length mismatch"
+    );
+    assert_eq!(values.len(), targets.len(), "value/target length mismatch");
+    for ((x, v), t) in values.iter_mut().zip(velocities.iter_mut()).zip(targets) {
+        let accel = (-k * (*x - *t) - c * *v) * inv_m;
+        *v += accel * dt;
+        *x += *v * dt;
+    }
+}
+
+struct IntegrateKernel<'a> {
+    values: &'a mut [f32],
+    velocities: &'a mut [f32],
+    targets: &'a [f32],
+    k: f32,
+    c: f32,
+    inv_m: f32,
+    dt: f32,
+}
+
+impl<'a> WithSimd for IntegrateKernel<'a> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let kv = simd.splat_f32s(-self.k * self.inv_m);
+        let cv = simd.splat_f32s(-self.c * self.inv_m);
+        let dtv = simd.splat_f32s(self.dt);
+
+        let (xh, xt) = S::as_mut_simd_f32s(self.values);
+        let (vh, vt) = S::as_mut_simd_f32s(self.velocities);
+        let (th, tt) = S::as_simd_f32s(self.targets);
+
+        for ((x, v), t) in xh.iter_mut().zip(vh.iter_mut()).zip(th) {
+            // accel = -k*inv_m*(x - t) - c*inv_m*v
+            let disp = simd.sub_f32s(*x, *t);
+            let accel = simd.mul_add_f32s(kv, disp, simd.mul_f32s(cv, *v));
+            // v += accel * dt
+            let nv = simd.mul_add_f32s(accel, dtv, *v);
+            // x += v * dt   (uses the just-updated v — symplectic)
+            let nx = simd.mul_add_f32s(nv, dtv, *x);
+            *v = nv;
+            *x = nx;
+        }
+        // Scalar tail for the ragged remainder past the last full register.
+        let (k, c, inv_m, dt) = (self.k, self.c, self.inv_m, self.dt);
+        for ((x, v), t) in xt.iter_mut().zip(vt.iter_mut()).zip(tt) {
+            let accel = (-k * (*x - *t) - c * *v) * inv_m;
+            *v += accel * dt;
+            *x += *v * dt;
+        }
+    }
+}
+
+/// Runtime-dispatched batch spring step: one symplectic-Euler integration of a
+/// whole pool of springs sharing constants `k`, `c`, `inv_m` (`= 1/mass`) and
+/// timestep `dt`.
+///
+/// `values`, `velocities` and `targets` are planar SoA slices of equal length —
+/// channel `i` is `(values[i], velocities[i], targets[i])`. Selected at runtime
+/// via [`pulp::Arch`]. Uses fused multiply-add on the SIMD path, so results
+/// match [`integrate_springs_scalar`] to within fp rounding (epsilon-equal, not
+/// necessarily bit-equal, when FMA is available).
+pub fn integrate_springs(
+    values: &mut [f32],
+    velocities: &mut [f32],
+    targets: &[f32],
+    k: f32,
+    c: f32,
+    inv_m: f32,
+    dt: f32,
+) {
+    assert_eq!(
+        values.len(),
+        velocities.len(),
+        "value/velocity length mismatch"
+    );
+    assert_eq!(values.len(), targets.len(), "value/target length mismatch");
+    if values.is_empty() {
+        return;
+    }
+    Arch::new().dispatch(IntegrateKernel {
+        values,
+        velocities,
+        targets,
+        k,
+        c,
+        inv_m,
+        dt,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +561,57 @@ mod tests {
         let mut p = vec![(0.0f32, 0.0f32), (1.0, 1.0), (-2.0, 3.0)];
         transform_points(&mut p, translate);
         assert_eq!(p, vec![(10.0, -5.0), (11.0, -4.0), (8.0, -2.0)]);
+    }
+
+    #[test]
+    fn integrate_springs_simd_matches_scalar_within_epsilon() {
+        // Spatial preset constants: k=400, c=30, m=1.
+        let (k, c, inv_m, dt) = (400.0f32, 30.0f32, 1.0f32, 1.0 / 240.0);
+        // Cross the SIMD/tail boundary at several widths.
+        for &n in &[0usize, 1, 3, 7, 8, 9, 16, 17, 31, 10_000] {
+            let mut r = Rng::new(0x5EED_1234 ^ n as u64);
+            let xs: Vec<f32> = (0..n).map(|_| r.next_f32() * 10.0 - 5.0).collect();
+            let vs: Vec<f32> = (0..n).map(|_| r.next_f32() * 4.0 - 2.0).collect();
+            let ts: Vec<f32> = (0..n).map(|_| r.next_f32() * 10.0 - 5.0).collect();
+
+            let (mut xa, mut va) = (xs.clone(), vs.clone());
+            let (mut xb, mut vb) = (xs.clone(), vs.clone());
+            // Run several steps so any per-step drift accumulates.
+            for _ in 0..200 {
+                integrate_springs_scalar(&mut xa, &mut va, &ts, k, c, inv_m, dt);
+                integrate_springs(&mut xb, &mut vb, &ts, k, c, inv_m, dt);
+            }
+            for i in 0..n {
+                assert!(
+                    (xa[i] - xb[i]).abs() <= 1e-2,
+                    "value drift at n={n} i={i}: {} vs {}",
+                    xa[i],
+                    xb[i]
+                );
+                assert!(
+                    (va[i] - vb[i]).abs() <= 1e-2,
+                    "velocity drift at n={n} i={i}: {} vs {}",
+                    va[i],
+                    vb[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integrate_springs_settles_to_target() {
+        // A pool of effects springs (critically damped) must converge to target.
+        let (k, c, inv_m, dt) = (400.0f32, 40.0f32, 1.0f32, 1.0 / 240.0);
+        let n = 256;
+        let mut xs = vec![0.0f32; n];
+        let mut vs = vec![0.0f32; n];
+        let ts: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        for _ in 0..5000 {
+            integrate_springs(&mut xs, &mut vs, &ts, k, c, inv_m, dt);
+        }
+        for i in 0..n {
+            assert!((xs[i] - ts[i]).abs() < 1e-2, "spring {i} did not settle");
+            assert!(vs[i].abs() < 1e-2, "spring {i} still moving");
+        }
     }
 }

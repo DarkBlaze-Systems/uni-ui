@@ -355,6 +355,155 @@ impl<const N: usize> SpringVec<N> {
     }
 }
 
+// --- Batch pool (std only) ---------------------------------------------------
+//
+// `SpringVec<N>` drives a handful of channels that belong to *one* widget.
+// `SpringPool` is the other axis: thousands of *independent* springs sharing one
+// set of physics constants — every animating property in a running UI tree. That
+// per-channel integration loop is exactly the planar-SoA, broadcast-the-constants
+// workload SIMD wants, so the pool delegates its step to `uni-simd`'s
+// runtime-dispatched [`integrate_springs`] kernel. (Requires the `std` feature
+// for heap storage; the rest of the crate stays `#![no_std]`.)
+
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "std")]
+pub use pool::SpringPool;
+
+#[cfg(feature = "std")]
+mod pool {
+    use crate::{Spring, MIN_MASS};
+    use std::vec::Vec;
+
+    /// A pool of independent springs that share one [`Spring`]'s constants.
+    ///
+    /// Storage is **struct-of-arrays**: values, velocities and targets each live
+    /// in their own contiguous `Vec`, which is what lets [`SpringPool::step`]
+    /// hand whole registers to `uni-simd` without any per-element gather.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct SpringPool {
+        values: Vec<f32>,
+        velocities: Vec<f32>,
+        targets: Vec<f32>,
+        spring: Spring,
+    }
+
+    impl SpringPool {
+        /// Empty pool driven by `spring`.
+        #[inline]
+        #[must_use]
+        pub fn new(spring: Spring) -> Self {
+            Self {
+                values: Vec::new(),
+                velocities: Vec::new(),
+                targets: Vec::new(),
+                spring,
+            }
+        }
+
+        /// A pool of `n` springs at rest on `value`, each targeting `value`.
+        #[must_use]
+        pub fn filled(spring: Spring, n: usize, value: f32) -> Self {
+            Self {
+                values: std::vec![value; n],
+                velocities: std::vec![0.0; n],
+                targets: std::vec![value; n],
+                spring,
+            }
+        }
+
+        /// Append a channel; returns its index.
+        pub fn push(&mut self, value: f32, target: f32) -> usize {
+            let i = self.values.len();
+            self.values.push(value);
+            self.velocities.push(0.0);
+            self.targets.push(target);
+            i
+        }
+
+        /// Number of channels.
+        #[inline]
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        /// Whether the pool holds no channels.
+        #[inline]
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.values.is_empty()
+        }
+
+        /// Redirect channel `i` to `target`, preserving its velocity.
+        #[inline]
+        pub fn set_target(&mut self, i: usize, target: f32) {
+            self.targets[i] = target;
+        }
+
+        /// Read channel `i`'s current value.
+        #[inline]
+        #[must_use]
+        pub fn value(&self, i: usize) -> f32 {
+            self.values[i]
+        }
+
+        /// The current values of every channel (in push order).
+        #[inline]
+        #[must_use]
+        pub fn values(&self) -> &[f32] {
+            &self.values
+        }
+
+        /// Advance the whole pool by `dt` seconds with one symplectic-Euler step,
+        /// offloaded to `uni-simd`'s runtime-dispatched SIMD kernel.
+        ///
+        /// Non-positive `dt` is a no-op (matching [`crate::SpringState::step`]).
+        pub fn step(&mut self, dt: f32) {
+            if dt <= 0.0 {
+                return;
+            }
+            let m = if self.spring.mass > MIN_MASS {
+                self.spring.mass
+            } else {
+                MIN_MASS
+            };
+            uni_simd::integrate_springs(
+                &mut self.values,
+                &mut self.velocities,
+                &self.targets,
+                self.spring.stiffness,
+                self.spring.damping,
+                1.0 / m,
+                dt,
+            );
+        }
+
+        /// Reference scalar step (no SIMD) — the source of truth the batched
+        /// kernel is validated against, and the baseline for the bench.
+        pub fn step_scalar(&mut self, dt: f32) {
+            if dt <= 0.0 {
+                return;
+            }
+            let m = if self.spring.mass > MIN_MASS {
+                self.spring.mass
+            } else {
+                MIN_MASS
+            };
+            uni_simd::integrate_springs_scalar(
+                &mut self.values,
+                &mut self.velocities,
+                &self.targets,
+                self.spring.stiffness,
+                self.spring.damping,
+                1.0 / m,
+                dt,
+            );
+        }
+    }
+}
+
 // --- std-free math helpers ---------------------------------------------------
 //
 // `#![no_std]` means we avoid pulling in the platform libm. These tiny
@@ -426,7 +575,10 @@ mod tests {
         let mut s = SpringState::new(0.0, 1.0);
         let (steps, peak_past) = run(&mut s, &spring, 1e-4);
         assert!(peak_past > 0.0, "spatial spring should overshoot target");
-        assert!(steps < MAX_STEPS, "spatial spring should settle in finite steps");
+        assert!(
+            steps < MAX_STEPS,
+            "spatial spring should settle in finite steps"
+        );
         assert!(s.is_settled(1e-4));
     }
 
@@ -580,5 +732,85 @@ mod tests {
         s.step(&spring, -0.5);
         assert_eq!(s.value, 0.0);
         assert_eq!(s.velocity, 0.0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pool_step_matches_single_state_step() {
+        // A pool channel must integrate identically to a lone `SpringState`
+        // taking the same constants and `dt` — same model, same answer.
+        let spring = Spring::spatial();
+        let mut pool = SpringPool::new(spring);
+        let i = pool.push(0.0, 1.0);
+
+        let mut s = SpringState::new(0.0, 1.0);
+        for _ in 0..500 {
+            pool.step(DT);
+            s.step(&spring, DT);
+        }
+        // Single-state uses `/ mass`; pool uses `* (1/mass)`. mass == 1 here, so
+        // the two are bit-identical along the SIMD-free (single-lane) tail.
+        assert!(
+            (pool.value(i) - s.value).abs() < 1e-4,
+            "{} vs {}",
+            pool.value(i),
+            s.value
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pool_settles_a_full_batch() {
+        let mut pool = SpringPool::filled(Spring::effects(), 10_000, 0.0);
+        for i in 0..pool.len() {
+            pool.set_target(i, 1.0);
+        }
+        for _ in 0..5000 {
+            pool.step(DT);
+            if pool.values().iter().all(|&v| abs(v - 1.0) < 1e-3) {
+                break;
+            }
+        }
+        assert!(
+            pool.values().iter().all(|&v| abs(v - 1.0) < 1e-2),
+            "batch did not settle"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pool_simd_and_scalar_paths_agree() {
+        let spring = Spring::spatial_expressive();
+        let mut a = SpringPool::filled(spring, 1234, 0.0);
+        let mut b = SpringPool::filled(spring, 1234, 0.0);
+        for i in 0..a.len() {
+            let t = (i as f32) * 0.01 - 6.0;
+            a.set_target(i, t);
+            b.set_target(i, t);
+        }
+        for _ in 0..300 {
+            a.step(DT);
+            b.step_scalar(DT);
+        }
+        for i in 0..a.len() {
+            assert!(
+                abs(a.value(i) - b.value(i)) < 1e-2,
+                "simd/scalar drift at {i}: {} vs {}",
+                a.value(i),
+                b.value(i)
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pool_ignores_nonpositive_dt() {
+        let mut pool = SpringPool::filled(Spring::spatial(), 16, 0.0);
+        for i in 0..pool.len() {
+            pool.set_target(i, 1.0);
+        }
+        pool.step(0.0);
+        pool.step(-1.0);
+        assert!(pool.values().iter().all(|&v| v == 0.0));
     }
 }

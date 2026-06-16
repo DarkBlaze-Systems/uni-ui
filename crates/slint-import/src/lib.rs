@@ -34,14 +34,46 @@ pub struct SlintImportError {
 
 impl std::fmt::Display for SlintImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "slint-import error at line {}: {}", self.line, self.message)
+        write!(
+            f,
+            "slint-import error at line {}: {}",
+            self.line, self.message
+        )
     }
 }
 
 impl std::error::Error for SlintImportError {}
 
 fn err(msg: impl Into<String>, line: usize) -> SlintImportError {
-    SlintImportError { message: msg.into(), line }
+    SlintImportError {
+        message: msg.into(),
+        line,
+    }
+}
+
+// ─────────────────────────────────────────────────────────── unsupported ──────
+
+/// A source construct the importer recognized but deliberately *dropped*
+/// rather than lower into the IR.
+///
+/// The IR is opinionated, not a passthrough — some Slint surface has no home in
+/// our vocabulary yet. Instead of swallowing it silently, every drop is recorded
+/// here so the caller (and the AI companion driving a port) can see exactly what
+/// fidelity was lost and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unsupported {
+    /// 1-based source line where the dropped construct began.
+    pub line: usize,
+    /// A short description of what was dropped (e.g. `"inherits Base"`).
+    pub text: String,
+}
+
+/// The full result of [`parse_with_report`]: the lowered document plus the
+/// list of constructs that were dropped on the floor.
+#[derive(Debug)]
+pub struct ImportReport {
+    pub document: Document,
+    pub unsupported: Vec<Unsupported>,
 }
 
 // ─────────────────────────────────────────────────────────────────── AST ─────
@@ -67,6 +99,7 @@ struct SlintElement {
 struct SlintFile {
     components: HashMap<String, SlintElement>,
     elements: Vec<SlintElement>,
+    unsupported: Vec<Unsupported>,
 }
 
 // ─────────────────────────────────────────────────────────────────── lexer ───
@@ -79,7 +112,11 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1 }
+        Self {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -98,7 +135,11 @@ impl<'a> Lexer<'a> {
     fn skip_ws_and_comments(&mut self) {
         loop {
             // Whitespace
-            while self.peek().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+            while self
+                .peek()
+                .map(|c| c.is_ascii_whitespace())
+                .unwrap_or(false)
+            {
                 self.advance();
             }
             // Line comment
@@ -175,13 +216,17 @@ impl<'a> Lexer<'a> {
         }
         let packed = match hex.len() {
             6 => {
-                let v = u32::from_str_radix(&hex, 16)
-                    .map_err(|_| err("bad hex color", self.line))?;
+                let v =
+                    u32::from_str_radix(&hex, 16).map_err(|_| err("bad hex color", self.line))?;
                 (v << 8) | 0xFF
             }
-            8 => u32::from_str_radix(&hex, 16)
-                .map_err(|_| err("bad hex color", self.line))?,
-            _ => return Err(err(format!("hex color must be 6 or 8 digits, got {}", hex.len()), self.line)),
+            8 => u32::from_str_radix(&hex, 16).map_err(|_| err("bad hex color", self.line))?,
+            _ => {
+                return Err(err(
+                    format!("hex color must be 6 or 8 digits, got {}", hex.len()),
+                    self.line,
+                ))
+            }
         };
         Ok(packed)
     }
@@ -210,7 +255,10 @@ impl<'a> Lexer<'a> {
                     _ => Ok(SlintValue::Ident(ident)),
                 }
             }
-            None => Err(err("unexpected end of input while reading value", self.line)),
+            None => Err(err(
+                "unexpected end of input while reading value",
+                self.line,
+            )),
         }
     }
 
@@ -238,6 +286,7 @@ impl<'a> Lexer<'a> {
 fn parse_element_with_kind(
     lex: &mut Lexer<'_>,
     kind: String,
+    unsupported: &mut Vec<Unsupported>,
 ) -> Result<SlintElement, SlintImportError> {
     lex.expect_byte(b'{')?;
 
@@ -263,27 +312,88 @@ fn parse_element_with_kind(
 
         if lex.peek() == Some(b':') {
             lex.advance();
+            // A two-way binding `prop: <=> other;` has no static value we can
+            // lower — record it and skip to the terminating `;`.
+            lex.skip_ws_and_comments();
+            if lex.peek() == Some(b'<') {
+                let line = lex.line;
+                skip_to_semicolon(lex);
+                unsupported.push(Unsupported {
+                    line,
+                    text: format!("two-way binding on '{key}'"),
+                });
+                continue;
+            }
             let value = lex.read_value()?;
             lex.skip_ws_and_comments();
             lex.expect_byte(b';')?;
             props.push((key, value));
         } else if lex.peek() == Some(b'{') {
-            let child = parse_element_with_kind(lex, key)?;
+            let child = parse_element_with_kind(lex, key, unsupported)?;
             children.push(child);
+        } else if lex.peek() == Some(b'=') {
+            // Callback handler `clicked => { ... }` — intent we don't yet lower.
+            let line = lex.line;
+            // consume '=' '>' then a balanced `{ ... }` if present, else to ';'
+            lex.advance();
+            lex.skip_ws_and_comments();
+            if lex.peek() == Some(b'>') {
+                lex.advance();
+            }
+            lex.skip_ws_and_comments();
+            if lex.peek() == Some(b'{') {
+                lex.advance();
+                skip_balanced_braces(lex);
+            } else {
+                skip_to_semicolon(lex);
+            }
+            unsupported.push(Unsupported {
+                line,
+                text: format!("callback handler '{key}'"),
+            });
         } else {
-            return Err(err(
-                format!("expected ':' or '{{' after '{key}'"),
-                lex.line,
-            ));
+            return Err(err(format!("expected ':' or '{{' after '{key}'"), lex.line));
         }
     }
 
-    Ok(SlintElement { kind, props, children })
+    Ok(SlintElement {
+        kind,
+        props,
+        children,
+    })
+}
+
+/// Consume bytes up to and including the next `;` (or EOF).
+fn skip_to_semicolon(lex: &mut Lexer<'_>) {
+    while let Some(c) = lex.peek() {
+        lex.advance();
+        if c == b';' {
+            break;
+        }
+    }
+}
+
+/// Consume a balanced `{ ... }` body, assuming the opening `{` was already eaten.
+fn skip_balanced_braces(lex: &mut Lexer<'_>) {
+    let mut depth = 1i32;
+    while let Some(c) = lex.advance() {
+        match c {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_file(lex: &mut Lexer<'_>) -> Result<SlintFile, SlintImportError> {
     let mut components: HashMap<String, SlintElement> = HashMap::new();
     let mut elements: Vec<SlintElement> = Vec::new();
+    let mut unsupported: Vec<Unsupported> = Vec::new();
 
     loop {
         lex.skip_ws_and_comments();
@@ -303,26 +413,37 @@ fn parse_file(lex: &mut Lexer<'_>) -> Result<SlintFile, SlintImportError> {
             if name.is_empty() {
                 return Err(err("expected component name", lex.line));
             }
-            // Optional 'inherits SomeBase' clause — skip if present
+            // Optional 'inherits SomeBase' clause — we inline components as a
+            // generic Stack, so the base relationship is dropped. Record it.
             lex.skip_ws_and_comments();
             if lex.peek() != Some(b'{') {
-                // skip 'inherits Xxx'
+                let line = lex.line;
                 let _clause = lex.read_ident(); // 'inherits'
                 lex.skip_ws_and_comments();
-                let _base = lex.read_ident(); // base name
+                let base = lex.read_ident(); // base name
                 lex.skip_ws_and_comments();
+                if !base.is_empty() {
+                    unsupported.push(Unsupported {
+                        line,
+                        text: format!("inherits {base}"),
+                    });
+                }
             }
-            let body = parse_element_with_kind(lex, "__component__".into())?;
+            let body = parse_element_with_kind(lex, "__component__".into(), &mut unsupported)?;
             components.insert(name, body);
         } else {
             // Top-level element instance
             lex.skip_ws_and_comments();
-            let elem = parse_element_with_kind(lex, kw)?;
+            let elem = parse_element_with_kind(lex, kw, &mut unsupported)?;
             elements.push(elem);
         }
     }
 
-    Ok(SlintFile { components, elements })
+    Ok(SlintFile {
+        components,
+        elements,
+        unsupported,
+    })
 }
 
 // ──────────────────────────────────────────────────────── lowering to IR ─────
@@ -385,21 +506,38 @@ fn lower_element(
         };
 
     let id = doc.fresh_id();
-    doc.apply_from(Origin::System, Mutation::CreateNode { id, kind: effective_kind })
-        .ok()?;
+    doc.apply_from(
+        Origin::System,
+        Mutation::CreateNode {
+            id,
+            kind: effective_kind,
+        },
+    )
+    .ok()?;
 
     // Component base props first (use-site overrides them below).
     for (k, v) in extra_props {
         let key = map_prop_name(&k);
-        doc.apply_from(Origin::System, Mutation::SetProp { id, key, value: slint_value_to_ir(v) })
-            .ok();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key,
+                value: slint_value_to_ir(v),
+            },
+        )
+        .ok();
     }
     // Use-site props.
     for (k, v) in &elem.props {
         let key = map_prop_name(k);
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id, key, value: slint_value_to_ir(v.clone()) },
+            Mutation::SetProp {
+                id,
+                key,
+                value: slint_value_to_ir(v.clone()),
+            },
         )
         .ok();
     }
@@ -407,15 +545,27 @@ fn lower_element(
     // Component base children first.
     for child_elem in &extra_children {
         if let Some(child_id) = lower_element(child_elem, doc, components) {
-            doc.apply_from(Origin::System, Mutation::AppendChild { parent: id, child: child_id })
-                .ok();
+            doc.apply_from(
+                Origin::System,
+                Mutation::AppendChild {
+                    parent: id,
+                    child: child_id,
+                },
+            )
+            .ok();
         }
     }
     // Use-site children.
     for child_elem in &elem.children {
         if let Some(child_id) = lower_element(child_elem, doc, components) {
-            doc.apply_from(Origin::System, Mutation::AppendChild { parent: id, child: child_id })
-                .ok();
+            doc.apply_from(
+                Origin::System,
+                Mutation::AppendChild {
+                    parent: id,
+                    child: child_id,
+                },
+            )
+            .ok();
         }
     }
 
@@ -428,7 +578,20 @@ fn lower_element(
 ///
 /// The first top-level element (non-component) becomes the document root.
 /// Component declarations are inlined at their use sites.
+///
+/// This is the lossy-by-design front door: dropped constructs are discarded.
+/// Use [`parse_with_report`] when you need to know what was lost.
 pub fn parse(src: &str) -> Result<Document, SlintImportError> {
+    Ok(parse_with_report(src)?.document)
+}
+
+/// Parse a Slint DSL source string into a [`Document`] *and* a list of the
+/// constructs that were recognized but dropped rather than lowered.
+///
+/// Additive sibling to [`parse`]: same lowering, but the [`ImportReport`] also
+/// surfaces every [`Unsupported`] drop (two-way bindings, callback handlers,
+/// `inherits` base relationships) with its source line.
+pub fn parse_with_report(src: &str) -> Result<ImportReport, SlintImportError> {
     let mut lex = Lexer::new(src);
     let file = parse_file(&mut lex)?;
     let mut doc = Document::new();
@@ -444,7 +607,10 @@ pub fn parse(src: &str) -> Result<Document, SlintImportError> {
         }
     }
 
-    Ok(doc)
+    Ok(ImportReport {
+        document: doc,
+        unsupported: file.unsupported,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────── tests ───
@@ -587,5 +753,59 @@ mod tests {
             doc.get(children[1]).unwrap().props.get("content"),
             Some(&Value::Text("b".into()))
         );
+    }
+
+    // ── E1: unsupported-construct reporting ───────────────────────────────────
+
+    #[test]
+    fn clean_input_reports_no_unsupported() {
+        let report = parse_with_report(r#"Text { text: "Hi"; }"#).unwrap();
+        assert!(report.unsupported.is_empty());
+        assert!(report.document.root().is_some());
+    }
+
+    #[test]
+    fn callback_handler_is_recorded_not_errored() {
+        // The old parser would have errored on `=>`; now it's dropped + reported.
+        let src = r#"Button { text: "Go"; clicked => { do_thing(); } }"#;
+        let report = parse_with_report(src).unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(report.unsupported[0].text.contains("clicked"));
+        // The supported prop still lowered.
+        let root = report.document.root().unwrap();
+        assert_eq!(
+            report.document.get(root).unwrap().props.get("content"),
+            Some(&Value::Text("Go".into()))
+        );
+    }
+
+    #[test]
+    fn two_way_binding_is_recorded() {
+        let src = r#"Input { value: <=> model.value; }"#;
+        let report = parse_with_report(src).unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(report.unsupported[0].text.contains("two-way"));
+    }
+
+    #[test]
+    fn inherits_clause_is_recorded() {
+        let src = r#"
+            component MyButton inherits Rectangle {
+                border-radius: 4px;
+            }
+            MyButton {}
+        "#;
+        let report = parse_with_report(src).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "inherits Rectangle"));
+    }
+
+    #[test]
+    fn parse_still_returns_bare_document() {
+        // Back-compat: `parse` signature unchanged, drops are silent.
+        let doc = parse(r#"Button { clicked => {} }"#).unwrap();
+        assert!(doc.root().is_some());
     }
 }

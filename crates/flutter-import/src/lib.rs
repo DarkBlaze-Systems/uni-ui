@@ -41,14 +41,46 @@ pub struct FlutterImportError {
 
 impl std::fmt::Display for FlutterImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "flutter-import error at line {}: {}", self.line, self.message)
+        write!(
+            f,
+            "flutter-import error at line {}: {}",
+            self.line, self.message
+        )
     }
 }
 
 impl std::error::Error for FlutterImportError {}
 
 fn err(msg: impl Into<String>, line: usize) -> FlutterImportError {
-    FlutterImportError { message: msg.into(), line }
+    FlutterImportError {
+        message: msg.into(),
+        line,
+    }
+}
+
+// ─────────────────────────────────────────────────────────── unsupported ──────
+
+/// A widget prop the importer recognized but deliberately *dropped* rather than
+/// lower into the IR.
+///
+/// Flutter carries a lot of structured argument values (`EdgeInsets.all(8)`,
+/// `MainAxisAlignment.center`, decorations, …) that have no literal home in our
+/// vocabulary yet. Instead of swallowing them, each drop is recorded here so the
+/// caller — and the AI companion driving a port — can see what was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unsupported {
+    /// 1-based source line where the dropped construct began.
+    pub line: usize,
+    /// A short description of what was dropped (e.g. `"prop 'padding' = EdgeInsets"`).
+    pub text: String,
+}
+
+/// The full result of [`parse_with_report`]: the lowered document plus the list
+/// of props that were dropped on the floor.
+#[derive(Debug)]
+pub struct ImportReport {
+    pub document: Document,
+    pub unsupported: Vec<Unsupported>,
 }
 
 // ────────────────────────────────────────────────────────────────── raw AST ──
@@ -57,7 +89,7 @@ fn err(msg: impl Into<String>, line: usize) -> FlutterImportError {
 #[derive(Debug, Clone)]
 enum FVal {
     Str(String),
-    Color(u32),   // already converted to RRGGBBAA
+    Color(u32), // already converted to RRGGBBAA
     Float(f64),
     Int(i64),
     Bool(bool),
@@ -87,7 +119,11 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1 }
+        Self {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -104,7 +140,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while self.peek().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+        while self
+            .peek()
+            .map(|c| c.is_ascii_whitespace())
+            .unwrap_or(false)
+        {
             self.advance();
         }
     }
@@ -156,7 +196,12 @@ impl<'a> Lexer<'a> {
                 self.advance();
             } else if c == b'.' && !is_float {
                 // Look ahead: must be digit after dot to be float
-                if self.src.get(self.pos + 1).map(|d| d.is_ascii_digit()).unwrap_or(false) {
+                if self
+                    .src
+                    .get(self.pos + 1)
+                    .map(|d| d.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     is_float = true;
                     s.push(c as char);
                     self.advance();
@@ -173,9 +218,18 @@ impl<'a> Lexer<'a> {
     fn expect_byte(&mut self, expected: u8) -> Result<(), FlutterImportError> {
         self.skip_ws();
         match self.peek() {
-            Some(c) if c == expected => { self.advance(); Ok(()) }
-            Some(c) => Err(err(format!("expected '{}', got '{}'", expected as char, c as char), self.line)),
-            None => Err(err(format!("expected '{}', got EOF", expected as char), self.line)),
+            Some(c) if c == expected => {
+                self.advance();
+                Ok(())
+            }
+            Some(c) => Err(err(
+                format!("expected '{}', got '{}'", expected as char, c as char),
+                self.line,
+            )),
+            None => Err(err(
+                format!("expected '{}', got EOF", expected as char),
+                self.line,
+            )),
         }
     }
 }
@@ -193,13 +247,18 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<FVal, FlutterImportError> {
             let mut items = Vec::new();
             loop {
                 lex.skip_ws();
-                if lex.peek() == Some(b']') { lex.advance(); break; }
+                if lex.peek() == Some(b']') {
+                    lex.advance();
+                    break;
+                }
                 if lex.peek().is_none() {
                     return Err(err("unexpected EOF in list", lex.line));
                 }
                 items.push(parse_value(lex)?);
                 lex.skip_ws();
-                if lex.peek() == Some(b',') { lex.advance(); }
+                if lex.peek() == Some(b',') {
+                    lex.advance();
+                }
             }
             Ok(FVal::List(items))
         }
@@ -229,14 +288,20 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<FVal, FlutterImportError> {
                     let color = parse_color_literal(lex)?;
                     lex.skip_ws();
                     // tolerate trailing comma before ')'
-                    if lex.peek() == Some(b',') { lex.advance(); }
+                    if lex.peek() == Some(b',') {
+                        lex.advance();
+                    }
                     lex.skip_ws();
                     lex.expect_byte(b')')?;
                     Ok(FVal::Color(color))
                 } else if ident == "TextStyle" {
                     // TextStyle(fontSize: 18.0, color: Color(0xFF...))
                     let args = parse_arg_list(lex)?;
-                    Ok(FVal::Widget(FWidget { kind: "TextStyle".into(), args, positional: None }))
+                    Ok(FVal::Widget(FWidget {
+                        kind: "TextStyle".into(),
+                        args,
+                        positional: None,
+                    }))
                 } else {
                     // Widget call
                     let widget = parse_widget_body(lex, ident)?;
@@ -257,7 +322,9 @@ fn parse_color_literal(lex: &mut Lexer<'_>) -> Result<u32, FlutterImportError> {
     if lex.peek() == Some(b'0') {
         lex.advance();
         match lex.peek() {
-            Some(b'x') | Some(b'X') => { lex.advance(); }
+            Some(b'x') | Some(b'X') => {
+                lex.advance();
+            }
             _ => return Err(err("expected '0x' for Color literal", lex.line)),
         }
     } else {
@@ -272,8 +339,8 @@ fn parse_color_literal(lex: &mut Lexer<'_>) -> Result<u32, FlutterImportError> {
             break;
         }
     }
-    let argb = u32::from_str_radix(&hex, 16)
-        .map_err(|_| err("invalid hex in Color literal", lex.line))?;
+    let argb =
+        u32::from_str_radix(&hex, 16).map_err(|_| err("invalid hex in Color literal", lex.line))?;
     // Flutter: AARRGGBB → uni-ir: RRGGBBAA
     let rrggbbaa = (argb & 0x00FF_FFFF) << 8 | (argb >> 24);
     Ok(rrggbbaa)
@@ -285,7 +352,10 @@ fn parse_arg_list(lex: &mut Lexer<'_>) -> Result<Vec<(String, FVal)>, FlutterImp
     let mut args = Vec::new();
     loop {
         lex.skip_ws();
-        if lex.peek() == Some(b')') { lex.advance(); break; }
+        if lex.peek() == Some(b')') {
+            lex.advance();
+            break;
+        }
         if lex.peek().is_none() {
             return Err(err("unexpected EOF in argument list", lex.line));
         }
@@ -306,7 +376,9 @@ fn parse_arg_list(lex: &mut Lexer<'_>) -> Result<Vec<(String, FVal)>, FlutterImp
             args.push(("__positional__".into(), val));
         }
         lex.skip_ws();
-        if lex.peek() == Some(b',') { lex.advance(); }
+        if lex.peek() == Some(b',') {
+            lex.advance();
+        }
     }
     Ok(args)
 }
@@ -327,15 +399,23 @@ fn parse_widget_body(lex: &mut Lexer<'_>, kind: String) -> Result<FWidget, Flutt
             named.push((k, v));
         }
     }
-    Ok(FWidget { kind, args: named, positional })
+    Ok(FWidget {
+        kind,
+        args: named,
+        positional,
+    })
 }
 
 /// Parse a top-level widget: `WidgetName(...)`.
 fn parse_widget(lex: &mut Lexer<'_>) -> Result<Option<FWidget>, FlutterImportError> {
     lex.skip_ws();
-    if lex.peek().is_none() { return Ok(None); }
+    if lex.peek().is_none() {
+        return Ok(None);
+    }
     let kind = lex.read_ident();
-    if kind.is_empty() { return Ok(None); }
+    if kind.is_empty() {
+        return Ok(None);
+    }
     lex.skip_ws();
     lex.expect_byte(b'(')?;
     let widget = parse_widget_body(lex, kind)?;
@@ -372,7 +452,7 @@ fn map_prop(flutter_prop: &str) -> Option<&str> {
         "width" => Some("width"),
         "height" => Some("height"),
         "onPressed" | "onTap" => None, // callback — handled separately
-        "style" => None, // inline expansion — handled separately
+        "style" => None,               // inline expansion — handled separately
         "padding" => Some("padding"),
         _ => Some(flutter_prop),
     }
@@ -391,9 +471,24 @@ fn fval_to_ir(v: FVal) -> Option<Value> {
 
 // ──────────────────────────────────────────────────────────── lowering ────────
 
+/// Describe an `FVal` for an unsupported-drop report (no value content, just shape).
+fn fval_shape(v: &FVal) -> &'static str {
+    match v {
+        FVal::Str(_) => "string",
+        FVal::Color(_) => "color",
+        FVal::Float(_) => "float",
+        FVal::Int(_) => "int",
+        FVal::Bool(_) => "bool",
+        FVal::Widget(_) => "widget-expr",
+        FVal::List(_) => "list",
+        FVal::Ident(_) => "ident-expr",
+    }
+}
+
 fn lower_widget(
     widget: &FWidget,
     doc: &mut Document,
+    unsupported: &mut Vec<Unsupported>,
 ) -> Result<NodeId, FlutterImportError> {
     let kind = map_kind(&widget.kind).to_string();
     let id = doc.fresh_id();
@@ -404,8 +499,13 @@ fn lower_widget(
     if let Some(ref s) = widget.positional {
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id, key: "content".into(), value: Value::Text(s.clone()) },
-        ).ok();
+            Mutation::SetProp {
+                id,
+                key: "content".into(),
+                value: Value::Text(s.clone()),
+            },
+        )
+        .ok();
     }
 
     // Process named args
@@ -413,19 +513,28 @@ fn lower_widget(
         match key.as_str() {
             "child" => {
                 if let FVal::Widget(child_w) = val {
-                    let child_id = lower_widget(child_w, doc)?;
-                    doc.apply_from(Origin::System, Mutation::AppendChild { parent: id, child: child_id })
-                        .map_err(|e| err(format!("{e:?}"), 0))?;
+                    let child_id = lower_widget(child_w, doc, unsupported)?;
+                    doc.apply_from(
+                        Origin::System,
+                        Mutation::AppendChild {
+                            parent: id,
+                            child: child_id,
+                        },
+                    )
+                    .map_err(|e| err(format!("{e:?}"), 0))?;
                 }
             }
             "children" => {
                 if let FVal::List(items) = val {
                     for item in items {
                         if let FVal::Widget(child_w) = item {
-                            let child_id = lower_widget(child_w, doc)?;
+                            let child_id = lower_widget(child_w, doc, unsupported)?;
                             doc.apply_from(
                                 Origin::System,
-                                Mutation::AppendChild { parent: id, child: child_id },
+                                Mutation::AppendChild {
+                                    parent: id,
+                                    child: child_id,
+                                },
                             )
                             .map_err(|e| err(format!("{e:?}"), 0))?;
                         }
@@ -443,7 +552,10 @@ fn lower_widget(
                     Mutation::SetCallback {
                         id,
                         event: "click".into(),
-                        action: Action { name: action_name, args: vec![] },
+                        action: Action {
+                            name: action_name,
+                            args: vec![],
+                        },
                     },
                 )
                 .ok();
@@ -456,7 +568,11 @@ fn lower_widget(
                             if let Some(ir_val) = fval_to_ir(sv.clone()) {
                                 doc.apply_from(
                                     Origin::System,
-                                    Mutation::SetProp { id, key: ir_key.into(), value: ir_val },
+                                    Mutation::SetProp {
+                                        id,
+                                        key: ir_key.into(),
+                                        value: ir_val,
+                                    },
                                 )
                                 .ok();
                             }
@@ -478,9 +594,21 @@ fn lower_widget(
                     if let Some(ir_val) = fval_to_ir(val.clone()) {
                         doc.apply_from(
                             Origin::System,
-                            Mutation::SetProp { id, key: ir_key.into(), value: ir_val },
+                            Mutation::SetProp {
+                                id,
+                                key: ir_key.into(),
+                                value: ir_val,
+                            },
                         )
                         .ok();
+                    } else {
+                        // A mapped prop whose value has no IR literal — e.g.
+                        // `padding: EdgeInsets.all(8)` or an enum like
+                        // `mainAxisAlignment: MainAxisAlignment.center`.
+                        unsupported.push(Unsupported {
+                            line: 0,
+                            text: format!("prop '{other}' = {}", fval_shape(val)),
+                        });
                     }
                 }
             }
@@ -497,17 +625,34 @@ fn lower_widget(
 ///
 /// The outermost widget becomes the document root. The parser is hand-rolled
 /// recursive descent; no external parser dependencies are used.
+///
+/// This is the lossy-by-design front door: dropped props are discarded. Use
+/// [`parse_with_report`] when you need to know what was lost.
 pub fn parse(src: &str) -> Result<Document, FlutterImportError> {
+    Ok(parse_with_report(src)?.document)
+}
+
+/// Parse a Flutter/Dart widget-tree source string into a [`Document`] *and* a
+/// list of the props that were recognized but dropped rather than lowered.
+///
+/// Additive sibling to [`parse`]: same lowering, but the [`ImportReport`] also
+/// surfaces every [`Unsupported`] drop (structured argument values with no IR
+/// literal, enum constants, decorations).
+pub fn parse_with_report(src: &str) -> Result<ImportReport, FlutterImportError> {
     let mut lex = Lexer::new(src);
     let mut doc = Document::new();
+    let mut unsupported = Vec::new();
 
     if let Some(widget) = parse_widget(&mut lex)? {
-        let root_id = lower_widget(&widget, &mut doc)?;
+        let root_id = lower_widget(&widget, &mut doc, &mut unsupported)?;
         doc.apply_from(Origin::System, Mutation::SetRoot { id: root_id })
             .map_err(|e| err(format!("{e:?}"), 0))?;
     }
 
-    Ok(doc)
+    Ok(ImportReport {
+        document: doc,
+        unsupported,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────── tests ───
@@ -652,5 +797,51 @@ mod tests {
     fn parse_integer_value() {
         let v = root_prop("SizedBox(borderRadius: 8)", "corner_radius");
         assert_eq!(v, Some(Value::Int(8)));
+    }
+
+    // ── E1: unsupported-construct reporting ───────────────────────────────────
+
+    #[test]
+    fn clean_input_reports_no_unsupported() {
+        let report = parse_with_report(r#"Text("Hi")"#).unwrap();
+        assert!(report.unsupported.is_empty());
+        assert!(report.document.root().is_some());
+    }
+
+    #[test]
+    fn enum_valued_prop_is_recorded() {
+        // `mainAxisAlignment: center` — a bare ident with no IR literal.
+        let src = r#"Column(mainAxisAlignment: center, children: [])"#;
+        let report = parse_with_report(src).unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(report.unsupported[0].text.contains("mainAxisAlignment"));
+        assert!(report.unsupported[0].text.contains("ident-expr"));
+        // The Column itself still lowered.
+        assert_eq!(
+            report
+                .document
+                .get(report.document.root().unwrap())
+                .unwrap()
+                .kind,
+            "Column"
+        );
+    }
+
+    #[test]
+    fn nested_drop_is_recorded_from_child() {
+        // The drop happens on a child, proving the collector threads recursively.
+        let src = r#"Container(child: Text("hi", maxLines: someVar))"#;
+        let report = parse_with_report(src).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text.contains("maxLines")));
+    }
+
+    #[test]
+    fn parse_still_returns_bare_document() {
+        // Back-compat: `parse` signature unchanged, drops are silent.
+        let doc = parse(r#"Column(mainAxisAlignment: center, children: [])"#).unwrap();
+        assert!(doc.root().is_some());
     }
 }

@@ -15,11 +15,18 @@
 //! later runtime can observe changes. v0 exposes a `dirty` flag (set on every
 //! [`Store::set`]) that a [`Reactor`] uses to know when to re-resolve.
 //!
-//! ## Binding expressions (v0)
+//! ## Binding expressions
 //!
-//! A [`Binding::expr`] is treated as a plain **state key** (a bare key, or a
-//! dotted path such as `"user.name"` — looked up verbatim in the [`Store`]).
-//! There is no expression grammar yet; richer evaluation is a later rung.
+//! A [`Binding::expr`] is parsed into a tiny [`Expr`] AST and evaluated against
+//! the [`Store`]. The grammar is deliberately small — keys, literals, the four
+//! arithmetic operators, the comparisons (`>`, `<`, `==`), and the unary `!`/`-`
+//! — enough to express "is the cart non-empty", "price * qty", or "count + 1"
+//! directly in a binding, without a handler.
+//!
+//! A **bare key** (an identifier, possibly dotted, e.g. `title` or `user.name`)
+//! still parses to the trivial [`Expr::Key`] and is looked up verbatim in the
+//! [`Store`] — the original v0 behavior is the degenerate case of the grammar,
+//! so every existing binding keeps working unchanged.
 //!
 //! ## `For` expansion
 //!
@@ -171,14 +178,421 @@ fn decode_value(ty: &str, val: &str) -> Option<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Expr — the tiny binding-expression AST
+// ---------------------------------------------------------------------------
+
+/// A binary operator in a binding expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Gt,
+    Lt,
+    Eq,
+}
+
+/// A unary operator in a binding expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    /// Logical not (`!`).
+    Not,
+    /// Arithmetic negation (`-`).
+    Neg,
+}
+
+/// The parsed form of a [`Binding::expr`].
+///
+/// Deliberately minimal: a state-key lookup, an inline literal, the four
+/// arithmetic ops, three comparisons, and two unary ops. A bare key parses to
+/// [`Expr::Key`] (the trivial, v0-compatible case).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    /// An inline literal value.
+    Literal(Value),
+    /// A state-key lookup against the [`Store`] (bare or dotted).
+    Key(String),
+    /// `lhs <op> rhs`.
+    Bin(BinOp, Box<Expr>, Box<Expr>),
+    /// `<op> operand`.
+    Un(UnOp, Box<Expr>),
+}
+
+impl Expr {
+    /// Parse a binding-expression string into an [`Expr`].
+    ///
+    /// A string that is a single bare identifier (or dotted path) becomes an
+    /// [`Expr::Key`] — the trivial parse that preserves the original key-lookup
+    /// semantics. Anything the grammar can't parse falls back to a single
+    /// [`Expr::Key`] over the whole trimmed string, so a stray expression is
+    /// still treated as a (probably-missing) key rather than panicking.
+    pub fn parse(src: &str) -> Expr {
+        let toks = lex(src);
+        let mut p = Parser {
+            toks: &toks,
+            pos: 0,
+        };
+        match p.parse_expr() {
+            Some(e) if p.at_end() => e,
+            // Unparseable / trailing junk: treat the whole thing as a key so
+            // the worst case is a benign missing-key lookup (the v0 behavior).
+            _ => Expr::Key(src.trim().to_string()),
+        }
+    }
+
+    /// Evaluate this expression against `store`, returning `None` if a key is
+    /// unset or an operation is undefined for its operands' types.
+    pub fn eval(&self, store: &Store) -> Option<Value> {
+        match self {
+            Expr::Literal(v) => Some(v.clone()),
+            Expr::Key(k) => store.get(k),
+            Expr::Un(op, e) => {
+                let v = e.eval(store)?;
+                match op {
+                    UnOp::Not => Some(Value::Bool(!truthy(&v))),
+                    UnOp::Neg => match v {
+                        Value::Int(n) => Some(Value::Int(-n)),
+                        Value::Float(f) => Some(Value::Float(-f)),
+                        Value::Px(p) => Some(Value::Px(-p)),
+                        _ => None,
+                    },
+                }
+            }
+            Expr::Bin(op, l, r) => {
+                let lv = l.eval(store)?;
+                let rv = r.eval(store)?;
+                eval_bin(*op, lv, rv)
+            }
+        }
+    }
+}
+
+/// Truthiness for the unary `!` and for boolean contexts.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Int(n) => *n != 0,
+        Value::Float(f) => *f != 0.0,
+        Value::Px(p) => *p != 0.0,
+        Value::Text(s) => !s.is_empty(),
+        Value::List(l) => !l.is_empty(),
+        Value::Color(_) => true,
+    }
+}
+
+/// Coerce a numeric [`Value`] to `f64` for mixed arithmetic/comparison.
+fn as_num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        Value::Px(p) => Some(*p as f64),
+        _ => None,
+    }
+}
+
+/// Evaluate a binary op over two already-evaluated values.
+fn eval_bin(op: BinOp, l: Value, r: Value) -> Option<Value> {
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            // Integer fast-path keeps Int+Int => Int (so `count + 1` stays Int).
+            if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+                let (a, b) = (*a, *b);
+                return Some(Value::Int(match op {
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    BinOp::Div => {
+                        if b == 0 {
+                            return None;
+                        }
+                        a / b
+                    }
+                    _ => unreachable!(),
+                }));
+            }
+            let (a, b) = (as_num(&l)?, as_num(&r)?);
+            Some(Value::Float(match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                _ => unreachable!(),
+            }))
+        }
+        BinOp::Gt | BinOp::Lt => {
+            let (a, b) = (as_num(&l)?, as_num(&r)?);
+            Some(Value::Bool(match op {
+                BinOp::Gt => a > b,
+                BinOp::Lt => a < b,
+                _ => unreachable!(),
+            }))
+        }
+        BinOp::Eq => {
+            // Numbers compare numerically (Int(1) == Float(1.0)); everything
+            // else compares by structural equality.
+            if let (Some(a), Some(b)) = (as_num(&l), as_num(&r)) {
+                Some(Value::Bool(a == b))
+            } else {
+                Some(Value::Bool(l == r))
+            }
+        }
+    }
+}
+
+// -- lexer ------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Num(f64),
+    Int(i64),
+    Str(String),
+    Ident(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Gt,
+    Lt,
+    EqEq,
+    Bang,
+    LParen,
+    RParen,
+}
+
+/// Tokenize a binding expression. Unrecognized characters are skipped, which
+/// keeps the lexer total (parse fall-back handles anything nonsensical).
+fn lex(src: &str) -> Vec<Tok> {
+    let mut toks = Vec::new();
+    let bytes: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            ' ' | '\t' | '\n' | '\r' => i += 1,
+            '+' => {
+                toks.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                toks.push(Tok::Minus);
+                i += 1;
+            }
+            '*' => {
+                toks.push(Tok::Star);
+                i += 1;
+            }
+            '/' => {
+                toks.push(Tok::Slash);
+                i += 1;
+            }
+            '>' => {
+                toks.push(Tok::Gt);
+                i += 1;
+            }
+            '<' => {
+                toks.push(Tok::Lt);
+                i += 1;
+            }
+            '(' => {
+                toks.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                toks.push(Tok::RParen);
+                i += 1;
+            }
+            '!' => {
+                toks.push(Tok::Bang);
+                i += 1;
+            }
+            '=' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == '=' {
+                    toks.push(Tok::EqEq);
+                    i += 2;
+                } else {
+                    // A lone `=` is not in the grammar; skip it.
+                    i += 1;
+                }
+            }
+            '"' | '\'' => {
+                let quote = c;
+                i += 1;
+                let mut s = String::new();
+                while i < bytes.len() && bytes[i] != quote {
+                    s.push(bytes[i]);
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // closing quote
+                }
+                toks.push(Tok::Str(s));
+            }
+            d if d.is_ascii_digit() => {
+                let start = i;
+                let mut seen_dot = false;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_digit() || (bytes[i] == '.' && !seen_dot))
+                {
+                    if bytes[i] == '.' {
+                        seen_dot = true;
+                    }
+                    i += 1;
+                }
+                let lit: String = bytes[start..i].iter().collect();
+                if seen_dot {
+                    if let Ok(f) = lit.parse::<f64>() {
+                        toks.push(Tok::Num(f));
+                    }
+                } else if let Ok(n) = lit.parse::<i64>() {
+                    toks.push(Tok::Int(n));
+                }
+            }
+            a if a.is_alphabetic() || a == '_' => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_alphanumeric() || bytes[i] == '_' || bytes[i] == '.')
+                {
+                    i += 1;
+                }
+                let ident: String = bytes[start..i].iter().collect();
+                toks.push(Tok::Ident(ident));
+            }
+            // Any other character is not part of the grammar — skip it.
+            _ => i += 1,
+        }
+    }
+    toks
+}
+
+// -- parser (recursive descent, classic precedence climbing) ----------------
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.toks.len()
+    }
+
+    fn bump(&mut self) -> Option<&Tok> {
+        let t = self.toks.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    /// expr := comparison
+    fn parse_expr(&mut self) -> Option<Expr> {
+        self.parse_comparison()
+    }
+
+    /// comparison := additive ( (`>` | `<` | `==`) additive )*
+    fn parse_comparison(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Gt) => BinOp::Gt,
+                Some(Tok::Lt) => BinOp::Lt,
+                Some(Tok::EqEq) => BinOp::Eq,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_additive()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Some(lhs)
+    }
+
+    /// additive := multiplicative ( (`+` | `-`) multiplicative )*
+    fn parse_additive(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => BinOp::Add,
+                Some(Tok::Minus) => BinOp::Sub,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_multiplicative()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Some(lhs)
+    }
+
+    /// multiplicative := unary ( (`*` | `/`) unary )*
+    fn parse_multiplicative(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => BinOp::Mul,
+                Some(Tok::Slash) => BinOp::Div,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_unary()?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
+        }
+        Some(lhs)
+    }
+
+    /// unary := (`!` | `-`) unary | primary
+    fn parse_unary(&mut self) -> Option<Expr> {
+        match self.peek() {
+            Some(Tok::Bang) => {
+                self.bump();
+                let e = self.parse_unary()?;
+                Some(Expr::Un(UnOp::Not, Box::new(e)))
+            }
+            Some(Tok::Minus) => {
+                self.bump();
+                let e = self.parse_unary()?;
+                Some(Expr::Un(UnOp::Neg, Box::new(e)))
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    /// primary := Int | Num | Str | Ident | `(` expr `)`
+    fn parse_primary(&mut self) -> Option<Expr> {
+        match self.bump()? {
+            Tok::Int(n) => Some(Expr::Literal(Value::Int(*n))),
+            Tok::Num(f) => Some(Expr::Literal(Value::Float(*f))),
+            Tok::Str(s) => Some(Expr::Literal(Value::Text(s.clone()))),
+            Tok::Ident(id) => match id.as_str() {
+                "true" => Some(Expr::Literal(Value::Bool(true))),
+                "false" => Some(Expr::Literal(Value::Bool(false))),
+                _ => Some(Expr::Key(id.clone())),
+            },
+            Tok::LParen => {
+                let e = self.parse_expr()?;
+                match self.bump() {
+                    Some(Tok::RParen) => Some(e),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // resolve
 // ---------------------------------------------------------------------------
 
 /// Evaluate one [`Binding`] against the [`Store`].
 ///
-/// v0: `expr` is a plain state key (bare or dotted), looked up verbatim.
+/// `expr` is parsed into an [`Expr`] AST and evaluated. A bare key parses to
+/// [`Expr::Key`] and is looked up verbatim — the original v0 behavior.
 fn eval_binding(b: &Binding, store: &Store) -> Option<Value> {
-    store.get(b.expr.as_str())
+    Expr::parse(b.expr.as_str()).eval(store)
 }
 
 /// Produce a *resolved* render [`Document`] from a *source* document + state.
@@ -234,12 +648,7 @@ pub fn resolve(src: &Document, store: &Store) -> Document {
 /// Resolve `src_id` from `src`, emitting node(s) into `out`. Returns the list
 /// of *output* node ids this source node expanded to (0 for a false `If`, `n`
 /// template copies for a `For`, exactly 1 for an ordinary node).
-fn resolve_into(
-    src: &Document,
-    src_id: NodeId,
-    store: &Store,
-    out: &mut Document,
-) -> Vec<NodeId> {
+fn resolve_into(src: &Document, src_id: NodeId, store: &Store, out: &mut Document) -> Vec<NodeId> {
     let Some(node) = src.get(src_id) else {
         return Vec::new();
     };
@@ -495,7 +904,8 @@ mod tests {
     }
 
     fn set_root(doc: &mut Document, id: NodeId) {
-        doc.apply_from(Origin::System, Mutation::SetRoot { id }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
     }
 
     fn child(doc: &mut Document, parent: NodeId, c: NodeId) {
@@ -690,33 +1100,79 @@ mod tests {
     fn for_expands_by_list_count() {
         // A For node bound to a List of 3 items expands into 3 children,
         // each carrying `item` and `index` props.
-        use uni_ir::{Binding, Document, Mutation, NodeId, Origin, Value};
         use crate::Store;
+        use uni_ir::{Binding, Document, Mutation, NodeId, Origin, Value};
 
         let mut doc = Document::new();
         // root Stack
         let root = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: root, kind: "Stack".into() }).unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
         // For node bound to "items"
         let for_node = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: for_node, kind: "For".into() }).unwrap();
-        doc.apply_from(Origin::System, Mutation::SetBinding {
-            id: for_node, key: "items".into(),
-            binding: Binding { expr: "items".into() },
-        }).unwrap();
-        doc.apply_from(Origin::System, Mutation::AppendChild { parent: root, child: for_node }).unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: for_node,
+                kind: "For".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetBinding {
+                id: for_node,
+                key: "items".into(),
+                binding: Binding {
+                    expr: "items".into(),
+                },
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::AppendChild {
+                parent: root,
+                child: for_node,
+            },
+        )
+        .unwrap();
         // Template child inside For: a Text node
         let template = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: template, kind: "Text".into() }).unwrap();
-        doc.apply_from(Origin::System, Mutation::AppendChild { parent: for_node, child: template }).unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: template,
+                kind: "Text".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::AppendChild {
+                parent: for_node,
+                child: template,
+            },
+        )
+        .unwrap();
 
         let mut store = Store::new();
-        store.set("items", Value::List(vec![
-            Value::Text("apple".into()),
-            Value::Text("banana".into()),
-            Value::Text("cherry".into()),
-        ]));
+        store.set(
+            "items",
+            Value::List(vec![
+                Value::Text("apple".into()),
+                Value::Text("banana".into()),
+                Value::Text("cherry".into()),
+            ]),
+        );
 
         let resolved = crate::resolve(&doc, &store);
 
@@ -727,8 +1183,12 @@ mod tests {
         let mut text_count = 0;
         fn count_text(doc: &Document, id: NodeId, n: &mut usize) {
             if let Some(node) = doc.get(id) {
-                if node.kind == "Text" { *n += 1; }
-                for &c in &node.children { count_text(doc, c, n); }
+                if node.kind == "Text" {
+                    *n += 1;
+                }
+                for &c in &node.children {
+                    count_text(doc, c, n);
+                }
             }
         }
         count_text(&resolved, resolved.root().unwrap(), &mut text_count);
@@ -752,12 +1212,131 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // B3 — binding expressions (Expr AST)
+    // -----------------------------------------------------------------------
+
+    /// A bare key still parses to a trivial `Key` lookup (the v0 contract).
+    #[test]
+    fn bare_key_is_a_trivial_key_expr() {
+        assert_eq!(Expr::parse("title"), Expr::Key("title".into()));
+        assert_eq!(Expr::parse("user.name"), Expr::Key("user.name".into()));
+    }
+
+    /// Arithmetic over store keys: `price * qty` and `count + 1` resolve to
+    /// computed literals, with Int + Int staying Int.
+    #[test]
+    fn arithmetic_binding_evaluates_against_store() {
+        let mut store = Store::new();
+        store.set("price", Value::Int(7));
+        store.set("qty", Value::Int(3));
+        store.set("count", Value::Int(41));
+
+        let total = Binding {
+            expr: "price * qty".into(),
+        };
+        assert_eq!(eval_binding(&total, &store), Some(Value::Int(21)));
+
+        let next = Binding {
+            expr: "count + 1".into(),
+        };
+        assert_eq!(eval_binding(&next, &store), Some(Value::Int(42)));
+
+        // Precedence: `*` binds tighter than `+`.
+        let mixed = Binding {
+            expr: "count + price * qty".into(),
+        };
+        assert_eq!(eval_binding(&mixed, &store), Some(Value::Int(41 + 21)));
+    }
+
+    /// Comparison bindings yield a `Bool` — the shape an `If` condition wants.
+    #[test]
+    fn comparison_binding_yields_bool() {
+        let mut store = Store::new();
+        store.set("count", Value::Int(3));
+
+        let gt = Binding {
+            expr: "count > 0".into(),
+        };
+        assert_eq!(eval_binding(&gt, &store), Some(Value::Bool(true)));
+
+        let lt = Binding {
+            expr: "count < 0".into(),
+        };
+        assert_eq!(eval_binding(&lt, &store), Some(Value::Bool(false)));
+
+        let eq = Binding {
+            expr: "count == 3".into(),
+        };
+        assert_eq!(eval_binding(&eq, &store), Some(Value::Bool(true)));
+    }
+
+    /// Unary `!` and `-` evaluate against the store.
+    #[test]
+    fn unary_ops_evaluate() {
+        let mut store = Store::new();
+        store.set("open", Value::Bool(false));
+        store.set("n", Value::Int(5));
+
+        let not_open = Binding {
+            expr: "!open".into(),
+        };
+        assert_eq!(eval_binding(&not_open, &store), Some(Value::Bool(true)));
+
+        let neg = Binding { expr: "-n".into() };
+        assert_eq!(eval_binding(&neg, &store), Some(Value::Int(-5)));
+    }
+
+    /// A comparison binding drives a real `If` end-to-end: `count > 0` gates the
+    /// subtree, proving the AST flows through `resolve`.
+    #[test]
+    fn comparison_binding_gates_an_if_node() {
+        let build = |count: i64| {
+            let mut src = Document::new();
+            let root = node(&mut src, "Stack");
+            set_root(&mut src, root);
+            let iff = node(&mut src, "If");
+            bind(&mut src, iff, "cond", "count > 0");
+            child(&mut src, root, iff);
+            let inner = node(&mut src, "Rect");
+            child(&mut src, iff, inner);
+
+            let mut store = Store::new();
+            store.set("count", Value::Int(count));
+            resolve(&src, &store)
+        };
+
+        // count = 0 → `count > 0` is false → Rect omitted.
+        assert!(find_kind(&build(0), "Rect").is_empty());
+        // count = 2 → true → Rect spliced in.
+        assert_eq!(find_kind(&build(2), "Rect").len(), 1);
+    }
+
+    /// Parenthesized grouping overrides precedence.
+    #[test]
+    fn parentheses_group_subexpressions() {
+        let mut store = Store::new();
+        store.set("a", Value::Int(2));
+        store.set("b", Value::Int(3));
+        store.set("c", Value::Int(4));
+
+        // (a + b) * c = 20, vs a + b * c = 14 without the parens.
+        let grouped = Binding {
+            expr: "(a + b) * c".into(),
+        };
+        assert_eq!(eval_binding(&grouped, &store), Some(Value::Int(20)));
+        let ungrouped = Binding {
+            expr: "a + b * c".into(),
+        };
+        assert_eq!(eval_binding(&ungrouped, &store), Some(Value::Int(14)));
+    }
+
     #[test]
     fn snapshot_and_restore_roundtrip() {
         let mut store = Store::new();
         store.set("flag", Value::Bool(true));
         store.set("count", Value::Int(42));
-        store.set("ratio", Value::Float(3.14));
+        store.set("ratio", Value::Float(3.25));
         store.set("label", Value::Text("hello\nworld".into()));
         store.set("accent", Value::Color(0x7D39_EBFF));
         store.set("size", Value::Px(16.5));
@@ -770,12 +1349,15 @@ mod tests {
         assert_eq!(restored, 6, "all 6 keys should restore");
         assert_eq!(store2.get("flag"), Some(Value::Bool(true)));
         assert_eq!(store2.get("count"), Some(Value::Int(42)));
-        assert_eq!(store2.get("label"), Some(Value::Text("hello\nworld".into())));
+        assert_eq!(
+            store2.get("label"),
+            Some(Value::Text("hello\nworld".into()))
+        );
         assert_eq!(store2.get("accent"), Some(Value::Color(0x7D39_EBFF)));
         assert_eq!(store2.get("size"), Some(Value::Px(16.5)));
         // Float roundtrip — check approximate equality.
         if let Some(Value::Float(f)) = store2.get("ratio") {
-            assert!((f - 3.14).abs() < 1e-9);
+            assert!((f - 3.25).abs() < 1e-9);
         } else {
             panic!("ratio should be a Float");
         }

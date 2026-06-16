@@ -34,9 +34,7 @@ use bytemuck::{Pod, Zeroable};
 use lyon::math::{Box2D, Point};
 use lyon::path::builder::BorderRadii;
 use lyon::path::Winding;
-use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers,
-};
+use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
 use wgpu::util::DeviceExt;
 
 use glyphon::{
@@ -264,7 +262,12 @@ impl WgpuRenderer {
         let info = adapter.get_info();
         eprintln!(
             "uni-render: adapter='{}' backend={:?} device_type={:?} power={:?} driver='{}' ({})",
-            info.name, info.backend, info.device_type, power_preference, info.driver, info.driver_info
+            info.name,
+            info.backend,
+            info.device_type,
+            power_preference,
+            info.driver,
+            info.driver_info
         );
         if info.name.to_lowercase().contains("intel") {
             eprintln!(
@@ -333,20 +336,19 @@ impl WgpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let globals_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("uni-render globals layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("uni-render globals layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
 
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uni-render globals bind group"),
@@ -357,12 +359,11 @@ impl WgpuRenderer {
             }],
         });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("uni-render pipeline layout"),
-                bind_group_layouts: &[&globals_layout],
-                push_constant_ranges: &[],
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("uni-render pipeline layout"),
+            bind_group_layouts: &[&globals_layout],
+            push_constant_ranges: &[],
+        });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("uni-render flat pipeline"),
@@ -673,7 +674,7 @@ impl WgpuRenderer {
         });
         pass.set_pipeline(pipeline);
         for (i, bg) in bind_groups.iter().enumerate() {
-            pass.set_bind_group(i as u32, *bg, &[]);
+            pass.set_bind_group(i as u32, bg, &[]);
         }
         pass.draw(0..3, 0..1);
     }
@@ -713,11 +714,13 @@ impl WgpuRenderer {
             radius,
             _pad: [0.0, 0.0],
         };
-        let h_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("blur h params"),
-            contents: bytemuck::bytes_of(&h_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let h_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blur h params"),
+                contents: bytemuck::bytes_of(&h_params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let h_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blur h uniform"),
             layout: &self.blur_uniform_bgl,
@@ -744,11 +747,13 @@ impl WgpuRenderer {
             radius,
             _pad: [0.0, 0.0],
         };
-        let v_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("blur v params"),
-            contents: bytemuck::bytes_of(&v_params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let v_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blur v params"),
+                contents: bytemuck::bytes_of(&v_params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let v_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blur v uniform"),
             layout: &self.blur_uniform_bgl,
@@ -787,8 +792,13 @@ impl Renderer for WgpuRenderer {
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
         // Reallocate offscreen targets to the new physical size.
-        self.scene_tex =
-            make_target(&self.device, self.color_format, width, height, "uni-render scene_tex");
+        self.scene_tex = make_target(
+            &self.device,
+            self.color_format,
+            width,
+            height,
+            "uni-render scene_tex",
+        );
         let bw = (width / BLUR_DOWNSAMPLE).max(1);
         let bh = (height / BLUR_DOWNSAMPLE).max(1);
         self.blur_a = make_target(&self.device, self.color_format, bw, bh, "uni-render blur_a");
@@ -884,14 +894,16 @@ impl Renderer for WgpuRenderer {
         for seg in &segments {
             // 1) Draw this segment's rects + text into scene_tex.
             let (vertices, indices) = self.tessellate_rects(&seg.draws);
-            let vertex_buffer =
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("uni-render vertices"),
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-            let index_buffer =
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            let index_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("uni-render indices"),
                     contents: bytemuck::cast_slice(&indices),
                     usage: wgpu::BufferUsages::INDEX,
@@ -1045,20 +1057,20 @@ impl Renderer for WgpuRenderer {
                     _pad: [0.0, 0.0],
                 };
                 let params_buf =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("frost params"),
-                        contents: bytemuck::bytes_of(&params),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
-                let frost_uniform_bg =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("frost uniform"),
-                        layout: &self.frost_uniform_bgl,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: params_buf.as_entire_binding(),
-                        }],
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("frost params"),
+                            contents: bytemuck::bytes_of(&params),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                let frost_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("frost uniform"),
+                    layout: &self.frost_uniform_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    }],
+                });
                 let blurred_bg = self.tex_bind_group(&self.blur_a.view, "frost backdrop");
 
                 // Composite the panel onto scene_tex (alpha blend, no clear).

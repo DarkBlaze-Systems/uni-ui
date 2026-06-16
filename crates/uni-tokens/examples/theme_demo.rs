@@ -39,13 +39,7 @@ fn print_pair(dark: &Palette, light: &Palette) {
     println!("    {:<12} {:<12} {:<12}", "-----", "----", "-----");
     for (name, d, l) in rows {
         let same = if d == l { "  (shared)" } else { "" };
-        println!(
-            "    {:<12} {:<12} {:<12}{}",
-            name,
-            hex(d),
-            hex(l),
-            same,
-        );
+        println!("    {:<12} {:<12} {:<12}{}", name, hex(d), hex(l), same,);
     }
 }
 
@@ -59,10 +53,7 @@ fn main() {
             Variant::Internal => "violet",
             Variant::Public => "lime",
         };
-        println!(
-            "Variant::{:?}  (accent = {})",
-            variant, accent_name,
-        );
+        println!("Variant::{:?}  (accent = {})", variant, accent_name,);
 
         let dark = Palette::for_mode(ThemeMode::Dark, variant);
         let light = Palette::for_mode(ThemeMode::Light, variant);
@@ -73,10 +64,7 @@ fn main() {
             dark.substrate, light.substrate,
             "dark and light substrates must differ",
         );
-        assert_eq!(
-            dark.accent, light.accent,
-            "accent is mode-independent",
-        );
+        assert_eq!(dark.accent, light.accent, "accent is mode-independent",);
         println!();
     }
 

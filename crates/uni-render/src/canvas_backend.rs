@@ -74,7 +74,7 @@ impl CanvasRenderer {
             // Scatter back to the RGBA byte buffer.
             for (i, packed) in row_u32.iter().enumerate() {
                 let p = base + i * 4;
-                self.pixels[p]     = ((*packed >> 24) & 0xFF) as u8;
+                self.pixels[p] = ((*packed >> 24) & 0xFF) as u8;
                 self.pixels[p + 1] = ((*packed >> 16) & 0xFF) as u8;
                 self.pixels[p + 2] = ((*packed >> 8) & 0xFF) as u8;
                 self.pixels[p + 3] = (*packed & 0xFF) as u8;
@@ -95,17 +95,27 @@ impl Renderer for CanvasRenderer {
         self.pixels.iter_mut().for_each(|p| *p = 0);
         for cmd in scene {
             match cmd {
-                DrawCmd::FilledRect { x, y, w, h, color, .. } => {
+                DrawCmd::FilledRect {
+                    x, y, w, h, color, ..
+                } => {
                     self.fill_rect(*x, *y, *w, *h, *color);
                 }
-                DrawCmd::Text { x, y, content, color, size } => {
+                DrawCmd::Text {
+                    x,
+                    y,
+                    content,
+                    color,
+                    size,
+                } => {
                     // In the software backend, draw text as a colored bar
                     // (real text rendering needs cosmic-text; this is the stub).
                     let w = (content.len() as f32 * size * 0.6).max(4.0);
                     let h = *size + 2.0;
                     self.fill_rect(*x, *y, w, h, *color);
                 }
-                DrawCmd::FrostedRect { x, y, w, h, tint, .. } => {
+                DrawCmd::FrostedRect {
+                    x, y, w, h, tint, ..
+                } => {
                     // Frosted glass: just fill with semi-transparent tint.
                     let tinted = (*tint & 0xFFFFFF00) | 0xCC;
                     self.fill_rect(*x, *y, *w, *h, tinted);
@@ -124,10 +134,14 @@ mod canvas_tests {
     fn canvas_renders_filled_rect_into_pixels() {
         let mut r = CanvasRenderer::new(10, 10);
         r.render(&vec![DrawCmd::FilledRect {
-            x: 2.0, y: 2.0, w: 4.0, h: 4.0,
+            x: 2.0,
+            y: 2.0,
+            w: 4.0,
+            h: 4.0,
             color: 0xFF0000FF, // red, fully opaque
             corner_radius: 0.0,
-        }]).unwrap();
+        }])
+        .unwrap();
         // Pixel at (3,3) should be red.
         let idx = (3 * 10 + 3) * 4;
         assert_eq!(r.pixels[idx], 255, "R channel");
@@ -139,9 +153,14 @@ mod canvas_tests {
     fn canvas_clears_between_renders() {
         let mut r = CanvasRenderer::new(4, 4);
         r.render(&vec![DrawCmd::FilledRect {
-            x: 0.0, y: 0.0, w: 4.0, h: 4.0,
-            color: 0x00FF00FF, corner_radius: 0.0,
-        }]).unwrap();
+            x: 0.0,
+            y: 0.0,
+            w: 4.0,
+            h: 4.0,
+            color: 0x00FF00FF,
+            corner_radius: 0.0,
+        }])
+        .unwrap();
         r.render(&vec![]).unwrap(); // empty scene
         assert!(r.pixels.iter().all(|&p| p == 0), "pixels should be cleared");
     }

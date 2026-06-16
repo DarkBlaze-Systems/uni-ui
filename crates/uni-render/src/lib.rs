@@ -16,7 +16,8 @@
 //!    render pass).
 //!
 //! Input flows the same way, in reverse: [`InputEvent`] / [`PointerButton`]
-//! (in [`input`]) are a renderer-agnostic input vocabulary in logical pixels
+//! (in the `input` module) are a renderer-agnostic input vocabulary in logical
+//! pixels
 //! that `uni-core` can hit-test against a [`Scene`] without touching winit. The
 //! winit-using helper [`translate_window_event`] lowers a concrete
 //! `winit::event::WindowEvent` into an [`InputEvent`].

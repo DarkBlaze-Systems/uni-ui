@@ -291,7 +291,10 @@ mod tests {
         // status_text must exist and be a child of content.
         assert!(doc.get(tb.status_text).is_some(), "status_text not in doc");
         assert!(
-            doc.get(tb.content).unwrap().children.contains(&tb.status_text),
+            doc.get(tb.content)
+                .unwrap()
+                .children
+                .contains(&tb.status_text),
             "status_text is not a child of content"
         );
     }
@@ -413,11 +416,7 @@ mod tests {
         ] {
             let (w, h) = tb.transition(&mut doc, stage, vw);
             assert_eq!(h, stage.target_height(), "height mismatch for {stage:?}");
-            assert_eq!(
-                w,
-                stage.width_fraction(vw),
-                "width mismatch for {stage:?}"
-            );
+            assert_eq!(w, stage.width_fraction(vw), "width mismatch for {stage:?}");
         }
     }
 

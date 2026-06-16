@@ -6,10 +6,18 @@ edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
-# Keystone crate: zero dependencies by design. The IR is pure data + a
-# mutation stream; everything else in the engine lowers into it or consumes
-# its mutations. Standard library only.
+# Keystone crate: lean by design. The IR is pure data + a mutation stream;
+# everything else in the engine lowers into it or consumes its mutations.
+# The only optional dependency is serde, for the JSON wire format — on by
+# default so the IR can cross a process/network boundary out of the box, but
+# strippable for a std-only build.
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "dep:serde_json"]
 
 # Dev-only: the three foreign-language importers, used by examples to prove
 # that Slint / Flutter / SwiftUI all converge onto this one IR vocabulary.

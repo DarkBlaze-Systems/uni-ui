@@ -149,7 +149,7 @@ impl WebBackend for StubWebBackend {
             y: rect.y,
             w: rect.w,
             h: rect.h,
-            color: 0x101418_ff,
+            color: 0x10_14_18_ff,
             corner_radius: 8.0,
         });
 
@@ -160,7 +160,7 @@ impl WebBackend for StubWebBackend {
             y: rect.y + 12.0,
             content: format!("WebFrame: {}", self.url),
             size: 16.0,
-            color: 0xe6edf3_ff,
+            color: 0xe6_ed_f3_ff,
         });
     }
 
@@ -212,7 +212,10 @@ mod tests {
                     if *x == 10.0 && *y == 20.0 && *w == 300.0 && *h == 200.0
             )
         });
-        assert!(has_panel, "paint must draw the placeholder panel into the rect");
+        assert!(
+            has_panel,
+            "paint must draw the placeholder panel into the rect"
+        );
 
         // There must be a Text command containing the loaded url.
         let url_in_text = scene.iter().any(|c| match c {

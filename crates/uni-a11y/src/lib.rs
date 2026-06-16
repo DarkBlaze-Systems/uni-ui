@@ -26,9 +26,9 @@
 //! | `Rect` / `Frost` / `FrostedRect`   | `GenericContainer` (decorative) |
 //! | anything else                      | `GenericContainer` |
 
-use accesskit::{Action, Node as A11yNode, NodeId as A11yNodeId, Rect, Role, Tree, TreeId};
 /// Re-export so downstream crates can name the return type without a direct accesskit dep.
 pub use accesskit::TreeUpdate;
+use accesskit::{Action, Node as A11yNode, NodeId as A11yNodeId, Rect, Role, Tree, TreeId};
 
 use uni_core::{ComputedRect, Layout};
 use uni_ir::{Document, NodeId, Value};
@@ -150,7 +150,7 @@ fn walk(
 ///
 /// When `focused` is `Some(id)`, the tree update's `focus` field is set to the
 /// accesskit id of that IR node (so the platform highlights it). When `None`,
-/// focus defaults to the synthetic [`ROOT_ID`] (no node focused).
+/// focus defaults to the synthetic root (no node focused).
 ///
 /// Feed the returned update to an `accesskit` platform adapter
 /// (e.g. `accesskit_winit`) to expose the UI to assistive technology.
@@ -219,11 +219,12 @@ mod tests {
     }
 
     fn set_root(doc: &mut Document, id: NodeId) {
-        doc.apply_from(Origin::System, Mutation::SetRoot { id }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
     }
 
     /// Find the built node for an IR id in a TreeUpdate's node list.
-    fn find<'a>(update: &'a TreeUpdate, ir: NodeId) -> &'a A11yNode {
+    fn find(update: &TreeUpdate, ir: NodeId) -> &A11yNode {
         let want = a11y_id(ir);
         &update
             .nodes
@@ -284,7 +285,7 @@ mod tests {
         // ---- Text node: Label role, name "Hi", bounds matching the layout. ----
         let a_text = find(&update, text);
         assert_eq!(a_text.role(), Role::Label);
-        assert_eq!(a_text.label().as_deref(), Some("Hi"));
+        assert_eq!(a_text.label(), Some("Hi"));
 
         let lr = layout.rect(text).expect("text laid out");
         let b = a_text.bounds().expect("text has bounds");
@@ -296,7 +297,7 @@ mod tests {
         // ---- Button: Button role, actionable (Click + Focus). ----
         let a_btn = find(&update, btn);
         assert_eq!(a_btn.role(), Role::Button);
-        assert_eq!(a_btn.label().as_deref(), Some("Go"));
+        assert_eq!(a_btn.label(), Some("Go"));
         assert!(
             a_btn.supports_action(Action::Click),
             "button should support Click"
@@ -328,6 +329,74 @@ mod tests {
         // The update is rooted at our synthetic window and focuses it.
         assert_eq!(update.tree.as_ref().unwrap().root, ROOT_ID);
         assert_eq!(update.focus, ROOT_ID);
+    }
+
+    /// **F2 — every Button is announceable and actionable.** For *every* IR
+    /// node that maps to [`Role::Button`], the emitted accesskit node must carry
+    /// a non-empty name (so a screen reader can speak it) and at least one
+    /// actionable [`Action`] (so it can be activated). A button a screen-reader
+    /// can neither name nor press is a dead control; this guards against it.
+    #[test]
+    fn every_button_has_a_name_and_an_action() {
+        let mut doc = Document::new();
+
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        // A button named via `label`, with a click callback.
+        let save = node(&mut doc, "Button");
+        prop(&mut doc, save, "label", Value::Text("Save".into()));
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetCallback {
+                id: save,
+                event: "click".into(),
+                action: IrAction {
+                    name: "save".into(),
+                    args: vec![],
+                },
+            },
+        )
+        .unwrap();
+        child(&mut doc, root, save);
+
+        // A second button named via the `name` prop, also clickable.
+        let cancel = node(&mut doc, "Button");
+        prop(&mut doc, cancel, "name", Value::Text("Cancel".into()));
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetCallback {
+                id: cancel,
+                event: "click".into(),
+                action: IrAction {
+                    name: "cancel".into(),
+                    args: vec![],
+                },
+            },
+        )
+        .unwrap();
+        child(&mut doc, root, cancel);
+
+        let layout = uni_core::layout(&doc, (800.0, 600.0));
+        let update = build_tree(&doc, &layout, None);
+
+        // Walk every emitted node; for each one whose role is Button, assert it
+        // has a non-empty name and supports an actionable Click.
+        let mut buttons_seen = 0;
+        for (aid, anode) in &update.nodes {
+            if anode.role() == Role::Button {
+                buttons_seen += 1;
+                assert!(
+                    anode.label().map(|s| !s.is_empty()).unwrap_or(false),
+                    "Button {aid:?} must have a non-empty name"
+                );
+                assert!(
+                    anode.supports_action(Action::Click),
+                    "Button {aid:?} must support an actionable Click"
+                );
+            }
+        }
+        assert_eq!(buttons_seen, 2, "both Button nodes should be in the tree");
     }
 
     #[test]

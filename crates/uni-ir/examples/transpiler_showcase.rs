@@ -173,10 +173,7 @@ fn main() {
     println!("    Slint   : {ks:?}");
     println!("    Flutter : {kf:?}");
     println!("    SwiftUI : {kw:?}");
-    println!(
-        "    identical sets : {}",
-        ks == kf && kf == kw
-    );
+    println!("    identical sets : {}", ks == kf && kf == kw);
 
     // Make the example self-checking: fail the run if convergence breaks.
     assert!(converged, "root kinds must converge");

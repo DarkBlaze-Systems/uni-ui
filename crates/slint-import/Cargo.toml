@@ -8,3 +8,11 @@ publish.workspace = true
 
 [dependencies]
 uni-ir = { path = "../uni-ir" }
+
+# Sibling importers — used ONLY by the cross-dialect differential test
+# (tests/differential.rs), which proves all three frontends lower an equivalent
+# button-in-column snippet to structurally equal IR. No circular dependency:
+# neither flutter-import nor swiftui-import depends on slint-import.
+[dev-dependencies]
+flutter-import = { path = "../flutter-import" }
+swiftui-import = { path = "../swiftui-import" }

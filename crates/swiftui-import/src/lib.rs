@@ -22,13 +22,46 @@ pub struct SwiftUIImportError {
 
 impl std::fmt::Display for SwiftUIImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "swiftui-import error at line {}: {}", self.line, self.message)
+        write!(
+            f,
+            "swiftui-import error at line {}: {}",
+            self.line, self.message
+        )
     }
 }
 impl std::error::Error for SwiftUIImportError {}
 
 fn err(msg: impl Into<String>, line: usize) -> SwiftUIImportError {
-    SwiftUIImportError { message: msg.into(), line }
+    SwiftUIImportError {
+        message: msg.into(),
+        line,
+    }
+}
+
+// ─────────────────────────────────────────────────────────── unsupported ──────
+
+/// A modifier the importer recognized but deliberately *dropped* rather than
+/// lower into the IR.
+///
+/// SwiftUI's modifier chain is vast (`.shadow`, `.accessibilityLabel`,
+/// `.animation`, `.transition`, …) and most of it has no home in our opinionated
+/// vocabulary yet. Instead of silently eating an unknown `.modifier(...)`, every
+/// drop is recorded here so the caller — and the AI companion driving a port —
+/// can see exactly what fidelity was lost and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unsupported {
+    /// 1-based source line where the dropped modifier began.
+    pub line: usize,
+    /// A short description of what was dropped (e.g. `"modifier .shadow"`).
+    pub text: String,
+}
+
+/// The full result of [`parse_with_report`]: the lowered document plus the list
+/// of modifiers that were dropped on the floor.
+#[derive(Debug)]
+pub struct ImportReport {
+    pub document: Document,
+    pub unsupported: Vec<Unsupported>,
 }
 
 // ─────────────────────────────────────────────────────────────────── AST ─────
@@ -51,6 +84,8 @@ struct SwiftView {
     props: Vec<(String, SwiftValue)>,
     callbacks: Vec<String>, // event names that have closures
     children: Vec<SwiftView>,
+    /// Modifiers recognized but dropped (recorded for the import report).
+    unsupported: Vec<Unsupported>,
 }
 
 // ───────────────────────────────────────────────────────────────── lexer ─────
@@ -63,7 +98,11 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1 }
+        Self {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -73,29 +112,43 @@ impl<'a> Lexer<'a> {
     fn advance(&mut self) -> Option<u8> {
         let c = self.src.get(self.pos).copied()?;
         self.pos += 1;
-        if c == b'\n' { self.line += 1; }
+        if c == b'\n' {
+            self.line += 1;
+        }
         Some(c)
     }
 
     fn skip_ws(&mut self) {
         loop {
-            while self.peek().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+            while self
+                .peek()
+                .map(|c| c.is_ascii_whitespace())
+                .unwrap_or(false)
+            {
                 self.advance();
             }
             if self.pos + 1 < self.src.len()
                 && self.src[self.pos] == b'/'
                 && self.src[self.pos + 1] == b'/'
             {
-                while self.peek().map(|c| c != b'\n').unwrap_or(false) { self.advance(); }
-            } else { break; }
+                while self.peek().map(|c| c != b'\n').unwrap_or(false) {
+                    self.advance();
+                }
+            } else {
+                break;
+            }
         }
     }
 
     fn read_ident(&mut self) -> String {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == b'_' { s.push(c as char); self.advance(); }
-            else { break; }
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                s.push(c as char);
+                self.advance();
+            } else {
+                break;
+            }
         }
         s
     }
@@ -121,8 +174,12 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self) -> f64 {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == b'.' { s.push(c as char); self.advance(); }
-            else { break; }
+            if c.is_ascii_digit() || c == b'.' {
+                s.push(c as char);
+                self.advance();
+            } else {
+                break;
+            }
         }
         s.parse().unwrap_or(0.0)
     }
@@ -130,8 +187,14 @@ impl<'a> Lexer<'a> {
     fn skip_balanced(&mut self, open: u8, close: u8) {
         let mut depth = 1i32;
         while let Some(c) = self.advance() {
-            if c == open { depth += 1; }
-            else if c == close { depth -= 1; if depth == 0 { break; } }
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
         }
     }
 }
@@ -197,15 +260,27 @@ fn parse_color_arg(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError
         // parse key: value, ...
         loop {
             lex.skip_ws();
-            if lex.peek() == Some(b')') { lex.advance(); break; }
+            if lex.peek() == Some(b')') {
+                lex.advance();
+                break;
+            }
             let key = lex.read_ident();
             lex.skip_ws();
-            if lex.peek() == Some(b':') { lex.advance(); }
+            if lex.peek() == Some(b':') {
+                lex.advance();
+            }
             lex.skip_ws();
             let v = lex.read_number();
-            match key.as_str() { "red" => r = v, "green" => g = v, "blue" => b = v, _ => {} }
+            match key.as_str() {
+                "red" => r = v,
+                "green" => g = v,
+                "blue" => b = v,
+                _ => {}
+            }
             lex.skip_ws();
-            if lex.peek() == Some(b',') { lex.advance(); }
+            if lex.peek() == Some(b',') {
+                lex.advance();
+            }
         }
         let packed = (((r * 255.0) as u32) << 24)
             | (((g * 255.0) as u32) << 16)
@@ -227,16 +302,14 @@ fn parse_color_arg(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError
 
 /// Parse a SwiftUI view starting just AFTER the kind name has been read.
 /// `kind` is already consumed.
-fn parse_view_body(
-    lex: &mut Lexer<'_>,
-    kind: String,
-) -> Result<SwiftView, SwiftUIImportError> {
+fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, SwiftUIImportError> {
     let mut view = SwiftView {
         kind,
         label: None,
         props: vec![],
         callbacks: vec![],
         children: vec![],
+        unsupported: vec![],
     };
 
     lex.skip_ws();
@@ -249,12 +322,18 @@ fn parse_view_body(
             view.label = Some(lex.read_string()?);
             lex.skip_ws();
             // optional trailing comma + more args
-            if lex.peek() == Some(b',') { lex.advance(); lex.skip_ws(); }
+            if lex.peek() == Some(b',') {
+                lex.advance();
+                lex.skip_ws();
+            }
         }
         // Parse remaining key: value pairs
         loop {
             lex.skip_ws();
-            if lex.peek() == Some(b')') { lex.advance(); break; }
+            if lex.peek() == Some(b')') {
+                lex.advance();
+                break;
+            }
             if lex.peek().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
                 let key = lex.read_ident();
                 lex.skip_ws();
@@ -266,9 +345,14 @@ fn parse_view_body(
                 }
             }
             lex.skip_ws();
-            if lex.peek() == Some(b',') { lex.advance(); }
-            else if lex.peek() == Some(b')') { lex.advance(); break; }
-            else { break; }
+            if lex.peek() == Some(b',') {
+                lex.advance();
+            } else if lex.peek() == Some(b')') {
+                lex.advance();
+                break;
+            } else {
+                break;
+            }
         }
         lex.skip_ws();
     }
@@ -290,7 +374,7 @@ fn parse_view_body(
             view.callbacks.push("click".into());
             lex.skip_balanced(b'{', b'}');
             lex.skip_ws();
-            return Ok(apply_modifiers(lex, view)?);
+            return apply_modifiers(lex, view);
         }
     }
 
@@ -299,8 +383,13 @@ fn parse_view_body(
         lex.advance(); // {
         loop {
             lex.skip_ws();
-            if lex.peek() == Some(b'}') { lex.advance(); break; }
-            if lex.peek().is_none() { break; }
+            if lex.peek() == Some(b'}') {
+                lex.advance();
+                break;
+            }
+            if lex.peek().is_none() {
+                break;
+            }
             if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                 let child_kind = lex.read_ident();
                 let child = parse_view_body(lex, child_kind)?;
@@ -327,8 +416,11 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
                 Ok(SwiftValue::Color(c))
             } else {
                 let px = font_role_px(&name);
-                if px > 0.0 { Ok(SwiftValue::FontRole(px)) }
-                else { Ok(SwiftValue::Ident(name)) }
+                if px > 0.0 {
+                    Ok(SwiftValue::FontRole(px))
+                } else {
+                    Ok(SwiftValue::Ident(name))
+                }
             }
         }
         Some(c) if c.is_ascii_digit() => Ok(SwiftValue::Float(lex.read_number())),
@@ -352,11 +444,16 @@ fn apply_modifiers(
 ) -> Result<SwiftView, SwiftUIImportError> {
     loop {
         lex.skip_ws();
-        if lex.peek() != Some(b'.') { break; }
+        if lex.peek() != Some(b'.') {
+            break;
+        }
+        let modifier_line = lex.line;
         lex.advance(); // .
         let modifier = lex.read_ident();
         lex.skip_ws();
-        if lex.peek() != Some(b'(') { continue; }
+        if lex.peek() != Some(b'(') {
+            continue;
+        }
         lex.advance(); // (
         lex.skip_ws();
 
@@ -364,7 +461,8 @@ fn apply_modifiers(
             "font" => {
                 let v = parse_value(lex)?;
                 if let SwiftValue::FontRole(px) = v {
-                    view.props.push(("size".into(), SwiftValue::Float(px as f64)));
+                    view.props
+                        .push(("size".into(), SwiftValue::Float(px as f64)));
                 }
             }
             "foregroundColor" | "foregroundStyle" => {
@@ -383,10 +481,14 @@ fn apply_modifiers(
                 // frame(width: N, height: M) or frame(maxWidth: .infinity)
                 loop {
                     lex.skip_ws();
-                    if lex.peek() == Some(b')') { break; }
+                    if lex.peek() == Some(b')') {
+                        break;
+                    }
                     let key = lex.read_ident();
                     lex.skip_ws();
-                    if lex.peek() == Some(b':') { lex.advance(); }
+                    if lex.peek() == Some(b':') {
+                        lex.advance();
+                    }
                     lex.skip_ws();
                     let v = parse_value(lex)?;
                     match key.as_str() {
@@ -395,7 +497,9 @@ fn apply_modifiers(
                         _ => {}
                     }
                     lex.skip_ws();
-                    if lex.peek() == Some(b',') { lex.advance(); }
+                    if lex.peek() == Some(b',') {
+                        lex.advance();
+                    }
                 }
             }
             "padding" => {
@@ -405,7 +509,8 @@ fn apply_modifiers(
             "cornerRadius" | "clipShape" => {
                 let v = parse_value(lex)?;
                 if let SwiftValue::Float(r) = v {
-                    view.props.push(("corner_radius".into(), SwiftValue::Float(r)));
+                    view.props
+                        .push(("corner_radius".into(), SwiftValue::Float(r)));
                 }
             }
             "opacity" => {
@@ -415,13 +520,25 @@ fn apply_modifiers(
             "onTapGesture" | "onLongPressGesture" => {
                 view.callbacks.push("click".into());
             }
-            _ => {}
+            other => {
+                // A modifier with no IR home (e.g. .shadow, .animation,
+                // .accessibilityLabel). Its arguments are consumed below.
+                view.unsupported.push(Unsupported {
+                    line: modifier_line,
+                    text: format!("modifier .{other}"),
+                });
+            }
         }
         // consume to closing )
         loop {
             lex.skip_ws();
-            if lex.peek() == Some(b')') { lex.advance(); break; }
-            if lex.peek().is_none() { break; }
+            if lex.peek() == Some(b')') {
+                lex.advance();
+                break;
+            }
+            if lex.peek().is_none() {
+                break;
+            }
             lex.advance();
         }
     }
@@ -432,7 +549,9 @@ fn parse_file(lex: &mut Lexer<'_>) -> Result<Vec<SwiftView>, SwiftUIImportError>
     let mut views = Vec::new();
     loop {
         lex.skip_ws();
-        if lex.peek().is_none() { break; }
+        if lex.peek().is_none() {
+            break;
+        }
         if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
             let kind = lex.read_ident();
             let view = parse_view_body(lex, kind)?;
@@ -457,24 +576,40 @@ fn swiftval_to_ir(v: SwiftValue) -> Value {
     }
 }
 
-fn lower_view(view: &SwiftView, doc: &mut Document) -> Option<NodeId> {
+fn lower_view(
+    view: &SwiftView,
+    doc: &mut Document,
+    unsupported: &mut Vec<Unsupported>,
+) -> Option<NodeId> {
+    // Hoist this view's dropped modifiers into the flat report.
+    unsupported.extend(view.unsupported.iter().cloned());
+
     let kind = map_kind(&view.kind).to_string();
     let id = doc.fresh_id();
-    doc.apply_from(Origin::System, Mutation::CreateNode { id, kind }).ok()?;
+    doc.apply_from(Origin::System, Mutation::CreateNode { id, kind })
+        .ok()?;
 
     // Label → content prop
     if let Some(label) = &view.label {
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id, key: "content".into(), value: Value::Text(label.clone()) },
-        ).ok();
+            Mutation::SetProp {
+                id,
+                key: "content".into(),
+                value: Value::Text(label.clone()),
+            },
+        )
+        .ok();
     }
 
     for (key, val) in &view.props {
         let ir_val = match val {
             SwiftValue::Float(f) => {
                 // If key is size/width/height/padding/corner_radius, use Px
-                if matches!(key.as_str(), "size" | "width" | "height" | "padding" | "corner_radius" | "opacity") {
+                if matches!(
+                    key.as_str(),
+                    "size" | "width" | "height" | "padding" | "corner_radius" | "opacity"
+                ) {
                     Value::Px(*f as f32)
                 } else {
                     Value::Float(*f)
@@ -482,7 +617,15 @@ fn lower_view(view: &SwiftView, doc: &mut Document) -> Option<NodeId> {
             }
             other => swiftval_to_ir(other.clone()),
         };
-        doc.apply_from(Origin::System, Mutation::SetProp { id, key: key.clone(), value: ir_val }).ok();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key: key.clone(),
+                value: ir_val,
+            },
+        )
+        .ok();
     }
 
     for event in &view.callbacks {
@@ -491,14 +634,25 @@ fn lower_view(view: &SwiftView, doc: &mut Document) -> Option<NodeId> {
             Mutation::SetCallback {
                 id,
                 event: event.clone(),
-                action: Action { name: "action".into(), args: vec![] },
+                action: Action {
+                    name: "action".into(),
+                    args: vec![],
+                },
             },
-        ).ok();
+        )
+        .ok();
     }
 
     for child in &view.children {
-        if let Some(child_id) = lower_view(child, doc) {
-            doc.apply_from(Origin::System, Mutation::AppendChild { parent: id, child: child_id }).ok();
+        if let Some(child_id) = lower_view(child, doc, unsupported) {
+            doc.apply_from(
+                Origin::System,
+                Mutation::AppendChild {
+                    parent: id,
+                    child: child_id,
+                },
+            )
+            .ok();
         }
     }
 
@@ -509,13 +663,27 @@ fn lower_view(view: &SwiftView, doc: &mut Document) -> Option<NodeId> {
 
 /// Parse a SwiftUI source string and return a `uni_ir::Document`.
 /// The first top-level view becomes the document root.
+///
+/// This is the lossy-by-design front door: dropped modifiers are discarded.
+/// Use [`parse_with_report`] when you need to know what was lost.
 pub fn parse(src: &str) -> Result<Document, SwiftUIImportError> {
+    Ok(parse_with_report(src)?.document)
+}
+
+/// Parse a SwiftUI source string into a [`Document`] *and* a list of the
+/// modifiers that were recognized but dropped rather than lowered.
+///
+/// Additive sibling to [`parse`]: same lowering, but the [`ImportReport`] also
+/// surfaces every [`Unsupported`] drop (unknown `.modifier(...)` chains) with
+/// its source line.
+pub fn parse_with_report(src: &str) -> Result<ImportReport, SwiftUIImportError> {
     let mut lex = Lexer::new(src);
     let views = parse_file(&mut lex)?;
     let mut doc = Document::new();
+    let mut unsupported = Vec::new();
     let mut root_set = false;
     for view in &views {
-        if let Some(id) = lower_view(view, &mut doc) {
+        if let Some(id) = lower_view(view, &mut doc, &mut unsupported) {
             if !root_set {
                 doc.apply_from(Origin::System, Mutation::SetRoot { id })
                     .map_err(|e| err(format!("{e:?}"), 0))?;
@@ -523,7 +691,10 @@ pub fn parse(src: &str) -> Result<Document, SwiftUIImportError> {
             }
         }
     }
-    Ok(doc)
+    Ok(ImportReport {
+        document: doc,
+        unsupported,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────── tests ───────
@@ -600,10 +771,14 @@ mod tests {
 
     #[test]
     fn parse_rounded_rect_corner_radius() {
-        let v = root_prop("RoundedRectangle(cornerRadius: 16).frame(width: 100, height: 40)", "corner_radius");
-        // cornerRadius inline arg — maps to corner_radius
-        // Note: the cornerRadius param goes through the inline args path
-        assert!(v.is_some() || true); // Accept either path; main check is no panic
+        let v = root_prop(
+            "RoundedRectangle(cornerRadius: 16).frame(width: 100, height: 40)",
+            "corner_radius",
+        );
+        // cornerRadius inline arg — maps to corner_radius. The point of this
+        // case is that the inline-args path parses without panicking; whether
+        // the value is currently surfaced as a prop is not asserted here.
+        let _ = v;
     }
 
     #[test]
@@ -635,5 +810,46 @@ mod tests {
     fn parse_fill_modifier_sets_background() {
         let v = root_prop("Rectangle().fill(.blue)", "background");
         assert_eq!(v, Some(Value::Color(0x0000_FFFF)));
+    }
+
+    // ── E1: unsupported-construct reporting ───────────────────────────────────
+
+    #[test]
+    fn clean_input_reports_no_unsupported() {
+        let report = parse_with_report(r#"Text("Hi").padding(8)"#).unwrap();
+        assert!(report.unsupported.is_empty());
+        assert!(report.document.root().is_some());
+    }
+
+    #[test]
+    fn unknown_modifier_is_recorded() {
+        // `.shadow(radius: 4)` has no IR home — dropped + reported.
+        let report = parse_with_report(r#"Text("Hi").shadow(radius: 4)"#).unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].text, "modifier .shadow");
+        // The Text still lowered with its content.
+        let root = report.document.root().unwrap();
+        assert_eq!(
+            report.document.get(root).unwrap().props.get("content"),
+            Some(&Value::Text("Hi".into()))
+        );
+    }
+
+    #[test]
+    fn nested_view_modifier_drop_is_recorded() {
+        // The drop is on a child, proving the report flattens the view tree.
+        let src = r#"VStack { Text("a").accessibilityLabel("greeting") }"#;
+        let report = parse_with_report(src).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "modifier .accessibilityLabel"));
+    }
+
+    #[test]
+    fn parse_still_returns_bare_document() {
+        // Back-compat: `parse` signature unchanged, drops are silent.
+        let doc = parse(r#"Text("Hi").shadow(radius: 4)"#).unwrap();
+        assert!(doc.root().is_some());
     }
 }

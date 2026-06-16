@@ -1,0 +1,63 @@
+# DarkBlaze Uni-UI — fuzz harness.
+#
+# A cargo-fuzz crate: libFuzzer targets that hammer each importer's `parse()`
+# with arbitrary input and assert it returns a `Result` rather than panicking.
+# A parser is a trust boundary; the only acceptable failure mode is `Err`, never
+# a crash. NEVER unwinding into UB, NEVER aborting — every byte string in.
+#
+# Detached from the parent workspace (cargo-fuzz convention): the empty
+# `[workspace]` table below makes this its own root so libFuzzer's nightly-only
+# build flags don't leak into the stable workspace next door.
+#
+# Run (needs nightly + cargo-fuzz):
+#   cargo +nightly fuzz run fuzz_slint
+#   cargo +nightly fuzz run fuzz_flutter
+#   cargo +nightly fuzz run fuzz_swiftui
+#   cargo +nightly fuzz run fuzz_uni
+
+[package]
+name = "uni-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+slint-import = { path = "../crates/slint-import" }
+flutter-import = { path = "../crates/flutter-import" }
+swiftui-import = { path = "../crates/swiftui-import" }
+uni-dsl = { path = "../crates/uni-dsl" }
+
+[[bin]]
+name = "fuzz_slint"
+path = "fuzz_targets/fuzz_slint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_flutter"
+path = "fuzz_targets/fuzz_flutter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_swiftui"
+path = "fuzz_targets/fuzz_swiftui.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_uni"
+path = "fuzz_targets/fuzz_uni.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]

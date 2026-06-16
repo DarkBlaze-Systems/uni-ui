@@ -12,8 +12,8 @@
 //! - **Close the window** → the audit log prints, showing the interleaved
 //!   `Human` and `Ai` `Invoke` records: the accountability circle, made visible.
 
-use uni_reactor::Store;
 use uni_ir::{Origin, Value};
+use uni_reactor::Store;
 use uni_runtime::Runtime;
 
 /// The interactive UI, in our `.uni` DSL. The Button carries `on click:

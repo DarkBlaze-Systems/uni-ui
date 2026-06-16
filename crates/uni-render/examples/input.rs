@@ -79,7 +79,9 @@ impl ApplicationHandler for App {
             Ok(r) => {
                 self.renderer = Some(r);
                 self.window = Some(window);
-                eprintln!("uni-render input demo: move / click / scroll / type to see InputEvents.");
+                eprintln!(
+                    "uni-render input demo: move / click / scroll / type to see InputEvents."
+                );
             }
             Err(e) => {
                 eprintln!("renderer init failed: {e}");
@@ -88,14 +90,8 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
-        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut())
-        else {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_mut()) else {
             return;
         };
 

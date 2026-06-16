@@ -232,7 +232,12 @@ pub fn checkbox(doc: &mut Document, tokens: &Tokens, label_text: &str, state_key
 /// frost backdrop.
 pub fn card(doc: &mut Document, tokens: &Tokens) -> NodeId {
     let root = create(doc, "Stack");
-    prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
     prop(doc, root, "padding", Value::Px(tokens.space.comfy));
     prop(doc, root, "corner_radius", Value::Px(tokens.shape.large));
     prop(doc, root, "gap", Value::Px(tokens.space.snug));
@@ -304,7 +309,12 @@ pub fn adaptive_scaffold(
             let root = create(doc, "Column");
             prop(doc, root, "width", Value::Px(env.vw(100.0)));
             prop(doc, root, "height", Value::Px(env.vh(100.0)));
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
 
             // Body grows to fill; nav sits at the bottom at natural size.
             prop(doc, body, "grow", Value::Float(1.0));
@@ -317,7 +327,12 @@ pub fn adaptive_scaffold(
             let root = create(doc, "Row");
             prop(doc, root, "width", Value::Px(env.vw(100.0)));
             prop(doc, root, "height", Value::Px(env.vh(100.0)));
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
 
             prop(doc, nav, "width", Value::Px(72.0));
             prop(doc, nav, "height", Value::Px(env.vh(100.0)));
@@ -331,7 +346,12 @@ pub fn adaptive_scaffold(
             let root = create(doc, "Row");
             prop(doc, root, "width", Value::Px(env.vw(100.0)));
             prop(doc, root, "height", Value::Px(env.vh(100.0)));
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
 
             prop(doc, nav, "width", Value::Px(256.0));
             prop(doc, nav, "height", Value::Px(env.vh(100.0)));
@@ -366,7 +386,12 @@ pub fn adaptive_nav(
         WidthClass::Compact => {
             // Horizontal bottom bar.
             let root = create(doc, "Row");
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
             prop(doc, root, "shadow", Value::Px(tokens.space.snug));
             prop(doc, root, "corner_radius", Value::Px(0.0));
 
@@ -383,7 +408,12 @@ pub fn adaptive_nav(
                 prop(doc, icon_rect, "color", Value::Color(tokens.palette.accent));
                 let icon_label = create(doc, "Text");
                 prop(doc, icon_label, "content", Value::Text((*icon).into()));
-                prop(doc, icon_label, "color", Value::Color(tokens.palette.accent));
+                prop(
+                    doc,
+                    icon_label,
+                    "color",
+                    Value::Color(tokens.palette.accent),
+                );
                 append(doc, item, icon_rect);
                 append(doc, item, icon_label);
 
@@ -415,7 +445,12 @@ pub fn adaptive_nav(
         WidthClass::Medium => {
             // Vertical rail, icon only.
             let root = create(doc, "Column");
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
             prop(doc, root, "width", Value::Px(72.0));
             prop(doc, root, "align", Value::Text("center".into()));
 
@@ -432,7 +467,12 @@ pub fn adaptive_nav(
                 prop(doc, icon_rect, "color", Value::Color(tokens.palette.accent));
                 let icon_label = create(doc, "Text");
                 prop(doc, icon_label, "content", Value::Text((*icon).into()));
-                prop(doc, icon_label, "color", Value::Color(tokens.palette.accent));
+                prop(
+                    doc,
+                    icon_label,
+                    "color",
+                    Value::Color(tokens.palette.accent),
+                );
                 append(doc, item, icon_rect);
                 append(doc, item, icon_label);
 
@@ -452,7 +492,12 @@ pub fn adaptive_nav(
         WidthClass::Expanded => {
             // Vertical sidebar, icon + label side-by-side.
             let root = create(doc, "Column");
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
             prop(doc, root, "width", Value::Px(256.0));
             prop(doc, root, "gap", Value::Px(tokens.space.snug));
             // Header spacer.
@@ -469,7 +514,12 @@ pub fn adaptive_nav(
                 prop(doc, icon_rect, "color", Value::Color(tokens.palette.accent));
                 let icon_label = create(doc, "Text");
                 prop(doc, icon_label, "content", Value::Text((*icon).into()));
-                prop(doc, icon_label, "color", Value::Color(tokens.palette.accent));
+                prop(
+                    doc,
+                    icon_label,
+                    "color",
+                    Value::Color(tokens.palette.accent),
+                );
                 append(doc, item, icon_rect);
                 append(doc, item, icon_label);
 
@@ -520,7 +570,12 @@ pub fn list_detail_pane(
     match env.width_class() {
         WidthClass::Compact => {
             let root = create(doc, "Column");
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
             prop(doc, root, "width", Value::Px(env.vw(100.0)));
             prop(doc, root, "height", Value::Px(env.vh(100.0)));
 
@@ -536,7 +591,12 @@ pub fn list_detail_pane(
         }
         WidthClass::Medium | WidthClass::Expanded => {
             let root = create(doc, "Row");
-            prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+            prop(
+                doc,
+                root,
+                "background",
+                Value::Color(tokens.palette.substrate),
+            );
             prop(doc, root, "width", Value::Px(env.vw(100.0)));
             prop(doc, root, "height", Value::Px(env.vh(100.0)));
 
@@ -587,8 +647,8 @@ mod tests {
             node.props.get("background"),
             Some(&Value::Color(t.palette.accent))
         );
-        assert!(node.props.get("padding").is_some());
-        assert!(node.props.get("corner_radius").is_some());
+        assert!(node.props.contains_key("padding"));
+        assert!(node.props.contains_key("corner_radius"));
 
         // A "click" callback firing the supplied action name.
         let click = node.callbacks.get("click").expect("has click callback");
@@ -673,8 +733,8 @@ mod tests {
 
         let node = doc.get(card_id).unwrap();
         assert!(is_container_kind(&node.kind), "kind was {}", node.kind);
-        assert!(node.props.get("padding").is_some());
-        assert!(node.props.get("corner_radius").is_some());
+        assert!(node.props.contains_key("padding"));
+        assert!(node.props.contains_key("corner_radius"));
 
         // A frost backdrop child is present.
         assert!(node
@@ -738,8 +798,8 @@ mod tests {
         assert_eq!(node.children[0], body);
         assert_eq!(node.children[1], nav);
         // Scaffold carries width/height props.
-        assert!(node.props.get("width").is_some());
-        assert!(node.props.get("height").is_some());
+        assert!(node.props.contains_key("width"));
+        assert!(node.props.contains_key("height"));
     }
 
     #[test]
@@ -788,7 +848,10 @@ mod tests {
         for (i, &child_id) in node.children.iter().enumerate() {
             let child = doc.get(child_id).unwrap();
             assert_eq!(child.kind, "Column");
-            let sel = child.callbacks.get("select").expect("select callback present");
+            let sel = child
+                .callbacks
+                .get("select")
+                .expect("select callback present");
             assert_eq!(sel.name, format!("nav_select_{i}"));
         }
     }
@@ -803,7 +866,10 @@ mod tests {
         let nav = adaptive_nav(&mut doc, &t, &env, &items);
 
         let node = doc.get(nav).unwrap();
-        assert_eq!(node.kind, "Column", "Expanded nav must be a Column (sidebar)");
+        assert_eq!(
+            node.kind, "Column",
+            "Expanded nav must be a Column (sidebar)"
+        );
         assert_eq!(
             node.props.get("width"),
             Some(&Value::Px(256.0)),
@@ -926,12 +992,33 @@ pub fn scroll_view(
     let root = create(doc, "Stack");
     prop(doc, root, "width", Value::Px(width));
     prop(doc, root, "height", Value::Px(height));
-    prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
     prop(doc, root, "corner_radius", Value::Px(tokens.shape.medium));
     prop(doc, root, "overflow", Value::Text("clip".into()));
     binding(doc, root, "scroll_offset", scroll_key);
-    callback(doc, root, "scroll_up", Action { name: "scroll_up".into(), args: vec![] });
-    callback(doc, root, "scroll_down", Action { name: "scroll_down".into(), args: vec![] });
+    callback(
+        doc,
+        root,
+        "scroll_up",
+        Action {
+            name: "scroll_up".into(),
+            args: vec![],
+        },
+    );
+    callback(
+        doc,
+        root,
+        "scroll_down",
+        Action {
+            name: "scroll_down".into(),
+            args: vec![],
+        },
+    );
     append(doc, root, content_node);
     root
 }
@@ -956,17 +1043,38 @@ pub fn text_input(
     let root = create(doc, "Row");
     prop(doc, root, "width", Value::Px(280.0));
     prop(doc, root, "height", Value::Px(40.0));
-    prop(doc, root, "background", Value::Color(tokens.palette.substrate));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
     prop(doc, root, "corner_radius", Value::Px(tokens.shape.small));
     prop(doc, root, "padding", Value::Px(tokens.space.snug));
     prop(doc, root, "placeholder", Value::Text(placeholder.into()));
-    callback(doc, root, "submit", Action { name: "submit".into(), args: vec![] });
-    callback(doc, root, "focus",  Action { name: "focus".into(),  args: vec![] });
+    callback(
+        doc,
+        root,
+        "submit",
+        Action {
+            name: "submit".into(),
+            args: vec![],
+        },
+    );
+    callback(
+        doc,
+        root,
+        "focus",
+        Action {
+            name: "focus".into(),
+            args: vec![],
+        },
+    );
 
     let text = create(doc, "Text");
     binding(doc, text, "content", value_key);
     prop(doc, text, "color", Value::Color(tokens.palette.ink));
-    prop(doc, text, "size",  Value::Px(tokens.r#type.body.base.size));
+    prop(doc, text, "size", Value::Px(tokens.r#type.body.base.size));
     append(doc, root, text);
 
     root
@@ -981,12 +1089,7 @@ pub fn text_input(
 /// Callers append the returned node to a container that overlays the UI
 /// (e.g. a `ZStack`-style `Stack`) and set `visible: Bool(true/false)` in
 /// the Store via `visible_key` to show/hide it.
-pub fn tooltip(
-    doc: &mut Document,
-    tokens: &Tokens,
-    text: &str,
-    visible_key: &str,
-) -> NodeId {
+pub fn tooltip(doc: &mut Document, tokens: &Tokens, text: &str, visible_key: &str) -> NodeId {
     let root = create(doc, "Stack");
     prop(doc, root, "background", Value::Color(tokens.palette.ink));
     prop(doc, root, "corner_radius", Value::Px(tokens.shape.small));
@@ -997,7 +1100,12 @@ pub fn tooltip(
     let label = create(doc, "Text");
     prop(doc, label, "content", Value::Text(text.into()));
     prop(doc, label, "color", Value::Color(tokens.palette.substrate));
-    prop(doc, label, "size",  Value::Px(tokens.r#type.caption.base.size));
+    prop(
+        doc,
+        label,
+        "size",
+        Value::Px(tokens.r#type.caption.base.size),
+    );
     append(doc, root, label);
 
     root
@@ -1008,24 +1116,37 @@ mod scroll_input_tests {
     use super::*;
     use uni_tokens::Tokens;
 
-    fn tokens() -> Tokens { Tokens::for_variant(uni_tokens::Variant::Internal) }
+    fn tokens() -> Tokens {
+        Tokens::for_variant(uni_tokens::Variant::Internal)
+    }
 
     #[test]
     fn scroll_view_has_scroll_callbacks() {
         let mut doc = Document::new();
         let content = {
             let id = doc.fresh_id();
-            doc.apply_from(Origin::System, uni_ir::Mutation::CreateNode {
-                id, kind: "Stack".into(),
-            }).unwrap();
+            doc.apply_from(
+                Origin::System,
+                uni_ir::Mutation::CreateNode {
+                    id,
+                    kind: "Stack".into(),
+                },
+            )
+            .unwrap();
             id
         };
         let t = tokens();
         let sv = scroll_view(&mut doc, &t, content, "offset", 400.0, 300.0);
         let n = doc.get(sv).unwrap();
         assert!(n.callbacks.contains_key("scroll_up"), "missing scroll_up");
-        assert!(n.callbacks.contains_key("scroll_down"), "missing scroll_down");
-        assert_eq!(n.bindings.get("scroll_offset").map(|b| b.expr.as_str()), Some("offset"));
+        assert!(
+            n.callbacks.contains_key("scroll_down"),
+            "missing scroll_down"
+        );
+        assert_eq!(
+            n.bindings.get("scroll_offset").map(|b| b.expr.as_str()),
+            Some("offset")
+        );
     }
 
     #[test]
@@ -1033,9 +1154,14 @@ mod scroll_input_tests {
         let mut doc = Document::new();
         let content = {
             let id = doc.fresh_id();
-            doc.apply_from(Origin::System, uni_ir::Mutation::CreateNode {
-                id, kind: "Stack".into(),
-            }).unwrap();
+            doc.apply_from(
+                Origin::System,
+                uni_ir::Mutation::CreateNode {
+                    id,
+                    kind: "Stack".into(),
+                },
+            )
+            .unwrap();
             id
         };
         let t = tokens();
@@ -1051,12 +1177,19 @@ mod scroll_input_tests {
         let t = tokens();
         let ti = text_input(&mut doc, &t, "Search…", "query");
         let n = doc.get(ti).unwrap();
-        assert!(n.callbacks.contains_key("submit"), "missing submit callback");
+        assert!(
+            n.callbacks.contains_key("submit"),
+            "missing submit callback"
+        );
         assert!(n.callbacks.contains_key("focus"), "missing focus callback");
         // The Text child carries the binding.
         let text_child = n.children[0];
         assert_eq!(
-            doc.get(text_child).unwrap().bindings.get("content").map(|b| b.expr.as_str()),
+            doc.get(text_child)
+                .unwrap()
+                .bindings
+                .get("content")
+                .map(|b| b.expr.as_str()),
             Some("query")
         );
     }
@@ -1067,7 +1200,10 @@ mod scroll_input_tests {
         let t = tokens();
         let tip = tooltip(&mut doc, &t, "Save", "show_tip");
         let n = doc.get(tip).unwrap();
-        assert_eq!(n.bindings.get("visible").map(|b| b.expr.as_str()), Some("show_tip"));
+        assert_eq!(
+            n.bindings.get("visible").map(|b| b.expr.as_str()),
+            Some("show_tip")
+        );
         assert_eq!(n.children.len(), 1);
     }
 }

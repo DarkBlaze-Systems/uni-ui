@@ -12,6 +12,12 @@
 //!   synthetic `If` / `For` elements carrying the expression in
 //!   `element_bindings`.
 
+// chumsky's combinators are generic over `Error = Simple<Token>`, whose
+// variant carries span + found/expected sets and so trips `result_large_err`.
+// The type is fixed by the parser library, not ours to shrink; boxing it would
+// distort every combinator signature for no real gain.
+#![allow(clippy::result_large_err)]
+
 use chumsky::prelude::*;
 
 use crate::ast::{Callback, Element, Literal, Prop, PropValue};
@@ -49,7 +55,7 @@ pub fn parser() -> impl Parser<Token, Element, Error = Simple<Token>> {
             .then(
                 literal
                     .map(PropValue::Literal)
-                    .or(binding_expr.clone().map(PropValue::Binding)),
+                    .or(binding_expr.map(PropValue::Binding)),
             )
             .then_ignore(just(Token::Semicolon))
             .map(|(key, value)| Entry::Prop(Prop { key, value }));
@@ -77,9 +83,7 @@ pub fn parser() -> impl Parser<Token, Element, Error = Simple<Token>> {
             });
 
         // `( $expr )` — a parenthesized binding expression, used by if/for.
-        let paren_expr = binding_expr
-            .clone()
-            .delimited_by(just(Token::LParen), just(Token::RParen));
+        let paren_expr = binding_expr.delimited_by(just(Token::LParen), just(Token::RParen));
 
         // A child body shared by control-flow blocks: `{ entries }` collected
         // into props/callbacks/children. Declared via a forward closure so it
@@ -121,11 +125,7 @@ pub fn parser() -> impl Parser<Token, Element, Error = Simple<Token>> {
         // Body = any number of props / callbacks / control-flow / children,
         // freely interleaved. Order the alternatives so the keyword-led
         // constructs are tried before the generic element.
-        let entry = prop
-            .or(callback)
-            .or(if_block)
-            .or(for_block)
-            .or(child);
+        let entry = prop.or(callback).or(if_block).or(for_block).or(child);
         let entries = entry.repeated();
 
         // `Kind { entries }`

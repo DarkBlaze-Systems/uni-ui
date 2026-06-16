@@ -70,7 +70,12 @@ pub struct Element {
 
 impl Element {
     /// Construct an ordinary element with no element-level bindings.
-    pub fn new(kind: String, props: Vec<Prop>, callbacks: Vec<Callback>, children: Vec<Element>) -> Self {
+    pub fn new(
+        kind: String,
+        props: Vec<Prop>,
+        callbacks: Vec<Callback>,
+        children: Vec<Element>,
+    ) -> Self {
         Element {
             kind,
             props,

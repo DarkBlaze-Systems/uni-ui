@@ -30,35 +30,113 @@ fn build_ui() -> (Document, NodeId) {
 
     // Root container.
     let root = doc.fresh_id();
-    doc.apply_from(Origin::System, Mutation::CreateNode { id: root, kind: "Stack".into() })
+    doc.apply_from(
+        Origin::System,
+        Mutation::CreateNode {
+            id: root,
+            kind: "Stack".into(),
+        },
+    )
+    .unwrap();
+    doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
         .unwrap();
-    doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: root, key: "padding".into(), value: Value::Px(24.0) }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: root, key: "gap".into(), value: Value::Px(16.0) }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: root, key: "background".into(), value: Value::Color(0x0a0a0aff) }).unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: root,
+            key: "padding".into(),
+            value: Value::Px(24.0),
+        },
+    )
+    .unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: root,
+            key: "gap".into(),
+            value: Value::Px(16.0),
+        },
+    )
+    .unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: root,
+            key: "background".into(),
+            value: Value::Color(0x0a0a0aff),
+        },
+    )
+    .unwrap();
 
     // The bound label: a `Text` whose `content` is driven by the `"label"`
     // state key. The literal is just the first-frame fallback before the store
     // is seeded; once `sync_bindings` runs, the store value wins.
     let label = doc.fresh_id();
-    doc.apply_from(Origin::System, Mutation::CreateNode { id: label, kind: "Text".into() }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: label, key: "content".into(), value: Value::Text("Clicks: 0".into()) }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: label, key: "size".into(), value: Value::Px(32.0) }).unwrap();
-    doc.apply_from(Origin::System, Mutation::SetProp { id: label, key: "color".into(), value: Value::Color(0xffffffff) }).unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::CreateNode {
+            id: label,
+            kind: "Text".into(),
+        },
+    )
+    .unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: label,
+            key: "content".into(),
+            value: Value::Text("Clicks: 0".into()),
+        },
+    )
+    .unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: label,
+            key: "size".into(),
+            value: Value::Px(32.0),
+        },
+    )
+    .unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::SetProp {
+            id: label,
+            key: "color".into(),
+            value: Value::Color(0xffffffff),
+        },
+    )
+    .unwrap();
     doc.apply_from(
         Origin::System,
         Mutation::SetBinding {
             id: label,
             key: "content".into(),
-            binding: uni_ir::Binding { expr: "label".into() },
+            binding: uni_ir::Binding {
+                expr: "label".into(),
+            },
         },
     )
     .unwrap();
-    doc.apply_from(Origin::System, Mutation::AppendChild { parent: root, child: label }).unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::AppendChild {
+            parent: root,
+            child: label,
+        },
+    )
+    .unwrap();
 
     // The button: built by the widget library, firing `increment` on click.
     let btn = button(&mut doc, &tokens, "Click me", "increment");
-    doc.apply_from(Origin::System, Mutation::AppendChild { parent: root, child: btn }).unwrap();
+    doc.apply_from(
+        Origin::System,
+        Mutation::AppendChild {
+            parent: root,
+            child: btn,
+        },
+    )
+    .unwrap();
 
     (doc, label)
 }
@@ -112,12 +190,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         button: PointerButton::Left,
     });
     assert!(handled, "the widget button should handle the click");
-    eprintln!("bound label is now: {:?} (updated VIA STATE)", label_content(&rt));
+    eprintln!(
+        "bound label is now: {:?} (updated VIA STATE)",
+        label_content(&rt)
+    );
     rt.print_audit_log();
 
     eprintln!("\n=== AI path: ai_fire on the same node ===");
     rt.ai_fire(button_id, "click");
-    eprintln!("bound label is now: {:?} (updated VIA STATE)", label_content(&rt));
+    eprintln!(
+        "bound label is now: {:?} (updated VIA STATE)",
+        label_content(&rt)
+    );
     rt.print_audit_log();
 
     // Confirm the bound label changed via state, not a direct prop write: there

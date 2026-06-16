@@ -203,19 +203,43 @@ mod tests {
 
     #[test]
     fn width_class_thresholds() {
-        assert_eq!(Env::for_window(599.0, 800.0).width_class(), WidthClass::Compact);
-        assert_eq!(Env::for_window(600.0, 800.0).width_class(), WidthClass::Medium);
-        assert_eq!(Env::for_window(839.0, 800.0).width_class(), WidthClass::Medium);
-        assert_eq!(Env::for_window(840.0, 800.0).width_class(), WidthClass::Expanded);
+        assert_eq!(
+            Env::for_window(599.0, 800.0).width_class(),
+            WidthClass::Compact
+        );
+        assert_eq!(
+            Env::for_window(600.0, 800.0).width_class(),
+            WidthClass::Medium
+        );
+        assert_eq!(
+            Env::for_window(839.0, 800.0).width_class(),
+            WidthClass::Medium
+        );
+        assert_eq!(
+            Env::for_window(840.0, 800.0).width_class(),
+            WidthClass::Expanded
+        );
         // edge: zero width is still Compact.
-        assert_eq!(Env::for_window(0.0, 800.0).width_class(), WidthClass::Compact);
+        assert_eq!(
+            Env::for_window(0.0, 800.0).width_class(),
+            WidthClass::Compact
+        );
     }
 
     #[test]
     fn height_class_thresholds() {
-        assert_eq!(Env::for_window(800.0, 479.0).height_class(), HeightClass::Short);
-        assert_eq!(Env::for_window(800.0, 480.0).height_class(), HeightClass::Tall);
-        assert_eq!(Env::for_window(800.0, 1000.0).height_class(), HeightClass::Tall);
+        assert_eq!(
+            Env::for_window(800.0, 479.0).height_class(),
+            HeightClass::Short
+        );
+        assert_eq!(
+            Env::for_window(800.0, 480.0).height_class(),
+            HeightClass::Tall
+        );
+        assert_eq!(
+            Env::for_window(800.0, 1000.0).height_class(),
+            HeightClass::Tall
+        );
     }
 
     #[test]

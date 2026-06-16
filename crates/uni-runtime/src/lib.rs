@@ -55,11 +55,22 @@
 //! The window/renderer plumbing is optional (feature-free, but only built when
 //! a real window is created), so the core fire→handler→mutation cycle is fully
 //! unit-testable headless — see the tests at the bottom of this file.
+//!
+//! ## D3 — incremental-layout foundation (partial)
+//!
+//! Every applied [`Mutation`] names the node(s) it touched. The runtime folds
+//! those ids out of the audit log into a **dirty-node set**
+//! ([`Runtime::dirty_nodes`]); a *clean* (empty) set lets `relayout` skip the
+//! work entirely (the clean-subtree short-circuit). This is the *foundation*:
+//! the conservative first cut still recomputes the **whole** tree whenever any
+//! node is dirty — relaying out only the dirty subtrees needs partial-layout
+//! support in `uni-core` (the layout engine must accept a seed of changed
+//! nodes), which is the next rung. The dirty-set populate/expose/short-circuit
+//! is in place and tested; per-subtree layout is the remaining work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use uni_a11y::build_tree;
 use uni_core::{hit_test, layout, paint, Layout};
 use uni_env::Env;
 use uni_ir::{Action, Document, Mutation, NodeId, Origin};
@@ -127,6 +138,16 @@ pub struct Runtime {
     animations: Vec<AnimationEntry>,
     /// Currently focused node (Tab/arrow-key navigation target).
     focused: Option<NodeId>,
+    /// **D3 — incremental-layout foundation.** The set of node ids touched by
+    /// applied mutations since the last [`relayout`](Runtime::relayout). Populated
+    /// from the audit log (every prop/child/binding edit names a node), and
+    /// drained on relayout. A *clean* set (empty) means nothing structural moved,
+    /// so [`relayout`](Runtime::relayout) can short-circuit. See
+    /// [`Runtime::dirty_nodes`].
+    dirty: BTreeSet<NodeId>,
+    /// How far into the audit log we've already folded into `dirty`. Lets us
+    /// scan only the *new* edits since the last sweep.
+    audit_cursor: usize,
 }
 
 impl Runtime {
@@ -146,6 +167,8 @@ impl Runtime {
             env,
             animations: Vec::new(),
             focused: None,
+            dirty: BTreeSet::new(),
+            audit_cursor: 0,
         };
         // Push any state already present into the bound props, then lay out, so
         // the very first frame reflects the store (not just literal defaults).
@@ -178,7 +201,7 @@ impl Runtime {
     }
 
     /// Mutable access to the [`Store`]. Seed initial state here before running;
-    /// call [`Runtime::sync_bindings`] (or let [`Runtime::dispatch`] do it) to
+    /// call [`Runtime::sync_bindings`] (or let `dispatch` do it) to
     /// push the values into the bound props.
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
@@ -228,7 +251,11 @@ impl Runtime {
         for (id, prop, value) in updates {
             let _ = self.doc.apply_from(
                 Origin::System,
-                Mutation::SetProp { id, key: prop, value: uni_ir::Value::Px(value) },
+                Mutation::SetProp {
+                    id,
+                    key: prop,
+                    value: uni_ir::Value::Px(value),
+                },
             );
         }
         self.relayout();
@@ -242,7 +269,7 @@ impl Runtime {
     /// `Origin::System` [`Mutation::SetProp`] on that *same* node id. This makes
     /// the DSL's `$bindings` live without ever changing node ids or tree
     /// structure (so hit-test and [`Document::fire`] keep targeting the same
-    /// nodes). Called before every [`relayout`](Runtime::relayout).
+    /// nodes). Called before every `relayout`.
     ///
     /// Structural binding nodes (`If` / `For`) are deliberately *not* expanded
     /// here: live structural reconciliation would mint fresh ids and is a later
@@ -287,17 +314,95 @@ impl Runtime {
         self.viewport
     }
 
+    /// **D3 — fold new audit-log edits into the dirty-node set.**
+    ///
+    /// Every structural [`Mutation`] names the node(s) it touched; we scan the
+    /// edits appended since the last sweep (tracked by `audit_cursor`) and add
+    /// their ids to `self.dirty`. This is the populate-from-applied-mutations
+    /// half of incremental layout — the foundation a later rung uses to relayout
+    /// only dirty subtrees.
+    fn mark_dirty_from_log(&mut self) {
+        // Collect the touched ids first so the immutable audit-log borrow ends
+        // before we mutate `self.dirty`.
+        let log = self.doc.audit_log();
+        let mut touched: Vec<NodeId> = Vec::new();
+        for edit in &log[self.audit_cursor..] {
+            match &edit.mutation {
+                Mutation::CreateNode { id, .. }
+                | Mutation::SetRoot { id }
+                | Mutation::SetProp { id, .. }
+                | Mutation::RemoveProp { id, .. }
+                | Mutation::RemoveNode { id }
+                | Mutation::SetCallback { id, .. }
+                | Mutation::RemoveCallback { id, .. }
+                | Mutation::SetBinding { id, .. }
+                | Mutation::RemoveBinding { id, .. }
+                | Mutation::Reconstruct { id, .. } => {
+                    touched.push(*id);
+                }
+                // Parent/child edits dirty *both* ends (the subtree moved).
+                Mutation::AppendChild { parent, child }
+                | Mutation::RemoveChild { parent, child } => {
+                    touched.push(*parent);
+                    touched.push(*child);
+                }
+                // Invoke is a pure audit record — it changes no tree geometry.
+                Mutation::Invoke { .. } => {}
+            }
+        }
+        let new_cursor = log.len();
+        self.dirty.extend(touched);
+        self.audit_cursor = new_cursor;
+    }
+
+    /// The set of node ids touched by applied mutations since the last layout.
+    ///
+    /// **D3 foundation.** A *clean* (empty) set means nothing structural changed,
+    /// so layout can be skipped. The set is folded from the audit log on each
+    /// `relayout` and drained there. Exposed so a caller (or
+    /// a future incremental-layout pass) can see exactly which subtrees are dirty.
+    pub fn dirty_nodes(&self) -> &BTreeSet<NodeId> {
+        &self.dirty
+    }
+
     /// Recompute the layout for the current document + viewport. Called after
     /// every action and on resize.
+    ///
+    /// **D3 (first approximation).** Before recomputing, fold any new audit-log
+    /// edits into the dirty-node set. If that set is *empty* — nothing was
+    /// touched since the last layout — short-circuit and keep the existing
+    /// layout (the clean-subtree skip). Otherwise recompute the whole layout and
+    /// drain the dirty set. (Recomputing the *whole* tree on any dirty node is
+    /// the conservative first cut; relaying out only the dirty subtrees is the
+    /// next rung — see the crate-level D3 note.)
     fn relayout(&mut self) {
+        self.mark_dirty_from_log();
+        // First-frame / explicit-relayout guard: an empty layout must always be
+        // computed once even if no mutation was logged (e.g. viewport-only init).
+        if self.dirty.is_empty() && !self.layout.order().is_empty() {
+            return;
+        }
         self.layout = layout(&self.doc, self.viewport);
+        self.dirty.clear();
+    }
+
+    /// Force a full layout recompute regardless of the dirty set (used when the
+    /// viewport itself changes, which dirties geometry without any tree edit).
+    fn relayout_force(&mut self) {
+        self.mark_dirty_from_log();
+        self.layout = layout(&self.doc, self.viewport);
+        self.dirty.clear();
     }
 
     /// Set the viewport and recompute the layout.
+    ///
+    /// A viewport change dirties *geometry* without touching the tree, so this
+    /// forces a full relayout (the dirty-node short-circuit only covers
+    /// tree-edit-driven changes).
     pub fn set_viewport(&mut self, viewport: (f32, f32)) {
         self.viewport = viewport;
         self.env = Env::for_window(viewport.0, viewport.1);
-        self.relayout();
+        self.relayout_force();
     }
 
     /// Paint the current layout into a [`Scene`].
@@ -386,12 +491,8 @@ impl Runtime {
                     false
                 }
             }
-            InputEvent::KeyDown { key } if key == "Tab" => {
-                self.move_focus(true)
-            }
-            InputEvent::KeyDown { key } if key == "Enter" || key == " " => {
-                self.activate_focused()
-            }
+            InputEvent::KeyDown { key } if key == "Tab" => self.move_focus(true),
+            InputEvent::KeyDown { key } if key == "Enter" || key == " " => self.activate_focused(),
             _ => false,
         }
     }
@@ -406,14 +507,51 @@ impl Runtime {
         self.dispatch(target, event, Origin::Ai)
     }
 
+    /// **Enumerate the registered callbacks** as `(node, event, action_name)`
+    /// triples — every place an event is bound to a named action in the live
+    /// document, in layout order.
+    ///
+    /// This is the cowork *index*: the menu of things that can be invoked on
+    /// this UI. A human reads it off the screen; the AI reads it off this list.
+    /// Both then drive the very same [`invoke`](Runtime::invoke) path — the
+    /// list is the proof that the AI's surface is exactly the human's, no more
+    /// and no less.
+    pub fn actions(&self) -> Vec<(NodeId, String, String)> {
+        let mut out = Vec::new();
+        for id in self.layout.order() {
+            if let Some(node) = self.doc.get(*id) {
+                for (event, action) in &node.callbacks {
+                    out.push((*id, event.clone(), action.name.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// **Invoke `event` on `node` with an explicit [`Origin`].**
+    ///
+    /// The single, origin-parameterized entry the cowork contract turns on: it
+    /// routes through the **identical** handler path as a human pointer event —
+    /// [`Document::fire`] records the audited [`Origin`]-tagged `Invoke`, the
+    /// registry dispatches the named handler, state syncs, and the layout
+    /// recomputes. Pass [`Origin::Ai`] and the AI drives precisely what a human
+    /// click drives; pass [`Origin::Human`] and it is the human's. There is no
+    /// second code path — `ai_fire` and human input both funnel here via
+    /// `dispatch`.
+    ///
+    /// Returns `true` if a handler ran.
+    pub fn invoke(&mut self, node: NodeId, event: &str, origin: Origin) -> bool {
+        self.dispatch(node, event, origin)
+    }
+
     // -- windowed entry point -------------------------------------------------
 
     /// Run the interactive event loop on a real window (blocking). The window's
     /// initial logical size becomes the viewport. Press a window's close button
     /// to exit; the audit log is printed on exit.
     pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let event_loop = winit::event_loop::EventLoop::<accesskit_winit::Event>::with_user_event()
-            .build()?;
+        let event_loop =
+            winit::event_loop::EventLoop::<accesskit_winit::Event>::with_user_event().build()?;
         event_loop.set_control_flow(ControlFlow::Wait);
         let proxy = event_loop.create_proxy();
         let mut app = WindowedApp {
@@ -505,7 +643,7 @@ impl Runtime {
 
     /// Activate (fire `"click"`) on the currently focused node.
     ///
-    /// Returns `true` if a handler ran (same semantics as [`Runtime::dispatch`]).
+    /// Returns `true` if a handler ran (same semantics as `dispatch`).
     pub fn activate_focused(&mut self) -> bool {
         match self.focused {
             Some(id) => self.dispatch(id, "click", Origin::Human),
@@ -523,25 +661,18 @@ impl Runtime {
 /// live window + GPU renderer.
 struct WindowedApp {
     rt: Runtime,
-    a11y: Option<accesskit_winit::Adapter>,
+    a11y: Option<a11y::A11yAdapter>,
     proxy: winit::event_loop::EventLoopProxy<accesskit_winit::Event>,
     last_frame: Option<std::time::Instant>,
 }
 
 impl winit::application::ApplicationHandler<accesskit_winit::Event> for WindowedApp {
-    fn user_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        event: accesskit_winit::Event,
-    ) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: accesskit_winit::Event) {
         match event.window_event {
             accesskit_winit::WindowEvent::InitialTreeRequested => {
                 // The a11y platform needs the initial tree now. Push the full tree.
                 if let Some(a11y) = &mut self.a11y {
-                    let doc = &self.rt.doc;
-                    let layout = &self.rt.layout;
-                    let focused = self.rt.focused;
-                    a11y.update_if_active(|| build_tree(doc, layout, focused));
+                    a11y.commit(&self.rt.doc, &self.rt.layout, self.rt.focused);
                 }
             }
             accesskit_winit::WindowEvent::ActionRequested(req) => {
@@ -587,11 +718,7 @@ impl winit::application::ApplicationHandler<accesskit_winit::Event> for Windowed
             }
         }
         // Create accessibility adapter BEFORE making the window visible.
-        let adapter = accesskit_winit::Adapter::with_event_loop_proxy(
-            event_loop,
-            window.as_ref(),
-            self.proxy.clone(),
-        );
+        let adapter = a11y::A11yAdapter::new(event_loop, window.as_ref(), self.proxy.clone());
         self.a11y = Some(adapter);
         // Now show the window.
         window.set_visible(true);
@@ -599,10 +726,7 @@ impl winit::application::ApplicationHandler<accesskit_winit::Event> for Windowed
         self.last_frame = Some(std::time::Instant::now());
         // Push the initial a11y tree now that activation will have been triggered.
         if let Some(a11y) = &mut self.a11y {
-            let doc = &self.rt.doc;
-            let layout = &self.rt.layout;
-            let focused = self.rt.focused;
-            a11y.update_if_active(|| build_tree(doc, layout, focused));
+            a11y.commit(&self.rt.doc, &self.rt.layout, self.rt.focused);
         }
         eprintln!(
             "uni-runtime: click the button (Human fire) or press 'A' (AI fire). \
@@ -632,10 +756,7 @@ impl winit::application::ApplicationHandler<accesskit_winit::Event> for Windowed
                     if let Some(target) = self.rt.ai_click_target() {
                         if self.rt.ai_fire(target, "click") {
                             if let Some(a11y) = &mut self.a11y {
-                                let doc = &self.rt.doc;
-                                let layout = &self.rt.layout;
-                                let focused = self.rt.focused;
-                                a11y.update_if_active(|| build_tree(doc, layout, focused));
+                                a11y.commit(&self.rt.doc, &self.rt.layout, self.rt.focused);
                             }
                             window.request_redraw();
                         }
@@ -644,10 +765,7 @@ impl winit::application::ApplicationHandler<accesskit_winit::Event> for Windowed
                 _ => {
                     if self.rt.on_input(&input) {
                         if let Some(a11y) = &mut self.a11y {
-                            let doc = &self.rt.doc;
-                            let layout = &self.rt.layout;
-                            let focused = self.rt.focused;
-                            a11y.update_if_active(|| build_tree(doc, layout, focused));
+                            a11y.commit(&self.rt.doc, &self.rt.layout, self.rt.focused);
                         }
                         window.request_redraw();
                     }
@@ -668,10 +786,7 @@ impl winit::application::ApplicationHandler<accesskit_winit::Event> for Windowed
                 self.rt
                     .set_viewport((size.width as f32 / scale, size.height as f32 / scale));
                 if let Some(a11y) = &mut self.a11y {
-                    let doc = &self.rt.doc;
-                    let layout = &self.rt.layout;
-                    let focused = self.rt.focused;
-                    a11y.update_if_active(|| build_tree(doc, layout, focused));
+                    a11y.commit(&self.rt.doc, &self.rt.layout, self.rt.focused);
                 }
                 window.request_redraw();
             }
@@ -725,16 +840,12 @@ impl Runtime {
         if let Some(t) = self.bubble_to_handler(self.cursor, "click") {
             return Some(t);
         }
-        self.layout
-            .order()
-            .iter()
-            .copied()
-            .find(|&id| {
-                self.doc
-                    .get(id)
-                    .map(|n| n.callbacks.contains_key("click"))
-                    .unwrap_or(false)
-            })
+        self.layout.order().iter().copied().find(|&id| {
+            self.doc
+                .get(id)
+                .map(|n| n.callbacks.contains_key("click"))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -773,17 +884,18 @@ pub mod web {
         pub fn new(doc: Document, width: u32, height: u32) -> Self {
             let rt = Runtime::new(doc, (width as f32, height as f32));
             let renderer = CanvasRenderer::new(width, height);
-            let mut host = Self { rt, renderer, width, height };
+            let mut host = Self {
+                rt,
+                renderer,
+                width,
+                height,
+            };
             host.render();
             host
         }
 
         /// Parse `.uni` source and build a host at the given size.
-        pub fn from_uni(
-            src: &str,
-            width: u32,
-            height: u32,
-        ) -> Result<Self, uni_dsl::ParseError> {
+        pub fn from_uni(src: &str, width: u32, height: u32) -> Result<Self, uni_dsl::ParseError> {
             Ok(Self::new(uni_dsl::parse(src)?, width, height))
         }
 
@@ -853,6 +965,78 @@ pub mod web {
     }
 }
 
+// ============================================================================
+// F1 — the accesskit_winit adapter seam
+// ============================================================================
+
+/// **The screen-reader bridge for a real window.**
+///
+/// `uni-a11y` builds the platform-agnostic [`uni_a11y::TreeUpdate`] (a pure
+/// function of [`Document`] + [`Layout`] + focus). This module owns the *other*
+/// half: pushing that tree into the live OS accessibility platform through
+/// [`accesskit_winit`], on **every commit** — every frame the document, layout,
+/// or focus may have changed.
+///
+/// The `WindowedApp` event loop already wires a raw `accesskit_winit::Adapter`
+/// inline; `A11yAdapter` factors that out into one named seam with a single
+/// `commit` call, so the "push the current tree" gesture
+/// lives in one place and reads the same way everywhere. The constructor is
+/// native (it needs a real winit event loop + window to register with the OS);
+/// the build-tree side is fully headless-tested in `uni-a11y` and via
+/// [`Runtime::a11y_update`].
+///
+/// **Screen-reader verification is manual.** A unit test can prove the tree is
+/// built and the adapter constructs/compiles, but confirming an actual screen
+/// reader (Orca / NVDA / VoiceOver) speaks the controls requires a human with
+/// assistive tech running against a real window — see the runnable example
+/// `uni-runtime` ships and the `run` entry point.
+pub mod a11y {
+    use accesskit_winit::Adapter;
+    use uni_core::Layout;
+    use uni_ir::{Document, NodeId};
+    use winit::event::WindowEvent;
+    use winit::event_loop::ActiveEventLoop;
+    use winit::window::Window;
+
+    /// Owns the platform accessibility adapter and pushes the current tree on
+    /// each commit.
+    pub struct A11yAdapter {
+        adapter: Adapter,
+    }
+
+    impl A11yAdapter {
+        /// **Native constructor.** Register an accessibility adapter for `window`
+        /// against the running `event_loop`, routing platform a11y events back
+        /// through `proxy`. Call this *before* the window is made visible, exactly
+        /// as the platform expects.
+        pub fn new(
+            event_loop: &ActiveEventLoop,
+            window: &Window,
+            proxy: winit::event_loop::EventLoopProxy<accesskit_winit::Event>,
+        ) -> Self {
+            let adapter = Adapter::with_event_loop_proxy(event_loop, window, proxy);
+            A11yAdapter { adapter }
+        }
+
+        /// Forward a raw winit window event to the platform adapter (so it can
+        /// track activation/focus on its side). Call from `window_event`.
+        pub fn process_event(&mut self, window: &Window, event: &WindowEvent) {
+            self.adapter.process_event(window, event);
+        }
+
+        /// **Push the current tree — call on every commit.**
+        ///
+        /// Builds `uni_a11y::build_tree(doc, layout, focused)` and hands it to the
+        /// platform (only when the a11y platform is active, so it's cheap when no
+        /// screen reader is listening). This is the single line a frame runs to
+        /// keep assistive tech in lock-step with the live UI.
+        pub fn commit(&mut self, doc: &Document, layout: &Layout, focused: Option<NodeId>) {
+            self.adapter
+                .update_if_active(|| uni_a11y::build_tree(doc, layout, focused));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,13 +1101,20 @@ mod tests {
         assert_eq!(doc.get(button).unwrap().kind, "Button");
         // The button carries the parsed click callback → increment.
         assert_eq!(
-            doc.get(button).unwrap().callbacks.get("click").unwrap().name,
+            doc.get(button)
+                .unwrap()
+                .callbacks
+                .get("click")
+                .unwrap()
+                .name,
             "increment"
         );
         // The label carries a binding for `content` → the `label` state key.
         assert_eq!(
             doc.get(label).unwrap().bindings.get("content"),
-            Some(&Binding { expr: "label".into() })
+            Some(&Binding {
+                expr: "label".into()
+            })
         );
     }
 
@@ -935,7 +1126,8 @@ mod tests {
         let label = label_id(rt.doc());
 
         // Set state for the bound key, then sync.
-        rt.store_mut().set("label", Value::Text("from state".into()));
+        rt.store_mut()
+            .set("label", Value::Text("from state".into()));
         rt.sync_bindings();
 
         // The SAME node's `content` prop now holds the store value.
@@ -1012,6 +1204,39 @@ mod tests {
         assert_eq!((human, ai), (1, 1));
     }
 
+    /// **B2 — the cowork index + symmetric invoke.** [`Runtime::actions`]
+    /// enumerates the button's `click → increment` callback, and the AI can
+    /// [`invoke`](Runtime::invoke) that exact `(node, event)` with `Origin::Ai`,
+    /// reaching the *same* handler a human pointer event would — proving the AI
+    /// has neither more nor less than the human surface.
+    #[test]
+    fn ai_can_invoke_the_same_action_a_human_can() {
+        let mut rt = counter_runtime();
+        let button = button_id(rt.doc());
+
+        // The cowork index surfaces exactly the button's increment callback.
+        let actions = rt.actions();
+        assert_eq!(
+            actions,
+            vec![(button, "click".to_string(), "increment".to_string())],
+            "actions() lists the (node, event, action) the UI exposes"
+        );
+
+        // The AI invokes that very triple as Origin::Ai — same handler path.
+        let (node, event, _name) = &actions[0];
+        let ran = rt.invoke(*node, event, Origin::Ai);
+        assert!(ran, "the AI-invoked action ran its registered handler");
+        assert_eq!(rt.store().get("count"), Some(Value::Int(1)));
+
+        // A human can invoke the identical triple — same path, same effect.
+        assert!(rt.invoke(*node, event, Origin::Human));
+        assert_eq!(rt.store().get("count"), Some(Value::Int(2)));
+
+        // The audit log proves both rode the one fire() surface: 1 Ai, 1 Human.
+        let (human, ai) = rt.invoke_counts();
+        assert_eq!((human, ai), (1, 1));
+    }
+
     /// `on_input` with a left PointerDown over the button hit-tests, bubbles to
     /// the click handler, fires it as Human, mutates state and updates the bound
     /// label — proving the full input → hit-test → bubble → fire → handler →
@@ -1043,33 +1268,71 @@ mod tests {
     fn click_on_child_bubbles_to_parent_handler() {
         let mut doc = Document::new();
         let row = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: row, kind: "Row".into() })
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: row,
+                kind: "Row".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: row })
             .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: row }).unwrap();
         doc.apply_from(
             Origin::System,
             Mutation::SetCallback {
                 id: row,
                 event: "click".into(),
-                action: uni_ir::Action { name: "ping".into(), args: vec![] },
+                action: uni_ir::Action {
+                    name: "ping".into(),
+                    args: vec![],
+                },
             },
         )
         .unwrap();
 
         let child = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: child, kind: "Rect".into() })
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: child,
+                kind: "Rect".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id: child,
+                key: "width".into(),
+                value: Value::Px(100.0),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id: child,
+                key: "height".into(),
+                value: Value::Px(100.0),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::AppendChild { parent: row, child })
             .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetProp { id: child, key: "width".into(), value: Value::Px(100.0) }).unwrap();
-        doc.apply_from(Origin::System, Mutation::SetProp { id: child, key: "height".into(), value: Value::Px(100.0) }).unwrap();
-        doc.apply_from(Origin::System, Mutation::AppendChild { parent: row, child }).unwrap();
 
         let mut rt = Runtime::new(doc, (400.0, 400.0));
         let pinged = Rc::new(RefCell::new(0i64));
         let p = pinged.clone();
-        rt.register("ping", Box::new(move |_store: &mut Store, _origin: Origin| { *p.borrow_mut() += 1; }));
+        rt.register(
+            "ping",
+            Box::new(move |_store: &mut Store, _origin: Origin| {
+                *p.borrow_mut() += 1;
+            }),
+        );
 
         // The child Rect has no callback of its own.
-        assert!(rt.doc().get(child).unwrap().callbacks.get("click").is_none());
+        assert!(!rt.doc().get(child).unwrap().callbacks.contains_key("click"));
 
         let r = rt.layout().rect(child).expect("child laid out");
         let point = (r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -1116,8 +1379,16 @@ mod tests {
     fn animate_drives_prop_toward_target() {
         let mut doc = Document::new();
         let id = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id, kind: "Rect".into() }).unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id }).unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id,
+                kind: "Rect".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
 
         let mut rt = Runtime::new(doc, (800.0, 600.0));
         rt.animate(id, "width", 0.0, 200.0, uni_spring::Spring::spatial());
@@ -1143,14 +1414,110 @@ mod tests {
 
     #[test]
     fn a11y_tree_built_headless() {
-        let rt = Runtime::from_uni(
-            r#"Stack { Text { content: "Hello"; } }"#,
-            (800.0, 600.0),
-        )
-        .unwrap();
+        let rt =
+            Runtime::from_uni(r#"Stack { Text { content: "Hello"; } }"#, (800.0, 600.0)).unwrap();
         let update = uni_a11y::build_tree(rt.doc(), rt.layout(), None);
         // Should have at least 3 entries: window root + Stack + Text.
-        assert!(update.nodes.len() >= 3, "expected window+Stack+Text in a11y tree");
+        assert!(
+            update.nodes.len() >= 3,
+            "expected window+Stack+Text in a11y tree"
+        );
+    }
+
+    /// **F1 — the commit payload the adapter pushes is the right tree.** The
+    /// native [`a11y::A11yAdapter`] needs a real winit window to register with
+    /// the OS (so a full screen-reader assertion is *manual*), but the data it
+    /// commits each frame is exactly `Runtime::a11y_update` —
+    /// `build_tree(doc, layout, focused)`. We assert that payload tracks focus,
+    /// which is what `A11yAdapter::commit` would hand the platform on each frame.
+    #[test]
+    fn a11y_commit_payload_tracks_focus() {
+        let (doc, btns) = focusable_doc(2);
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        // No focus → the payload focuses the synthetic window root, not a node.
+        let before = rt.a11y_update();
+        assert!(
+            before.focus != uni_a11y::build_tree(rt.doc(), rt.layout(), Some(btns[0])).focus,
+            "an unfocused tree differs from one focused on a real node"
+        );
+
+        // Move focus → the very payload A11yAdapter::commit would push now points
+        // the platform at the focused button.
+        rt.move_focus(true);
+        assert_eq!(rt.focused(), Some(btns[0]));
+        let after = rt.a11y_update();
+        let want = uni_a11y::build_tree(rt.doc(), rt.layout(), Some(btns[0]));
+        assert_eq!(
+            after.focus, want.focus,
+            "commit payload focuses the focused node"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D3 — dirty-node tracking (incremental-layout foundation)
+    // -----------------------------------------------------------------------
+
+    /// A firing handler that mutates state dirties the bound node(s): the dirty
+    /// set is populated from the applied mutations, then drained by relayout.
+    #[test]
+    fn dispatch_populates_then_drains_dirty_set() {
+        let mut rt = counter_runtime();
+        let button = button_id(rt.doc());
+        let label = label_id(rt.doc());
+
+        // After construction the set is clean (the constructor's first layout
+        // drained it).
+        assert!(
+            rt.dirty_nodes().is_empty(),
+            "starts clean after initial layout"
+        );
+
+        // A click mutates state → sync_bindings writes the bound label prop →
+        // that SetProp is logged → the label id lands in the dirty set, which is
+        // then drained by the relayout inside dispatch.
+        assert!(rt.dispatch(button, "click", Origin::Human));
+        assert!(
+            rt.dirty_nodes().is_empty(),
+            "relayout drains the dirty set after recomputing"
+        );
+
+        // Prove the *foundation* records the touched node before relayout drains
+        // it: apply a raw SetProp on the label and fold the log without a full
+        // relayout.
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id: label,
+                    key: "size".into(),
+                    value: Value::Px(40.0),
+                },
+            )
+            .unwrap();
+        rt.mark_dirty_from_log();
+        assert!(
+            rt.dirty_nodes().contains(&label),
+            "the touched label id is recorded in the dirty set"
+        );
+    }
+
+    /// The clean-subtree short-circuit: a relayout with nothing dirty does not
+    /// recompute (the existing layout is preserved untouched).
+    #[test]
+    fn clean_relayout_short_circuits() {
+        let (doc, _btns) = focusable_doc(2);
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        // Snapshot the layout order; a clean relayout must leave it identical.
+        let order_before = rt.layout().order().to_vec();
+        assert!(rt.dirty_nodes().is_empty());
+        rt.relayout(); // nothing dirty → short-circuit
+        assert_eq!(
+            rt.layout().order(),
+            order_before.as_slice(),
+            "clean relayout preserves the existing layout"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1162,26 +1529,44 @@ mod tests {
     fn focusable_doc(count: usize) -> (Document, Vec<NodeId>) {
         let mut doc = Document::new();
         let row = doc.fresh_id();
-        doc.apply_from(Origin::System, Mutation::CreateNode { id: row, kind: "Row".into() })
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: row,
+                kind: "Row".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: row })
             .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: row }).unwrap();
 
         let mut ids = Vec::new();
         for i in 0..count {
             let btn = doc.fresh_id();
             doc.apply_from(
                 Origin::System,
-                Mutation::CreateNode { id: btn, kind: "Stack".into() },
+                Mutation::CreateNode {
+                    id: btn,
+                    kind: "Stack".into(),
+                },
             )
             .unwrap();
             doc.apply_from(
                 Origin::System,
-                Mutation::SetProp { id: btn, key: "width".into(), value: Value::Px(60.0) },
+                Mutation::SetProp {
+                    id: btn,
+                    key: "width".into(),
+                    value: Value::Px(60.0),
+                },
             )
             .unwrap();
             doc.apply_from(
                 Origin::System,
-                Mutation::SetProp { id: btn, key: "height".into(), value: Value::Px(40.0) },
+                Mutation::SetProp {
+                    id: btn,
+                    key: "height".into(),
+                    value: Value::Px(40.0),
+                },
             )
             .unwrap();
             doc.apply_from(
@@ -1189,13 +1574,19 @@ mod tests {
                 Mutation::SetCallback {
                     id: btn,
                     event: "click".into(),
-                    action: uni_ir::Action { name: format!("hit_{i}"), args: vec![] },
+                    action: uni_ir::Action {
+                        name: format!("hit_{i}"),
+                        args: vec![],
+                    },
                 },
             )
             .unwrap();
             doc.apply_from(
                 Origin::System,
-                Mutation::AppendChild { parent: row, child: btn },
+                Mutation::AppendChild {
+                    parent: row,
+                    child: btn,
+                },
             )
             .unwrap();
             ids.push(btn);
@@ -1218,7 +1609,11 @@ mod tests {
 
         // Second Tab: moves to the next.
         rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
-        assert_eq!(rt.focused(), Some(btns[1]), "second Tab focuses second node");
+        assert_eq!(
+            rt.focused(),
+            Some(btns[1]),
+            "second Tab focuses second node"
+        );
 
         // Third Tab: moves to the third.
         rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
@@ -1235,16 +1630,28 @@ mod tests {
         let hit1 = Rc::new(RefCell::new(0i64));
         {
             let h0 = hit0.clone();
-            rt.register("hit_0", Box::new(move |_s: &mut Store, _o: Origin| { *h0.borrow_mut() += 1; }));
+            rt.register(
+                "hit_0",
+                Box::new(move |_s: &mut Store, _o: Origin| {
+                    *h0.borrow_mut() += 1;
+                }),
+            );
             let h1 = hit1.clone();
-            rt.register("hit_1", Box::new(move |_s: &mut Store, _o: Origin| { *h1.borrow_mut() += 1; }));
+            rt.register(
+                "hit_1",
+                Box::new(move |_s: &mut Store, _o: Origin| {
+                    *h1.borrow_mut() += 1;
+                }),
+            );
         }
 
         // Tab to the first button, then activate with Enter.
         rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
         assert_eq!(rt.focused(), Some(btns[0]));
 
-        let activated = rt.on_input(&InputEvent::KeyDown { key: "Enter".into() });
+        let activated = rt.on_input(&InputEvent::KeyDown {
+            key: "Enter".into(),
+        });
         assert!(activated, "Enter on a focused node should return true");
         assert_eq!(*hit0.borrow(), 1, "hit_0 handler should have fired once");
         assert_eq!(*hit1.borrow(), 0, "hit_1 should not have fired");
@@ -1263,11 +1670,19 @@ mod tests {
 
         // One more Tab should wrap to the first.
         rt.move_focus(true);
-        assert_eq!(rt.focused(), Some(btns[0]), "Tab past last should wrap to first");
+        assert_eq!(
+            rt.focused(),
+            Some(btns[0]),
+            "Tab past last should wrap to first"
+        );
 
         // Backward from first should wrap to last.
         rt.move_focus(false);
-        assert_eq!(rt.focused(), Some(btns[2]), "backward from first should wrap to last");
+        assert_eq!(
+            rt.focused(),
+            Some(btns[2]),
+            "backward from first should wrap to last"
+        );
     }
 }
 

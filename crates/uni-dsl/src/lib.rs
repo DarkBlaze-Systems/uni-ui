@@ -185,7 +185,8 @@ fn lower_element(doc: &mut Document, el: &Element) -> Result<uni_ir::NodeId, Par
                 binding: Binding { expr: expr.clone() },
             },
         };
-        doc.apply_from(Origin::System, mutation).map_err(lower_err)?;
+        doc.apply_from(Origin::System, mutation)
+            .map_err(lower_err)?;
     }
 
     // Event handlers → SetCallback with a literal-arg Action.
@@ -261,7 +262,10 @@ mod tests {
 
         // padding == Px(16.0), background expanded to full alpha.
         assert_eq!(root.props.get("padding"), Some(&Value::Px(16.0)));
-        assert_eq!(root.props.get("background"), Some(&Value::Color(0x0a0a0aff)));
+        assert_eq!(
+            root.props.get("background"),
+            Some(&Value::Color(0x0a0a0aff))
+        );
 
         // Two children, in order: Text then Rect.
         assert_eq!(root.children.len(), 2);
@@ -338,7 +342,9 @@ mod tests {
         );
         assert_eq!(
             root.bindings.get("color"),
-            Some(&uni_ir::Binding { expr: "theme.accent".into() })
+            Some(&uni_ir::Binding {
+                expr: "theme.accent".into()
+            })
         );
         // The literal sibling still lowered to a prop.
         assert_eq!(root.props.get("height"), Some(&Value::Px(80.0)));
@@ -411,7 +417,9 @@ mod tests {
         assert_eq!(if_node.kind, "If");
         assert_eq!(
             if_node.bindings.get("cond"),
-            Some(&uni_ir::Binding { expr: "visible".into() })
+            Some(&uni_ir::Binding {
+                expr: "visible".into()
+            })
         );
         assert_eq!(if_node.children.len(), 1);
         assert_eq!(doc.get(if_node.children[0]).unwrap().kind, "Text");
@@ -421,7 +429,9 @@ mod tests {
         assert_eq!(for_node.kind, "For");
         assert_eq!(
             for_node.bindings.get("items"),
-            Some(&uni_ir::Binding { expr: "items".into() })
+            Some(&uni_ir::Binding {
+                expr: "items".into()
+            })
         );
         assert_eq!(for_node.children.len(), 1);
         assert_eq!(doc.get(for_node.children[0]).unwrap().kind, "Rect");

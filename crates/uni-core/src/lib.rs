@@ -82,16 +82,103 @@ fn is_container(kind: &str) -> bool {
     matches!(kind, "Stack" | "Column" | "Row" | "Grid")
 }
 
-/// Intrinsic size of a `Text` leaf: a crude monospace-ish metric so text boxes
-/// actually occupy space in the layout (`size*0.6` per char wide, `size*1.4`
-/// tall). Good enough for v0 — real shaping lives in the renderer.
-fn text_intrinsic_size(node: &Node) -> Size<f32> {
+// ---------------------------------------------------------------------------
+// Text measurement
+// ---------------------------------------------------------------------------
+
+/// How layout learns the intrinsic size of a `Text` leaf.
+///
+/// Layout doesn't shape glyphs itself — it asks a `TextMeasurer` for the
+/// `(width, height)` a run of `text` wants at a given font `size`. The default
+/// ([`HeuristicMeasurer`]) is a cheap monospace-ish guess; the optional
+/// `real-text` feature provides a `cosmic-text`-backed implementation with real
+/// shaping metrics. Inject your own to test, mock, or match a specific font.
+pub trait TextMeasurer {
+    /// The intrinsic `(width, height)` of `text` rendered at `size` logical px.
+    fn measure(&self, text: &str, size: f32) -> (f32, f32);
+}
+
+/// The default, dependency-free measurer: a crude monospace-ish metric so text
+/// boxes occupy space in layout (`size*0.6` per char wide, `size*1.4` tall).
+///
+/// Good enough for v0 and for builds that don't want a font stack. This is the
+/// exact heuristic `uni-core` shipped before the trait existed — kept byte-for-
+/// byte so layouts don't shift when you don't opt into `real-text`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeuristicMeasurer;
+
+impl TextMeasurer for HeuristicMeasurer {
+    fn measure(&self, text: &str, size: f32) -> (f32, f32) {
+        let chars = text.chars().count().max(1) as f32;
+        (size * 0.6 * chars, size * 1.4)
+    }
+}
+
+/// A `cosmic-text`-backed measurer: real shaping, real metrics. Behind the
+/// non-default `real-text` feature so the common build stays light.
+///
+/// Holds its own [`cosmic_text::FontSystem`]; construct once and reuse, as
+/// loading system fonts is not free. `measure` shapes a single line (no wrap)
+/// and reports the widest run and the buffer's full height.
+#[cfg(feature = "real-text")]
+pub struct CosmicTextMeasurer {
+    font_system: std::cell::RefCell<cosmic_text::FontSystem>,
+}
+
+#[cfg(feature = "real-text")]
+impl CosmicTextMeasurer {
+    /// Build a measurer with a fresh font system (loads installed fonts).
+    pub fn new() -> Self {
+        Self {
+            font_system: std::cell::RefCell::new(cosmic_text::FontSystem::new()),
+        }
+    }
+}
+
+#[cfg(feature = "real-text")]
+impl Default for CosmicTextMeasurer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "real-text")]
+impl TextMeasurer for CosmicTextMeasurer {
+    fn measure(&self, text: &str, size: f32) -> (f32, f32) {
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+
+        let mut fs = self.font_system.borrow_mut();
+        // Line height tracks the renderer's `size * 1.2`.
+        let mut buffer = Buffer::new(&mut fs, Metrics::new(size, size * 1.2));
+        buffer.set_text(
+            &mut fs,
+            text,
+            Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(&mut fs, false);
+
+        let mut width = 0.0_f32;
+        let mut height = 0.0_f32;
+        for run in buffer.layout_runs() {
+            width = width.max(run.line_w);
+            height += run.line_height;
+        }
+        if height == 0.0 {
+            height = size * 1.2;
+        }
+        (width, height)
+    }
+}
+
+/// Intrinsic size of a `Text` leaf, via `measurer`. Non-`Text` leaves are zero.
+fn text_intrinsic_size(node: &Node, measurer: &dyn TextMeasurer) -> Size<f32> {
     let content = text_of(node, "content").unwrap_or_default();
     let size = px_of(node, "size").unwrap_or(16.0);
-    let chars = content.chars().count().max(1) as f32;
+    let (w, h) = measurer.measure(&content, size);
     Size {
-        width: size * 0.6 * chars,
-        height: size * 1.4,
+        width: w,
+        height: h,
     }
 }
 
@@ -335,8 +422,24 @@ fn collect_rects(
 /// Run real constraint layout over `doc` for the given logical `viewport`,
 /// returning every node's absolute [`ComputedRect`] in painter's order.
 ///
+/// `Text` leaves are sized via [`HeuristicMeasurer`] — the cheap default. For
+/// real shaping metrics, use [`layout_with_measure`] with another
+/// [`TextMeasurer`] (e.g. the `real-text`-gated `CosmicTextMeasurer`).
+///
 /// An empty document (no root) yields an empty [`Layout`].
 pub fn layout(doc: &Document, viewport: (f32, f32)) -> Layout {
+    layout_with_measure(doc, viewport, &HeuristicMeasurer)
+}
+
+/// Like [`layout`], but `Text` intrinsic sizing is routed through `measurer`.
+///
+/// This is the seam between layout and text shaping: layout never touches
+/// glyphs directly, it only asks `measurer` how big each `Text` run wants to be.
+pub fn layout_with_measure(
+    doc: &Document,
+    viewport: (f32, f32),
+    measurer: &dyn TextMeasurer,
+) -> Layout {
     let mut out = Layout {
         viewport,
         ..Layout::default()
@@ -364,13 +467,16 @@ pub fn layout(doc: &Document, viewport: (f32, f32)) -> Layout {
         |known, _avail, _node, context, _style| {
             // Honor any known dimension; else use the leaf's intrinsic size.
             if let (Some(w), Some(h)) = (known.width, known.height) {
-                return Size { width: w, height: h };
+                return Size {
+                    width: w,
+                    height: h,
+                };
             }
             let intrinsic = context
                 .and_then(|&mut ir_id| {
                     doc.get(ir_id)
                         .filter(|n| n.kind == "Text")
-                        .map(text_intrinsic_size)
+                        .map(|n| text_intrinsic_size(n, measurer))
                 })
                 .unwrap_or(Size::ZERO);
             Size {
@@ -558,7 +664,8 @@ mod tests {
     }
 
     fn set_root(doc: &mut Document, id: NodeId) {
-        doc.apply_from(Origin::System, Mutation::SetRoot { id }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
     }
 
     #[test]
@@ -786,7 +893,12 @@ mod tests {
 
         // Absolutely-positioned overlay: ignores flow, sits at its inset.
         let overlay = node(&mut doc, "Frost");
-        prop(&mut doc, overlay, "position", Value::Text("absolute".into()));
+        prop(
+            &mut doc,
+            overlay,
+            "position",
+            Value::Text("absolute".into()),
+        );
         prop(&mut doc, overlay, "left", Value::Px(40.0));
         prop(&mut doc, overlay, "top", Value::Px(20.0));
         prop(&mut doc, overlay, "width", Value::Px(50.0));
@@ -840,5 +952,83 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn heuristic_measurer_matches_legacy_metric() {
+        // The default measurer must reproduce the pre-trait numbers exactly,
+        // so opting out of `real-text` never shifts a layout.
+        let m = HeuristicMeasurer;
+        // 6 chars at size 20 → 6 * 20 * 0.6 wide, 20 * 1.4 tall.
+        assert_eq!(m.measure("Uni-UI", 20.0), (72.0, 28.0));
+        // Empty content still claims one char's width (max(1)).
+        assert_eq!(m.measure("", 10.0), (6.0, 14.0));
+    }
+
+    #[test]
+    fn default_layout_uses_heuristic_text_size() {
+        // A `Row` lets the text keep its intrinsic main-axis width (a Stack's
+        // single child would stretch to fill the cross axis instead).
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Row");
+        set_root(&mut doc, root);
+        let t = node(&mut doc, "Text");
+        prop(&mut doc, t, "content", Value::Text("ABCD".into()));
+        prop(&mut doc, t, "size", Value::Px(20.0));
+        child(&mut doc, root, t);
+
+        let l = layout(&doc, (400.0, 400.0));
+        let r = l.rect(t).unwrap();
+        // 4 chars * 20 * 0.6 = 48 main-axis width, straight from the heuristic.
+        // (Cross-axis height flex-stretches to the row, so we don't pin it.)
+        assert_eq!(r.w, 48.0);
+    }
+
+    #[test]
+    fn layout_with_measure_routes_through_custom_measurer() {
+        // A stub measurer with fixed, distinctive metrics: layout must report
+        // exactly what we hand back, proving the seam is real.
+        struct Fixed;
+        impl TextMeasurer for Fixed {
+            fn measure(&self, text: &str, _size: f32) -> (f32, f32) {
+                (text.chars().count() as f32 * 100.0, 33.0)
+            }
+        }
+
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Row");
+        set_root(&mut doc, root);
+        let t = node(&mut doc, "Text");
+        prop(&mut doc, t, "content", Value::Text("xy".into()));
+        prop(&mut doc, t, "size", Value::Px(20.0));
+        child(&mut doc, root, t);
+
+        // In a Row the text keeps its measured main-axis WIDTH (200) — proof
+        // the measurer's width feeds layout.
+        let row = layout_with_measure(&doc, (1000.0, 1000.0), &Fixed);
+        assert_eq!(row.rect(t).unwrap().w, 200.0);
+
+        // Re-parent under a Column so the text keeps its measured main-axis
+        // HEIGHT (33) — proof the measurer's height feeds layout too.
+        let col_root = node(&mut doc, "Column");
+        let t2 = node(&mut doc, "Text");
+        prop(&mut doc, t2, "content", Value::Text("xy".into()));
+        prop(&mut doc, t2, "size", Value::Px(20.0));
+        child(&mut doc, col_root, t2);
+        set_root(&mut doc, col_root);
+        let col = layout_with_measure(&doc, (1000.0, 1000.0), &Fixed);
+        assert_eq!(col.rect(t2).unwrap().h, 33.0);
+    }
+
+    #[cfg(feature = "real-text")]
+    #[test]
+    fn cosmic_measurer_gives_nonzero_size() {
+        // With the `real-text` feature, the cosmic-text measurer should shape
+        // real glyphs and report positive metrics (exact values are font-
+        // dependent, so we only assert they're sane).
+        let m = CosmicTextMeasurer::new();
+        let (w, h) = m.measure("Hello", 24.0);
+        assert!(w > 0.0, "width should be positive, got {w}");
+        assert!(h > 0.0, "height should be positive, got {h}");
     }
 }

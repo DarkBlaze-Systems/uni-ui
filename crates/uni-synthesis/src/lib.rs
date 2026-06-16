@@ -85,6 +85,25 @@ impl Synthesizer for BasicSynthesizer {
     }
 }
 
+/// Chains several synthesizers into one. Each child runs in turn against the
+/// same `(doc, env, profile)`, and their mutation lists are concatenated in
+/// order. The list is then applied front-to-back, so a later child's `SetProp`
+/// on the same `(NodeId, key)` lands after an earlier one's — later wins on
+/// conflict. This is how an LLM synthesizer layers on top of the rule-based
+/// baseline without either knowing about the other.
+pub struct CompositeSynthesizer(pub Vec<Box<dyn Synthesizer>>);
+
+impl Synthesizer for CompositeSynthesizer {
+    fn synthesize(&self, doc: &Document, env: &Env, profile: &UserProfile) -> SynthesisResult {
+        let mut mutations = Vec::new();
+        for child in &self.0 {
+            let result = child.synthesize(doc, env, profile);
+            mutations.extend(result.mutations);
+        }
+        SynthesisResult { mutations }
+    }
+}
+
 fn walk(
     doc: &Document,
     id: NodeId,
@@ -99,20 +118,26 @@ fn walk(
         if let Some(Value::Px(base_size)) = node.props.get("size").cloned() {
             let scaled = (base_size * profile.text_scale).round();
             if (scaled - base_size).abs() > 0.5 {
-                out.push((id, Mutation::SetProp {
+                out.push((
                     id,
-                    key: "size".into(),
-                    value: Value::Px(scaled),
-                }));
+                    Mutation::SetProp {
+                        id,
+                        key: "size".into(),
+                        value: Value::Px(scaled),
+                    },
+                ));
             }
         }
         // High contrast: override text color to pure white.
         if profile.high_contrast {
-            out.push((id, Mutation::SetProp {
+            out.push((
                 id,
-                key: "color".into(),
-                value: Value::Color(0xFFFF_FFFF),
-            }));
+                Mutation::SetProp {
+                    id,
+                    key: "color".into(),
+                    value: Value::Color(0xFFFF_FFFF),
+                },
+            ));
         }
     }
 
@@ -120,20 +145,26 @@ fn walk(
     if node.callbacks.contains_key("click") && env.input_mode == InputMode::Touch {
         if let Some(Value::Px(h)) = node.props.get("height").cloned() {
             if h < 48.0 {
-                out.push((id, Mutation::SetProp {
+                out.push((
                     id,
-                    key: "height".into(),
-                    value: Value::Px(48.0),
-                }));
+                    Mutation::SetProp {
+                        id,
+                        key: "height".into(),
+                        value: Value::Px(48.0),
+                    },
+                ));
             }
         }
         if let Some(Value::Px(w)) = node.props.get("width").cloned() {
             if w < 48.0 {
-                out.push((id, Mutation::SetProp {
+                out.push((
                     id,
-                    key: "width".into(),
-                    value: Value::Px(48.0),
-                }));
+                    Mutation::SetProp {
+                        id,
+                        key: "width".into(),
+                        value: Value::Px(48.0),
+                    },
+                ));
             }
         }
     }
@@ -143,11 +174,14 @@ fn walk(
         if let Some(Value::Px(gap)) = node.props.get("gap").cloned() {
             let adjusted = (gap * profile.density).round();
             if (adjusted - gap).abs() > 0.5 {
-                out.push((id, Mutation::SetProp {
+                out.push((
                     id,
-                    key: "gap".into(),
-                    value: Value::Px(adjusted),
-                }));
+                    Mutation::SetProp {
+                        id,
+                        key: "gap".into(),
+                        value: Value::Px(adjusted),
+                    },
+                ));
             }
         }
     }
@@ -156,11 +190,14 @@ fn walk(
     if env.width_class() == WidthClass::Compact {
         if let Some(Value::Px(w)) = node.props.get("width").cloned() {
             if w > env.win_w {
-                out.push((id, Mutation::SetProp {
+                out.push((
                     id,
-                    key: "width".into(),
-                    value: Value::Px(env.win_w - 32.0),
-                }));
+                    Mutation::SetProp {
+                        id,
+                        key: "width".into(),
+                        value: Value::Px(env.win_w - 32.0),
+                    },
+                ));
             }
         }
     }
@@ -199,25 +236,39 @@ mod tests {
         let root = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: root, kind: "Stack".into() },
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
         )
         .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
 
         let text = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: text, kind: "Text".into() },
+            Mutation::CreateNode {
+                id: text,
+                kind: "Text".into(),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: text, key: "size".into(), value: Value::Px(size) },
+            Mutation::SetProp {
+                id: text,
+                key: "size".into(),
+                value: Value::Px(size),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::AppendChild { parent: root, child: text },
+            Mutation::AppendChild {
+                parent: root,
+                child: text,
+            },
         )
         .unwrap();
         (doc, text)
@@ -227,7 +278,10 @@ mod tests {
     fn synthesize_scales_text_size_by_profile() {
         let (doc, text_id) = make_doc_with_text(16.0);
         let env = make_env(1280.0, 800.0, InputMode::Pointer);
-        let profile = UserProfile { text_scale: 1.5, ..Default::default() };
+        let profile = UserProfile {
+            text_scale: 1.5,
+            ..Default::default()
+        };
 
         let result = BasicSynthesizer.synthesize(&doc, &env, &profile);
 
@@ -248,7 +302,10 @@ mod tests {
     fn synthesize_no_change_when_scale_is_1() {
         let (doc, _) = make_doc_with_text(16.0);
         let env = make_env(1280.0, 800.0, InputMode::Pointer);
-        let profile = UserProfile { text_scale: 1.0, ..Default::default() };
+        let profile = UserProfile {
+            text_scale: 1.0,
+            ..Default::default()
+        };
 
         let result = BasicSynthesizer.synthesize(&doc, &env, &profile);
 
@@ -258,14 +315,20 @@ mod tests {
             .iter()
             .filter(|(_, m)| matches!(m, Mutation::SetProp { key, .. } if key == "size"))
             .collect();
-        assert!(size_muts.is_empty(), "scale=1.0 should produce no size mutations");
+        assert!(
+            size_muts.is_empty(),
+            "scale=1.0 should produce no size mutations"
+        );
     }
 
     #[test]
     fn synthesize_high_contrast_sets_white_text() {
         let (doc, text_id) = make_doc_with_text(16.0);
         let env = make_env(1280.0, 800.0, InputMode::Pointer);
-        let profile = UserProfile { high_contrast: true, ..Default::default() };
+        let profile = UserProfile {
+            high_contrast: true,
+            ..Default::default()
+        };
 
         let result = BasicSynthesizer.synthesize(&doc, &env, &profile);
 
@@ -278,7 +341,11 @@ mod tests {
                         if key == "color")
             })
             .collect();
-        assert_eq!(color_muts.len(), 1, "high contrast should set color to pure white");
+        assert_eq!(
+            color_muts.len(),
+            1,
+            "high contrast should set color to pure white"
+        );
     }
 
     #[test]
@@ -287,25 +354,40 @@ mod tests {
         let root = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: root, kind: "Stack".into() },
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
         )
         .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
 
         let btn = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: btn, kind: "Button".into() },
+            Mutation::CreateNode {
+                id: btn,
+                kind: "Button".into(),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: btn, key: "width".into(), value: Value::Px(32.0) },
+            Mutation::SetProp {
+                id: btn,
+                key: "width".into(),
+                value: Value::Px(32.0),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: btn, key: "height".into(), value: Value::Px(32.0) },
+            Mutation::SetProp {
+                id: btn,
+                key: "height".into(),
+                value: Value::Px(32.0),
+            },
         )
         .unwrap();
         // Register a click callback so the synthesizer sees it as interactive.
@@ -314,13 +396,19 @@ mod tests {
             Mutation::SetCallback {
                 id: btn,
                 event: "click".into(),
-                action: Action { name: "noop".into(), args: vec![] },
+                action: Action {
+                    name: "noop".into(),
+                    args: vec![],
+                },
             },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::AppendChild { parent: root, child: btn },
+            Mutation::AppendChild {
+                parent: root,
+                child: btn,
+            },
         )
         .unwrap();
 
@@ -347,8 +435,16 @@ mod tests {
                         if key == "height" && (*v - 48.0).abs() < 0.01)
             })
             .collect();
-        assert_eq!(w_muts.len(), 1, "touch should enlarge small button width to 48");
-        assert_eq!(h_muts.len(), 1, "touch should enlarge small button height to 48");
+        assert_eq!(
+            w_muts.len(),
+            1,
+            "touch should enlarge small button width to 48"
+        );
+        assert_eq!(
+            h_muts.len(),
+            1,
+            "touch should enlarge small button height to 48"
+        );
     }
 
     #[test]
@@ -357,26 +453,41 @@ mod tests {
         let root = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: root, kind: "Stack".into() },
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
         )
         .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
 
         let btn = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: btn, kind: "Button".into() },
+            Mutation::CreateNode {
+                id: btn,
+                kind: "Button".into(),
+            },
         )
         .unwrap();
         // Already large enough.
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: btn, key: "width".into(), value: Value::Px(80.0) },
+            Mutation::SetProp {
+                id: btn,
+                key: "width".into(),
+                value: Value::Px(80.0),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: btn, key: "height".into(), value: Value::Px(60.0) },
+            Mutation::SetProp {
+                id: btn,
+                key: "height".into(),
+                value: Value::Px(60.0),
+            },
         )
         .unwrap();
         doc.apply_from(
@@ -384,13 +495,19 @@ mod tests {
             Mutation::SetCallback {
                 id: btn,
                 event: "click".into(),
-                action: Action { name: "noop".into(), args: vec![] },
+                action: Action {
+                    name: "noop".into(),
+                    args: vec![],
+                },
             },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::AppendChild { parent: root, child: btn },
+            Mutation::AppendChild {
+                parent: root,
+                child: btn,
+            },
         )
         .unwrap();
 
@@ -417,18 +534,29 @@ mod tests {
         let root = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: root, kind: "Stack".into() },
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
         )
         .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: root, key: "gap".into(), value: Value::Px(10.0) },
+            Mutation::SetProp {
+                id: root,
+                key: "gap".into(),
+                value: Value::Px(10.0),
+            },
         )
         .unwrap();
 
         let env = make_env(1280.0, 800.0, InputMode::Pointer);
-        let profile = UserProfile { density: 1.5, ..Default::default() };
+        let profile = UserProfile {
+            density: 1.5,
+            ..Default::default()
+        };
 
         let result = BasicSynthesizer.synthesize(&doc, &env, &profile);
 
@@ -441,7 +569,11 @@ mod tests {
                         if key == "gap" && (*v - 15.0).abs() < 0.01)
             })
             .collect();
-        assert_eq!(gap_muts.len(), 1, "density=1.5 should scale gap from 10 to 15");
+        assert_eq!(
+            gap_muts.len(),
+            1,
+            "density=1.5 should scale gap from 10 to 15"
+        );
     }
 
     #[test]
@@ -450,26 +582,40 @@ mod tests {
         let root = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: root, kind: "Stack".into() },
+            Mutation::CreateNode {
+                id: root,
+                kind: "Stack".into(),
+            },
         )
         .unwrap();
-        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root })
+            .unwrap();
 
         let panel = doc.fresh_id();
         doc.apply_from(
             Origin::System,
-            Mutation::CreateNode { id: panel, kind: "Rect".into() },
+            Mutation::CreateNode {
+                id: panel,
+                kind: "Rect".into(),
+            },
         )
         .unwrap();
         // Panel wider than compact window (390px).
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp { id: panel, key: "width".into(), value: Value::Px(800.0) },
+            Mutation::SetProp {
+                id: panel,
+                key: "width".into(),
+                value: Value::Px(800.0),
+            },
         )
         .unwrap();
         doc.apply_from(
             Origin::System,
-            Mutation::AppendChild { parent: root, child: panel },
+            Mutation::AppendChild {
+                parent: root,
+                child: panel,
+            },
         )
         .unwrap();
 
@@ -488,14 +634,83 @@ mod tests {
                         if key == "width" && (*v - (390.0 - 32.0)).abs() < 0.01)
             })
             .collect();
-        assert_eq!(clip_muts.len(), 1, "compact env should clip element wider than window");
+        assert_eq!(
+            clip_muts.len(),
+            1,
+            "compact env should clip element wider than window"
+        );
+    }
+
+    #[test]
+    fn composite_runs_children_and_merges_both_kinds() {
+        // Two BasicSynthesizers chained: the profile has both high_contrast and
+        // large text_scale, so each child emits a size-scale and a color
+        // mutation. The composite must surface both kinds, and applying them
+        // must land both on the document.
+        let (mut doc, text_id) = make_doc_with_text(16.0);
+        let env = make_env(1280.0, 800.0, InputMode::Pointer);
+        let profile = UserProfile {
+            text_scale: 1.5,
+            high_contrast: true,
+            ..Default::default()
+        };
+
+        let composite =
+            CompositeSynthesizer(vec![Box::new(BasicSynthesizer), Box::new(BasicSynthesizer)]);
+        let result = composite.synthesize(&doc, &env, &profile);
+
+        // Composite concatenated two children, so each kind appears twice.
+        let size_kind = result
+            .mutations
+            .iter()
+            .filter(|(id, m)| {
+                *id == text_id
+                    && matches!(m, Mutation::SetProp { key, value: Value::Px(v), .. }
+                        if key == "size" && (*v - 24.0).abs() < 0.01)
+            })
+            .count();
+        let color_kind = result
+            .mutations
+            .iter()
+            .filter(|(id, m)| {
+                *id == text_id
+                    && matches!(m, Mutation::SetProp { key, value: Value::Color(0xFFFF_FFFF), .. }
+                        if key == "color")
+            })
+            .count();
+        assert_eq!(
+            size_kind, 2,
+            "both children should emit a text-size mutation"
+        );
+        assert_eq!(
+            color_kind, 2,
+            "both children should emit a high-contrast color mutation"
+        );
+
+        // Applying the merged list lands both kinds on the node (later wins).
+        apply(&mut doc, result);
+        let node = doc.get(text_id).unwrap();
+        assert_eq!(
+            node.props.get("size"),
+            Some(&Value::Px(24.0)),
+            "text scaled to 16*1.5"
+        );
+        assert_eq!(
+            node.props.get("color"),
+            Some(&Value::Color(0xFFFF_FFFF)),
+            "high-contrast color applied"
+        );
     }
 
     #[test]
     fn apply_mutations_via_origin_ai() {
         let (mut doc, text_id) = make_doc_with_text(16.0);
         let env = make_env(1280.0, 800.0, InputMode::Pointer);
-        let profile = UserProfile { text_scale: 2.0, high_contrast: true, ..Default::default() };
+        let profile = UserProfile {
+            text_scale: 2.0,
+            high_contrast: true,
+            ..Default::default()
+        };
 
         let result = BasicSynthesizer.synthesize(&doc, &env, &profile);
         let log_before = doc.audit_log().len();
@@ -503,7 +718,10 @@ mod tests {
         let applied = apply(&mut doc, result);
 
         // At least 2 mutations: size scale + high-contrast color.
-        assert!(applied >= 2, "expected at least 2 mutations applied, got {applied}");
+        assert!(
+            applied >= 2,
+            "expected at least 2 mutations applied, got {applied}"
+        );
 
         // All new edits are attributed to Ai.
         let new_edits = &doc.audit_log()[log_before..];

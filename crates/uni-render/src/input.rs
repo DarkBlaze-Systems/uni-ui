@@ -42,9 +42,17 @@ pub enum InputEvent {
     /// The pointer moved to `(x, y)` (logical px).
     PointerMoved { x: f32, y: f32 },
     /// A pointer `button` was pressed at `(x, y)` (logical px).
-    PointerDown { x: f32, y: f32, button: PointerButton },
+    PointerDown {
+        x: f32,
+        y: f32,
+        button: PointerButton,
+    },
     /// A pointer `button` was released at `(x, y)` (logical px).
-    PointerUp { x: f32, y: f32, button: PointerButton },
+    PointerUp {
+        x: f32,
+        y: f32,
+        button: PointerButton,
+    },
     /// A scroll/wheel gesture. `dx`/`dy` are logical-pixel deltas (positive
     /// `dy` scrolls content down). Line-based wheels are converted to pixels by
     /// the translator using a fixed line height.

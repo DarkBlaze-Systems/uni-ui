@@ -76,7 +76,10 @@ mod tests {
         let radius = taps_for_sigma(sigma);
         let k = normalized_half_kernel(sigma, radius);
         let total = k[0] + 2.0 * k[1..].iter().sum::<f32>();
-        assert!((total - 1.0).abs() < 1e-5, "kernel must sum to 1, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "kernel must sum to 1, got {total}"
+        );
     }
 
     #[test]

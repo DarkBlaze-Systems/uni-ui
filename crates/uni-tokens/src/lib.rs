@@ -115,7 +115,7 @@ impl Palette {
     /// backward compatibility with existing call sites.
     pub const fn for_variant(variant: Variant) -> Self {
         Palette {
-            substrate: SUBSTRATE,       // white
+            substrate: SUBSTRATE, // white
             ink: NEAR_BLACK,
             ink_soft: 0x0a0a0aaa,
             ink_faint: 0x0a0a0a66,
@@ -141,16 +141,16 @@ impl Palette {
         };
         match mode {
             ThemeMode::Dark => Palette {
-                substrate: NEAR_BLACK,      // 0x0a0a0aff — the dark canvas
-                ink: 0xffffffff,            // white text/icons
+                substrate: NEAR_BLACK, // 0x0a0a0aff — the dark canvas
+                ink: 0xffffffff,       // white text/icons
                 ink_soft: 0xffffffaa,
                 ink_faint: 0xffffff66,
-                glow: 0xffffff22,           // subtle white rim light
-                shadow: 0x00000066,         // deeper shadow on dark
+                glow: 0xffffff22,   // subtle white rim light
+                shadow: 0x00000066, // deeper shadow on dark
                 accent,
             },
             ThemeMode::Light => Palette {
-                substrate: SUBSTRATE,       // 0xffffffff — white canvas
+                substrate: SUBSTRATE, // 0xffffffff — white canvas
                 ink: NEAR_BLACK,
                 ink_soft: 0x0a0a0aaa,
                 ink_faint: 0x0a0a0a66,
@@ -534,7 +534,12 @@ mod tests {
     fn every_role_has_an_emphasized_variant() {
         let ty = Type::default();
         for role in [
-            ty.display, ty.title, ty.subtitle, ty.body, ty.caption, ty.mono,
+            ty.display,
+            ty.title,
+            ty.subtitle,
+            ty.body,
+            ty.caption,
+            ty.mono,
         ] {
             // Emphasized is at least as heavy as the base — the whole point.
             assert!(role.emphasized.weight >= role.base.weight);
@@ -583,12 +588,7 @@ mod tests {
     /// in that band — proving "no emerald constant present".
     #[test]
     fn no_emerald_constant_present() {
-        let colors = [
-            SUBSTRATE,
-            NEAR_BLACK,
-            ACCENT_VIOLET,
-            ACCENT_LIME,
-        ];
+        let colors = [SUBSTRATE, NEAR_BLACK, ACCENT_VIOLET, ACCENT_LIME];
         for c in colors {
             let r = ((c >> 24) & 0xff) as i32;
             let g = ((c >> 16) & 0xff) as i32;
@@ -606,6 +606,9 @@ mod tests {
         // must survive the emerald check above.
         let lr = ((ACCENT_LIME >> 24) & 0xff) as i32;
         let lg = ((ACCENT_LIME >> 16) & 0xff) as i32;
-        assert!(lr > 150 && lg > 150, "lime should be yellow-green, not emerald");
+        assert!(
+            lr > 150 && lg > 150,
+            "lime should be yellow-green, not emerald"
+        );
     }
 }

@@ -1,0 +1,60 @@
+# cargo-deny — supply-chain & license gate for the Uni-UI engine.
+#
+# The engine is owned outright and destined for the DarkBlaze "Sanity License"
+# (a BSL 1.1 variant). Our own crates carry `LicenseRef-DarkBlaze-Sanity`;
+# every *dependency* must be permissive. Copyleft is denied outright — pulling
+# GPL/AGPL/MPL/etc. into the tree would poison the no-compete grant.
+#
+# Run: cargo deny check licenses advisories bans
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # `paste` is unmaintained (archived upstream). It enters the tree only
+    # transitively through wgpu → wgpu-hal → metal, a macOS-only backend dep we
+    # do not control, and RustSec lists no safe upgrade. It is a proc-macro with
+    # no runtime/network surface, so the unmaintained status is informational
+    # rather than a live vulnerability. Revisit when wgpu drops it.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+# Allow only permissive licenses. Our own source is LicenseRef-DarkBlaze-Sanity.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # CC0-1.0: public-domain dedication (hexf-parse). More permissive than MIT.
+    "CC0-1.0",
+    # ISC: functionally equivalent to MIT (libloading).
+    "ISC",
+    "LicenseRef-DarkBlaze-Sanity",
+]
+confidence-threshold = 0.9
+
+# Our own workspace crates carry `LicenseRef-DarkBlaze-Sanity`, which SPDX does
+# not know about, so cargo-deny reads them as "unlicensed". They are never
+# published (`publish = false`); skip them — the gate is about *dependencies*.
+private = { ignore = true }
+
+[bans]
+# Deny copyleft and other non-permissive families if they ever sneak in via a
+# transitive dep. Anything not in `licenses.allow` already fails the licenses
+# check above; this section guards the dependency graph's shape.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

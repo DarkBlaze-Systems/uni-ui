@@ -6,8 +6,8 @@
 //! it shows the Human-vs-AI `Origin` trail in plain text (useful in CI / over
 //! SSH where a GPU surface isn't available).
 
-use uni_reactor::Store;
 use uni_ir::{NodeId, Origin, Value};
+use uni_reactor::Store;
 use uni_render::{InputEvent, PointerButton};
 use uni_runtime::Runtime;
 

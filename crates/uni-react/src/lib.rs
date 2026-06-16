@@ -78,19 +78,19 @@ enum State {
     Dirty,
 }
 
+/// A memo's recompute closure: reads the [`Runtime`] and yields a fresh
+/// type-erased value to cache.
+type ComputeFn = Box<dyn FnMut(&Runtime) -> Box<dyn AnyValue>>;
+
 /// What a node *is*. The boxed value/closure is type-erased; the typed
 /// handles ([`Signal`], [`Memo`]) re-impose the type on access.
 enum NodeKind {
     /// A root mutable cell.
     Signal,
     /// A derived value computed by `compute`, caching into the node's `value`.
-    Memo {
-        compute: Box<dyn FnMut(&Runtime) -> Box<dyn AnyValue>>,
-    },
+    Memo { compute: ComputeFn },
     /// A side effect; `run` re-executes when a dependency changes.
-    Effect {
-        run: Box<dyn FnMut(&Runtime)>,
-    },
+    Effect { run: Box<dyn FnMut(&Runtime)> },
 }
 
 /// One reactive node in the arena.

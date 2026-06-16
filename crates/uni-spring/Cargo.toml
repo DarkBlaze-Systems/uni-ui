@@ -5,4 +5,23 @@ edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Off by default so the core stays `#![no_std]` and dependency-free. Turning
+# `std` on lights up `SpringPool`, the heap-backed batch integrator that offloads
+# its per-channel loop to `uni-simd`'s runtime-dispatched SIMD kernel.
+default = []
+std = ["dep:uni-simd"]
+
 [dependencies]
+# Optional: only pulled in by the `std` feature, for the batch SIMD path.
+uni-simd = { path = "../uni-simd", optional = true }
+
+[dev-dependencies]
+# Statistics-driven microbenchmarks (scalar vs SIMD batch integration).
+# MIT / Apache-2.0. Dev-only — never in the shipped dep tree.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "integrate"
+harness = false
+required-features = ["std"]
