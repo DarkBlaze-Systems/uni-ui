@@ -25,6 +25,13 @@
 - **S4 — Animation + transforms.** Implicit/explicit animation, transitions, offset/rotation/scale effects (on uni-spring). ← ✅ **DONE** (348 tests / 0 fail, clippy+doc clean; rotation full for rects, text axis-aligned in v0).
 - **S5 — Gestures.** tap/longPress/drag/magnify/rotation, combined, gesture state. ← ✅ **DONE** (379 tests / 0 fail, clippy+doc clean; magnify/rotation driven programmatically — headless has no multitouch).
 - **S6 — Drawing + text.** Path/Shape/Canvas/gradients; dynamic type, localization. ← ✅ **DONE** (430 tests / 0 fail, clippy+doc clean; angular gradient partial, bidi later).
-- **S7 — Tooling + ergonomics.** Preview harness, inspector, hot-reload-ish; docs/examples.
+- **S7 — Tooling + ergonomics.** Preview harness (`preview_png` headless render→PNG, hand-rolled encoder), IR/layout `inspect()`, `reload_from_uni` hot-reload, `docs/SWIFTUI-MAPPING.md`. ← ✅ **DONE** (442 tests / 0 fail, clippy+doc clean).
+
+---
+
+## ✅ Planned program S1→S7 COMPLETE (442 tests, all gates green)
+The **common, practical SwiftUI surface** lowers, lays out, renders, animates, and is inspectable/previewable in Uni-UI. See `docs/SWIFTUI-MAPPING.md` for the full construct-by-construct reference.
+
+**Honest residuals (NOT equivalence with Apple's depth):** angular gradient (partial), rotation-on-text (axis-aligned v0), bidi text, matchedGeometry, `@Environment`, GeometryReader, Link — all ⬜/partial. No app dogfooded on a real device yet; this is *functional coverage of the common surface*, not Apple-grade polish/ecosystem. That depth is the ongoing road.
 
 _Each milestone ships green (cargo test + clippy + doc) and updates this matrix. No "equivalent" claim without the matrix backing it._

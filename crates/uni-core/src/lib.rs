@@ -1955,6 +1955,139 @@ pub fn lower(doc: &Document, viewport: (f32, f32)) -> Scene {
     paint(doc, &l)
 }
 
+// ---------------------------------------------------------------------------
+// SwiftUI-style devtools: PREVIEW (render-to-PNG) + INSPECTOR (IR tree dump)
+// ---------------------------------------------------------------------------
+
+/// Rasterize a [`Document`] into an RGBA8 pixel buffer at the given viewport,
+/// using the software [`uni_render::CanvasRenderer`] (no GPU, no window).
+///
+/// This is the headless half of SwiftUI's `#Preview`: lower the doc to a
+/// [`Scene`], paint it into an in-memory buffer. Returns `(width, height,
+/// pixels)` where `pixels` is `width*height*4` bytes, row-major, top-down.
+/// `viewport` is rounded to whole logical pixels.
+pub fn render_to_buffer(doc: &Document, viewport: (f32, f32)) -> (u32, u32, Vec<u8>) {
+    use uni_render::{CanvasRenderer, Renderer};
+    let w = viewport.0.max(1.0).round() as u32;
+    let h = viewport.1.max(1.0).round() as u32;
+    let scene = lower(doc, (w as f32, h as f32));
+    let mut canvas = CanvasRenderer::new(w, h);
+    // The canvas renderer is infallible (no surface to lose); render in place.
+    let _ = canvas.render(&scene);
+    (w, h, canvas.pixels)
+}
+
+/// Render a [`Document`] to **PNG bytes** at the given viewport — the headless
+/// SwiftUI `#Preview` path, end to end.
+///
+/// Lowers the doc with the software canvas backend ([`render_to_buffer`]) and
+/// encodes the resulting RGBA buffer with [`uni_render::encode_rgba`] (a tiny,
+/// dependency-light PNG encoder). The returned `Vec<u8>` is a complete,
+/// spec-valid PNG file you can write straight to disk.
+pub fn preview_png(doc: &Document, viewport: (f32, f32)) -> Vec<u8> {
+    let (w, h, pixels) = render_to_buffer(doc, viewport);
+    uni_render::encode_rgba(w, h, &pixels)
+}
+
+/// Produce an indented, human-readable dump of the IR tree against a computed
+/// [`Layout`] — the view a SwiftUI-style **inspector** devtool would show.
+///
+/// Each line is one node, indented by depth, carrying:
+/// - the node `kind` and its [`NodeId`],
+/// - a couple of identifying props (content/color/dimensions where present),
+/// - its computed `rect` (`x,y w×h`) from the layout,
+/// - its **painter order** index (draw order; higher == on top),
+/// - a **window/dirty** marker: `[off-window]` when the node has no computed
+///   rect (e.g. a `List`/`LazyVStack` row virtualized out of the visible
+///   window), so the inspector shows what layout dropped.
+///
+/// The walk follows the document tree from the root depth-first (parent before
+/// children, siblings in order), independent of paint suppression, so the dump
+/// reflects the *authored* structure even for hidden/dormant subtrees.
+pub fn inspect(doc: &Document, layout: &Layout) -> String {
+    let mut out = String::new();
+    let (vw, vh) = layout.viewport();
+    out.push_str(&format!(
+        "Document  viewport {vw:.0}x{vh:.0}  ({} nodes laid out)\n",
+        layout.len()
+    ));
+
+    // Painter-order index per node, so each line can report its draw order.
+    let mut paint_idx: HashMap<NodeId, usize> = HashMap::new();
+    for (i, id) in layout.order().iter().enumerate() {
+        paint_idx.insert(*id, i);
+    }
+
+    match doc.root() {
+        Some(root) => inspect_node(doc, layout, &paint_idx, root, 0, &mut out),
+        None => out.push_str("  (no root)\n"),
+    }
+    out
+}
+
+/// Recursive worker for [`inspect`]: emit one indented line per node, then recurse.
+fn inspect_node(
+    doc: &Document,
+    layout: &Layout,
+    paint_idx: &HashMap<NodeId, usize>,
+    id: NodeId,
+    depth: usize,
+    out: &mut String,
+) {
+    let Some(node) = doc.get(id) else {
+        return;
+    };
+    let indent = "  ".repeat(depth + 1);
+
+    // Identifying props, kept short so the dump stays a tree you can scan.
+    let mut props: Vec<String> = Vec::new();
+    if let Some(s) = text_of(node, "content") {
+        let s = if s.len() > 24 { format!("{}…", &s[..24]) } else { s };
+        props.push(format!("content={s:?}"));
+    }
+    if let Some(c) = color_of(node, "color").or_else(|| color_of(node, "background")) {
+        props.push(format!("color=#{c:08x}"));
+    }
+    if let Some(w) = px_of(node, "width") {
+        props.push(format!("width={w:.0}"));
+    }
+    if let Some(h) = px_of(node, "height") {
+        props.push(format!("height={h:.0}"));
+    }
+    let prop_str = if props.is_empty() {
+        String::new()
+    } else {
+        format!("  {{{}}}", props.join(", "))
+    };
+
+    // Computed rect + painter order, or an off-window marker when layout
+    // produced no rect for this node (virtualized list row / never laid out).
+    let geom = match layout.rect(id) {
+        Some(r) => {
+            let order = paint_idx
+                .get(&id)
+                .map(|i| format!("paint#{i}"))
+                .unwrap_or_else(|| "paint#-".to_string());
+            format!(
+                "rect=({:.0},{:.0} {:.0}x{:.0})  {order}",
+                r.x, r.y, r.w, r.h
+            )
+        }
+        None => "[off-window]".to_string(),
+    };
+
+    out.push_str(&format!(
+        "{indent}{kind}#{nid}{prop_str}  {geom}\n",
+        kind = node.kind,
+        nid = id.0,
+    ));
+
+    let children: Vec<NodeId> = node.children.clone();
+    for child in children {
+        inspect_node(doc, layout, paint_idx, child, depth + 1, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2069,6 +2202,101 @@ mod tests {
         let doc = Document::new();
         assert!(lower(&doc, (640.0, 480.0)).is_empty());
         assert!(layout(&doc, (640.0, 480.0)).is_empty());
+    }
+
+    /// Build a small shapes+text doc shared by the preview/inspect tests.
+    fn sample_doc() -> Document {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        prop(&mut doc, root, "background", Value::Color(0x0a0a0aff));
+
+        let t = node(&mut doc, "Text");
+        prop(&mut doc, t, "content", Value::Text("Preview".into()));
+        prop(&mut doc, t, "size", Value::Px(28.0));
+        prop(&mut doc, t, "color", Value::Color(0xffffffff));
+        child(&mut doc, root, t);
+
+        let circ = node(&mut doc, "Circle");
+        prop(&mut doc, circ, "width", Value::Px(120.0));
+        prop(&mut doc, circ, "height", Value::Px(120.0));
+        prop(&mut doc, circ, "color", Value::Color(0x7d39ebff));
+        child(&mut doc, root, circ);
+
+        let r = node(&mut doc, "Rect");
+        prop(&mut doc, r, "width", Value::Px(200.0));
+        prop(&mut doc, r, "height", Value::Px(80.0));
+        prop(&mut doc, r, "color", Value::Color(0x1fb6c8ff));
+        child(&mut doc, root, r);
+        doc
+    }
+
+    #[test]
+    fn render_to_buffer_fills_rgba_pixels() {
+        let doc = sample_doc();
+        let (w, h, px) = render_to_buffer(&doc, (240.0, 240.0));
+        assert_eq!((w, h), (240, 240));
+        assert_eq!(px.len(), 240 * 240 * 4);
+        // The background fills the viewport opaque, so the corner pixel is painted.
+        assert!(px.iter().any(|&b| b != 0), "buffer is not all-zero");
+        let corner_a = px[3]; // alpha of pixel (0,0)
+        assert_eq!(corner_a, 255, "opaque background reaches the corner");
+    }
+
+    #[test]
+    fn preview_png_emits_valid_png_bytes() {
+        let doc = sample_doc();
+        let png = preview_png(&doc, (200.0, 160.0));
+        assert!(!png.is_empty(), "PNG bytes are non-empty");
+        // PNG 8-byte signature.
+        assert_eq!(
+            &png[..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+            "valid PNG signature"
+        );
+        // First chunk is IHDR; the encoded dimensions match the viewport.
+        assert_eq!(&png[12..16], b"IHDR");
+        let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+        let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+        assert_eq!((w, h), (200, 160));
+    }
+
+    #[test]
+    fn inspect_dumps_root_kind_and_child_rect() {
+        let doc = sample_doc();
+        let l = layout(&doc, (400.0, 400.0));
+        let dump = inspect(&doc, &l);
+
+        // The root kind is present.
+        assert!(dump.contains("Stack#"), "root kind in dump:\n{dump}");
+        // A child kind is present.
+        assert!(dump.contains("Text#"), "child kind in dump:\n{dump}");
+        assert!(dump.contains("Circle#"), "shape child in dump:\n{dump}");
+        // A computed rect appears (the geometry the inspector exposes).
+        assert!(dump.contains("rect=("), "computed rect in dump:\n{dump}");
+        // Painter order is reported.
+        assert!(dump.contains("paint#"), "painter order in dump:\n{dump}");
+        // Indentation nests children under the root.
+        assert!(
+            dump.contains("\n  Stack#") && dump.contains("\n    Text#"),
+            "nested indentation in dump:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn inspect_marks_off_window_nodes() {
+        // A node with no layout rect is reported as off-window. Build a doc,
+        // lay it out, then add a brand-new node that the stale layout never saw.
+        let mut doc = sample_doc();
+        let l = layout(&doc, (400.0, 400.0));
+        let extra = node(&mut doc, "Rect");
+        let root = doc.root().unwrap();
+        child(&mut doc, root, extra);
+        let dump = inspect(&doc, &l);
+        assert!(
+            dump.contains("[off-window]"),
+            "node absent from layout is flagged off-window:\n{dump}"
+        );
     }
 
     #[test]

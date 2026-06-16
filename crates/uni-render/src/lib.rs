@@ -52,3 +52,8 @@ pub use wgpu_backend::WgpuRenderer;
 // here; it exists for downstream crates that want an explicit opt-in.
 pub mod canvas_backend;
 pub use canvas_backend::CanvasRenderer;
+
+// A tiny, dependency-light PNG encoder for the preview path (SwiftUI #Preview):
+// rasterize a Scene with `CanvasRenderer`, then `encode_rgba` the buffer.
+pub mod png;
+pub use png::encode_rgba;

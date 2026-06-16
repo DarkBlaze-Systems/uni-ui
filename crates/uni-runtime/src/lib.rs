@@ -353,6 +353,70 @@ impl Runtime {
         Ok(Runtime::new(uni_dsl::parse(src)?, viewport))
     }
 
+    // -- hot reload (SwiftUI-style live edit) ---------------------------------
+
+    /// **Re-parse `.uni` source and swap the live tree in place** — the
+    /// hot-reload entry point. Re-parses `src` through [`uni_dsl::parse`] into a
+    /// fresh [`Document`] and hands it to [`Runtime::reload_document`], so
+    /// editing the source and reloading updates the live UI **without a
+    /// restart** (the SwiftUI live-edit feel).
+    ///
+    /// State in the [`Store`] is preserved across the swap — every key that
+    /// still exists keeps its value (see [`Runtime::reload_document`]) — so a
+    /// reload after editing layout/markup keeps the counter where it was, the
+    /// route where it was, the form filled in. A [`uni_dsl::ParseError`] leaves
+    /// the current tree untouched (the swap only happens on a clean parse).
+    pub fn reload_from_uni(&mut self, src: &str) -> Result<(), uni_dsl::ParseError> {
+        let doc = uni_dsl::parse(src)?;
+        self.reload_document(doc);
+        Ok(())
+    }
+
+    /// **Swap in a freshly built [`Document`], preserving store state.**
+    ///
+    /// The structural half of hot reload. The new document replaces the live
+    /// tree wholesale (new root, new node ids, new structure), but the reactive
+    /// [`Store`] is carried across untouched: state is keyed by name, not by
+    /// node id, so every key whose binding still exists in the new tree
+    /// repopulates its bound prop on the [`sync_bindings`](Runtime::sync_bindings)
+    /// that follows. Keys whose bindings vanished simply stop being read; keys
+    /// whose bindings appeared get pushed in immediately.
+    ///
+    /// Because the swap invalidates every node id, the incremental-layout
+    /// machinery (the dirty set, the audit cursor, and the persistent
+    /// [`uni_core::LayoutCache`]) is reset and a **full** relayout is forced —
+    /// taffy cannot reuse a cached subtree from a tree that no longer exists.
+    /// The animation watcher snapshots are reseeded against the new tree, so
+    /// only changes *after* the reload animate (the reload itself is not an
+    /// animated transition). The result: the live UI reflects the new document
+    /// on the very next paint, with surviving state intact.
+    pub fn reload_document(&mut self, doc: Document) {
+        // Swap the tree. The old doc (and its audit log) is dropped; provenance
+        // for the *new* tree starts fresh from its own construction log.
+        self.doc = doc;
+        // Every node id from the old tree is gone, so the incremental-layout
+        // bookkeeping must start over: a stale dirty id or cached subtree would
+        // point at a node that no longer exists.
+        self.dirty.clear();
+        self.audit_cursor = self.doc.audit_log().len();
+        self.layout_cache = LayoutCache::new();
+        self.layout = Layout::default();
+        // In-flight animations and focus targeted the old node ids; drop them.
+        self.animations.clear();
+        self.implicit.clear();
+        self.focused = None;
+        // Re-derive the live frame from the surviving store: push state into the
+        // new tree's bound props (id-stable within the new tree), then force a
+        // full layout (the dirty short-circuit would otherwise skip a clean,
+        // never-laid-out tree only if `order()` were non-empty — it isn't, but
+        // forcing is the honest contract here).
+        self.sync_bindings();
+        self.relayout_force();
+        // Reseed the watcher so the first change *after* reload is what animates,
+        // not the reload's own prop values.
+        self.seed_animation_snapshots();
+    }
+
     /// Register (or replace) the handler run when an [`Action`] of this `name`
     /// fires. The handler mutates the document; the runtime re-lays-out and
     /// repaints afterward.
@@ -3164,6 +3228,168 @@ mod tests {
         let fired = rt.feed_gesture(&up(790.0, 590.0), Origin::Human);
         assert!(!fired);
         assert!(log.borrow().is_empty(), "a miss does not arm the tap");
+    }
+
+    // -- hot reload -----------------------------------------------------------
+
+    /// The "after the edit" source: the root is now a `Column`, not a `Stack`,
+    /// and the bound label moved but still reads `$label`. Reloading this over a
+    /// `COUNTER_UNI` runtime is the live-edit swap.
+    const RELOADED_UNI: &str = r#"
+        Column { padding: 8px; gap: 4px; background: #111111;
+          Text { content: "static header"; size: 18px; color: #ffffff; }
+          Text { content: $label; size: 28px; color: #cccccc; }
+        }
+    "#;
+
+    /// **Reload swaps the live tree.** After [`Runtime::reload_from_uni`] the
+    /// root kind changes (`Stack` → `Column`) and the new tree's nodes are the
+    /// ones the runtime now holds — editing source and reloading updates the
+    /// live document without a restart.
+    #[test]
+    fn reload_from_uni_swaps_the_tree() {
+        let mut rt = counter_runtime();
+        assert_eq!(rt.doc().get(rt.doc().root().unwrap()).unwrap().kind, "Stack");
+        // Old root had a Button child; the new tree has none.
+        let had_button = rt
+            .doc()
+            .audit_log()
+            .iter()
+            .any(|e| matches!(&e.mutation, Mutation::CreateNode { kind, .. } if kind == "Button"));
+        assert!(had_button, "precondition: the counter tree has a Button");
+
+        rt.reload_from_uni(RELOADED_UNI).expect("reloaded .uni parses");
+
+        let root = rt.doc().root().unwrap();
+        assert_eq!(
+            rt.doc().get(root).unwrap().kind,
+            "Column",
+            "root kind reflects the reloaded source"
+        );
+        // The new root's children are the two Texts from RELOADED_UNI.
+        let kids = &rt.doc().get(root).unwrap().children;
+        assert_eq!(kids.len(), 2);
+        assert_eq!(rt.doc().get(kids[0]).unwrap().kind, "Text");
+        assert_eq!(rt.doc().get(kids[1]).unwrap().kind, "Text");
+        // No Button survives the swap (the old subtree is gone): walk the new
+        // layout order and confirm none of its nodes is a Button.
+        let any_button = rt
+            .layout()
+            .order()
+            .iter()
+            .any(|&id| rt.doc().get(id).map(|n| n.kind == "Button").unwrap_or(false));
+        assert!(!any_button, "the Button did not survive the reload");
+    }
+
+    /// **Store state survives the reload for surviving keys.** A handler bumps
+    /// `count`/`label` before the reload; after swapping in a tree that still
+    /// binds `$label`, the store values persist and the *new* tree's bound Text
+    /// shows the carried-over label.
+    #[test]
+    fn reload_preserves_store_state_for_surviving_keys() {
+        let mut rt = counter_runtime();
+        let button = button_id(rt.doc());
+        // Click twice → count=2, label="Clicks: 2".
+        rt.dispatch(button, "click", Origin::Human);
+        rt.dispatch(button, "click", Origin::Human);
+        assert_eq!(rt.store().get("count"), Some(Value::Int(2)));
+
+        rt.reload_from_uni(RELOADED_UNI).expect("reloaded .uni parses");
+
+        // State carried across the swap untouched.
+        assert_eq!(rt.store().get("count"), Some(Value::Int(2)));
+        assert_eq!(
+            rt.store().get("label"),
+            Some(Value::Text("Clicks: 2".into()))
+        );
+        // The surviving binding repopulated the new tree's bound Text prop.
+        let root = rt.doc().root().unwrap();
+        let bound_label = rt.doc().get(root).unwrap().children[1];
+        assert_eq!(
+            rt.doc().get(bound_label).unwrap().props.get("content"),
+            Some(&Value::Text("Clicks: 2".into())),
+            "the reloaded tree's bound label reflects the surviving state"
+        );
+    }
+
+    /// **Layout reflects the new doc after reload.** The reloaded tree lays out
+    /// fresh: its root node has a computed rect, the old root id need not even
+    /// resolve, and the layout order enumerates the new nodes.
+    #[test]
+    fn reload_relays_out_the_new_doc() {
+        let mut rt = counter_runtime();
+        // The old tree (Stack root containing a Button) was laid out.
+        let old_kinds: Vec<String> = rt
+            .layout()
+            .order()
+            .iter()
+            .filter_map(|&id| rt.doc().get(id).map(|n| n.kind.clone()))
+            .collect();
+        assert!(
+            old_kinds.iter().any(|k| k == "Button"),
+            "precondition: the old layout includes the Button"
+        );
+
+        rt.reload_from_uni(RELOADED_UNI).expect("reloaded .uni parses");
+
+        let root = rt.doc().root().unwrap();
+        // The new root is laid out (a real computed rect exists).
+        assert!(
+            rt.layout().rect(root).is_some(),
+            "the reloaded root has a computed rect"
+        );
+        // The layout order now enumerates the reloaded tree's nodes, and every
+        // one resolves in the *new* doc.
+        let order = rt.layout().order();
+        assert!(order.contains(&root), "layout order includes the new root");
+        let new_kinds: Vec<String> = order
+            .iter()
+            .filter_map(|&id| rt.doc().get(id).map(|n| n.kind.clone()))
+            .collect();
+        // The layout reflects the new tree, not the old: a Column, no Button.
+        assert!(
+            new_kinds.iter().any(|k| k == "Column"),
+            "the laid-out tree now has a Column root"
+        );
+        assert!(
+            !new_kinds.iter().any(|k| k == "Button"),
+            "the old Button is no longer laid out"
+        );
+        // RELOADED_UNI's laid-out tree is Column + two Text nodes.
+        assert_eq!(order.len(), 3, "Column + two Text nodes are laid out");
+    }
+
+    /// **`reload_document` is the doc-level variant.** Swapping a pre-built
+    /// [`Document`] preserves state and relays out, exactly like the string path.
+    #[test]
+    fn reload_document_variant_swaps_and_preserves_state() {
+        let mut rt = counter_runtime();
+        rt.dispatch(button_id(rt.doc()), "click", Origin::Human);
+        assert_eq!(rt.store().get("count"), Some(Value::Int(1)));
+
+        let new_doc = uni_dsl::parse(RELOADED_UNI).unwrap();
+        rt.reload_document(new_doc);
+
+        assert_eq!(
+            rt.doc().get(rt.doc().root().unwrap()).unwrap().kind,
+            "Column"
+        );
+        assert_eq!(rt.store().get("count"), Some(Value::Int(1)));
+        assert!(rt.layout().rect(rt.doc().root().unwrap()).is_some());
+    }
+
+    /// A reload that fails to parse leaves the current tree untouched.
+    #[test]
+    fn reload_from_uni_rejects_bad_source_without_swapping() {
+        let mut rt = counter_runtime();
+        let root_before = rt.doc().root().unwrap();
+        let kind_before = rt.doc().get(root_before).unwrap().kind.clone();
+
+        let err = rt.reload_from_uni("Stack { this is not valid uni ::: }");
+        assert!(err.is_err(), "malformed source is rejected");
+        // The tree is unchanged: same root id, same kind.
+        assert_eq!(rt.doc().root(), Some(root_before));
+        assert_eq!(rt.doc().get(root_before).unwrap().kind, kind_before);
     }
 }
 
