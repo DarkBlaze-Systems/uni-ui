@@ -11,5 +11,10 @@ uni-ir = { path = "../uni-ir" }
 uni-core = { path = "../uni-core" }
 uni-render = { path = "../uni-render" }
 uni-react = { path = "../uni-react" }
+uni-reactor = { path = "../uni-reactor" }
+uni-widgets = { path = "../uni-widgets" }
 uni-dsl = { path = "../uni-dsl" }
 winit = "0.30"
+
+[dev-dependencies]
+uni-tokens = { path = "../uni-tokens" }

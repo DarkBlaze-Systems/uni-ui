@@ -6,16 +6,14 @@
 //! it shows the Human-vs-AI `Origin` trail in plain text (useful in CI / over
 //! SSH where a GPU surface isn't available).
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use uni_ir::{Document, Mutation, NodeId, Origin, Value};
+use uni_reactor::Store;
+use uni_ir::{NodeId, Origin, Value};
 use uni_render::{InputEvent, PointerButton};
 use uni_runtime::Runtime;
 
 const COUNTER_UNI: &str = r#"
     Stack { padding: 24px; gap: 16px; background: #0a0a0a;
-      Text { content: "Clicks: 0"; size: 32px; color: #ffffff; }
+      Text { content: $label; size: 32px; color: #ffffff; }
       Button { width: 200px; height: 64px; color: #7d39eb; corner_radius: 16px;
                on click: increment();
                Text { content: "Click me"; size: 20px; color: #ffffff; } }
@@ -28,28 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label: NodeId = rt.doc().get(root).unwrap().children[0];
     let button: NodeId = rt.doc().get(root).unwrap().children[1];
 
-    let count = Rc::new(RefCell::new(0i64));
+    rt.store_mut().set("count", Value::Int(0));
+    rt.store_mut().set("label", Value::Text("Clicks: 0".into()));
+    rt.sync_bindings();
+
     rt.register(
         "increment",
-        Box::new(move |doc: &mut Document| {
-            *count.borrow_mut() += 1;
-            let n = *count.borrow();
-            let origin = doc
-                .audit_log()
-                .iter()
-                .rev()
-                .find(|e| matches!(e.mutation, Mutation::Invoke { .. }))
-                .map(|e| e.origin)
-                .unwrap_or(Origin::System);
-            doc.apply_from(
-                origin,
-                Mutation::SetProp {
-                    id: label,
-                    key: "content".into(),
-                    value: Value::Text(format!("Clicks: {n}")),
-                },
-            )
-            .unwrap();
+        Box::new(move |store: &mut Store, _origin: Origin| {
+            let n = match store.get("count") {
+                Some(Value::Int(n)) => n + 1,
+                _ => 1,
+            };
+            store.set("count", Value::Int(n));
+            store.set("label", Value::Text(format!("Clicks: {n}")));
         }),
     );
 
