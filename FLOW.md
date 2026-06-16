@@ -2,9 +2,18 @@
 
 Uni-UI is organized by one principle, borrowed from the DarkBlaze Flow-Kernel:
 
-> **Own the spine. Isolate everything else as swappable backend leaves behind it,
-> never above it. Whoever owns the flow owns the system — freedom and portability
-> follow ownership of the *flow*, not of every line.**
+> **Own the spine — a governing, umbrella layer. Fuse the best existing wheels
+> beneath it; isolate each as a swappable leaf, never above the spine. Whoever
+> owns the flow owns the system — freedom and portability follow ownership of the
+> *flow*, not of every line.**
+
+**We don't reinvent the wheel — we make a better wheel out of all existing ideas
+of wheels.** The Flow *governs and fuses* what already works (`taffy`, `wgpu`,
+`parley`, `accesskit`, `winit`); we forge a new wheel *only* where the existing
+one is missing or encumbered (a real frosted-glass blur — none existed
+permissively; our own `.uni` parser — Slint's compiler is GPL; the AI-malleable
+cowork IR — genuinely new). We adapt and fuse what works. We don't force — we
+show a better way. We bring order to the chaos.
 
 ## The spine (DarkBlaze-owned)
 
