@@ -355,6 +355,232 @@ impl<const N: usize> SpringVec<N> {
     }
 }
 
+// --- SwiftUI-style animation toolkit -----------------------------------------
+//
+// The `Spring` above is the *physics* core: an interruptible, velocity-preserving
+// oscillator with no fixed duration. SwiftUI's `Animation` is the other idiom — a
+// declarative *descriptor* pairing a curve with a (mostly) fixed duration that you
+// sample at a normalized time. This section adds that idiom **alongside** the
+// spring, sharing the same crate and the same `#![no_std]` discipline.
+//
+// A timed curve maps elapsed time `t` (seconds) to a normalized `progress` in
+// `0..=1`. The spring curve has no inherent duration, so its descriptor samples
+// the existing physics path: it integrates a unit `SpringState` (0 -> 1) at a
+// fixed internal step and reports the value at time `t` — the same integrator the
+// rest of the crate is built on, just driven on a clock instead of per-frame.
+
+/// A timing curve: how normalized progress evolves over a fixed duration.
+///
+/// Every variant maps an elapsed time onto a progress in `0..=1`. The `Spring`
+/// variant reuses the crate's physics integrator (see [`Animation::sample`]); the
+/// rest are classic CSS/SwiftUI easing functions evaluated in closed form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Curve {
+    /// Constant velocity: `progress == t / duration`.
+    Linear,
+    /// Cubic ease-in: starts slow, accelerates. `f(x) = x^3`.
+    EaseIn,
+    /// Cubic ease-out: starts fast, decelerates. `f(x) = 1 - (1-x)^3`.
+    EaseOut,
+    /// Cubic ease-in-out: slow at both ends, fast in the middle.
+    EaseInOut,
+    /// Physics spring sampled on a clock, parameterised the SwiftUI way by
+    /// `response` (seconds, the natural period) and `damping_fraction` (the
+    /// damping ratio `zeta`). Reuses [`SpringState::step`] under the hood.
+    Spring {
+        /// Natural period in seconds. SwiftUI's `response`. Smaller = snappier.
+        response: f32,
+        /// Damping ratio `zeta`. `1.0` = critically damped (no overshoot);
+        /// `< 1.0` bounces. SwiftUI's `dampingFraction`.
+        damping_fraction: f32,
+    },
+}
+
+/// A SwiftUI-style animation descriptor: a [`Curve`] plus a `duration`.
+///
+/// Build one with the presets ([`Animation::linear`], [`Animation::ease_in_out`],
+/// [`Animation::spring`], …) and read its progress with [`Animation::sample`].
+/// This is purely declarative tuning — it carries no moving state, so one
+/// `Animation` can drive any number of properties.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Animation {
+    /// The timing curve.
+    pub curve: Curve,
+    /// Total duration in seconds. For [`Curve::Spring`] this is the settle
+    /// horizon used to report progress (`1.0` at and beyond it).
+    pub duration: f32,
+}
+
+impl Animation {
+    /// Construct an animation from a curve and duration.
+    ///
+    /// `duration` is clamped to a small positive floor so `sample` never divides
+    /// by zero; a zero-duration animation reports `1.0` for any `t > 0`.
+    #[inline]
+    #[must_use]
+    pub fn new(curve: Curve, duration: f32) -> Self {
+        Self {
+            curve,
+            duration: if duration > MIN_DURATION {
+                duration
+            } else {
+                MIN_DURATION
+            },
+        }
+    }
+
+    /// SwiftUI `.linear(duration:)` — constant velocity.
+    #[inline]
+    #[must_use]
+    pub fn linear(duration: f32) -> Self {
+        Self::new(Curve::Linear, duration)
+    }
+
+    /// SwiftUI `.easeIn(duration:)` — cubic ease-in.
+    #[inline]
+    #[must_use]
+    pub fn ease_in(duration: f32) -> Self {
+        Self::new(Curve::EaseIn, duration)
+    }
+
+    /// SwiftUI `.easeOut(duration:)` — cubic ease-out.
+    #[inline]
+    #[must_use]
+    pub fn ease_out(duration: f32) -> Self {
+        Self::new(Curve::EaseOut, duration)
+    }
+
+    /// SwiftUI `.easeInOut(duration:)` — cubic ease-in-out.
+    #[inline]
+    #[must_use]
+    pub fn ease_in_out(duration: f32) -> Self {
+        Self::new(Curve::EaseInOut, duration)
+    }
+
+    /// SwiftUI `.spring(response:dampingFraction:)`.
+    ///
+    /// `response` is the natural period in seconds; `damping_fraction` is the
+    /// damping ratio. `duration` is the settle horizon over which progress is
+    /// reported (SwiftUI's spring is unbounded in principle; we report `1.0`
+    /// once the clock passes `duration`).
+    #[inline]
+    #[must_use]
+    pub fn spring_with(response: f32, damping_fraction: f32, duration: f32) -> Self {
+        Self::new(
+            Curve::Spring {
+                response,
+                damping_fraction,
+            },
+            duration,
+        )
+    }
+
+    /// SwiftUI `.spring()` — the default spring preset.
+    ///
+    /// Matches SwiftUI's defaults: `response = 0.55`, `dampingFraction = 0.825`,
+    /// reported over a `1.0`-second settle horizon.
+    #[inline]
+    #[must_use]
+    pub fn spring() -> Self {
+        Self::spring_with(0.55, 0.825, 1.0)
+    }
+
+    /// Convert a [`Curve::Spring`] descriptor into the physics [`Spring`] it
+    /// represents (mass fixed at `1.0`).
+    ///
+    /// `response` is the period `T = 2*pi / w0`, so `k = (2*pi / response)^2`;
+    /// `damping_fraction` is `zeta`, so `c = 2 * zeta * sqrt(k)`. Returns `None`
+    /// for non-spring curves.
+    #[inline]
+    #[must_use]
+    pub fn as_spring(&self) -> Option<Spring> {
+        match self.curve {
+            Curve::Spring {
+                response,
+                damping_fraction,
+            } => {
+                let resp = if response > MIN_DURATION {
+                    response
+                } else {
+                    MIN_DURATION
+                };
+                let w0 = TAU / resp;
+                let k = w0 * w0;
+                let c = 2.0 * damping_fraction * sqrt(k);
+                Some(Spring::new(k, c, 1.0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Sample the animation at elapsed time `t` (seconds), returning progress.
+    ///
+    /// * For the timed curves the result is **clamped to `0..=1`**: `0.0` at
+    ///   `t <= 0`, the curve in between, and `1.0` at `t >= duration`.
+    /// * For [`Curve::Spring`] the value comes from integrating a unit
+    ///   `SpringState` (0 -> 1) with [`SpringState::step`] up to `t`, then
+    ///   forced to exactly `1.0` once `t >= duration` so timed and physics paths
+    ///   share the same "done at duration" contract.
+    #[must_use]
+    pub fn sample(&self, t: f32) -> f32 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        if t >= self.duration {
+            return 1.0;
+        }
+        match self.curve {
+            Curve::Linear => clamp01(t / self.duration),
+            Curve::EaseIn => {
+                let x = clamp01(t / self.duration);
+                x * x * x
+            }
+            Curve::EaseOut => {
+                let x = clamp01(t / self.duration);
+                let inv = 1.0 - x;
+                1.0 - inv * inv * inv
+            }
+            Curve::EaseInOut => {
+                let x = clamp01(t / self.duration);
+                if x < 0.5 {
+                    4.0 * x * x * x
+                } else {
+                    let inv = -2.0 * x + 2.0;
+                    1.0 - (inv * inv * inv) / 2.0
+                }
+            }
+            Curve::Spring { .. } => {
+                // Reuse the physics integrator: unit state 0 -> 1, stepped to t.
+                let spring = self.as_spring().unwrap_or_else(Spring::effects);
+                let mut state = SpringState::new(0.0, 1.0);
+                // Fixed fine step keeps the closed-clock sample accurate and
+                // stable (semi-implicit Euler); the remainder is taken last.
+                let step = SPRING_SAMPLE_DT;
+                let mut elapsed = 0.0;
+                while elapsed + step <= t {
+                    state.step(&spring, step);
+                    elapsed += step;
+                }
+                let rem = t - elapsed;
+                if rem > 0.0 {
+                    state.step(&spring, rem);
+                }
+                state.value
+            }
+        }
+    }
+}
+
+const MIN_DURATION: f32 = 1e-6;
+const TAU: f32 = 6.283_185_5;
+const SPRING_SAMPLE_DT: f32 = 1.0 / 1000.0;
+
+#[inline]
+fn clamp01(x: f32) -> f32 {
+    // `f32::clamp` is available in core (no_std-safe).
+    x.clamp(0.0, 1.0)
+}
+
 // --- Batch pool (std only) ---------------------------------------------------
 //
 // `SpringVec<N>` drives a handful of channels that belong to *one* widget.
@@ -732,6 +958,131 @@ mod tests {
         s.step(&spring, -0.5);
         assert_eq!(s.value, 0.0);
         assert_eq!(s.velocity, 0.0);
+    }
+
+    // --- Animation toolkit tests --------------------------------------------
+
+    /// Every timed easing must anchor the endpoints and never leave 0..=1.
+    #[test]
+    fn timed_curves_hit_endpoints_and_stay_bounded() {
+        let dur = 0.5;
+        for anim in [
+            Animation::linear(dur),
+            Animation::ease_in(dur),
+            Animation::ease_out(dur),
+            Animation::ease_in_out(dur),
+        ] {
+            // 0 at t == 0.
+            assert_eq!(anim.sample(0.0), 0.0, "{anim:?} not 0 at t=0");
+            assert_eq!(anim.sample(-1.0), 0.0, "{anim:?} not 0 at t<0");
+            // 1 at t >= duration.
+            assert_eq!(anim.sample(dur), 1.0, "{anim:?} not 1 at t=duration");
+            assert_eq!(anim.sample(dur * 2.0), 1.0, "{anim:?} not 1 past duration");
+            // Stay inside 0..=1 across the span.
+            for i in 0..=100 {
+                let t = dur * (i as f32) / 100.0;
+                let p = anim.sample(t);
+                assert!((0.0..=1.0).contains(&p), "{anim:?} out of range: {p} at {t}");
+            }
+        }
+    }
+
+    /// Every timed easing must be monotonically non-decreasing.
+    #[test]
+    fn timed_curves_are_monotonic() {
+        let dur = 0.5;
+        for anim in [
+            Animation::linear(dur),
+            Animation::ease_in(dur),
+            Animation::ease_out(dur),
+            Animation::ease_in_out(dur),
+        ] {
+            let mut prev = anim.sample(0.0);
+            for i in 1..=200 {
+                let t = dur * (i as f32) / 200.0;
+                let p = anim.sample(t);
+                assert!(
+                    p + 1e-6 >= prev,
+                    "{anim:?} not monotonic: {p} < {prev} at t={t}"
+                );
+                prev = p;
+            }
+        }
+    }
+
+    /// The cubic easings should differ from linear in the expected direction:
+    /// ease-in lags, ease-out leads at the midpoint.
+    #[test]
+    fn ease_in_out_shape_is_correct() {
+        let dur = 1.0;
+        let mid = 0.5 * dur;
+        let lin = Animation::linear(dur).sample(mid);
+        assert!((lin - 0.5).abs() < 1e-6);
+        // ease-in is below the line early (slow start).
+        assert!(Animation::ease_in(dur).sample(mid) < lin);
+        // ease-out is above the line early (fast start).
+        assert!(Animation::ease_out(dur).sample(mid) > lin);
+        // ease-in-out passes through 0.5 at the midpoint by symmetry.
+        assert!((Animation::ease_in_out(dur).sample(mid) - 0.5).abs() < 1e-6);
+    }
+
+    /// The SwiftUI `.spring()` preset must settle to ~1.0 within its horizon and
+    /// be exactly 1.0 once the clock passes `duration`.
+    #[test]
+    fn spring_preset_settles() {
+        let anim = Animation::spring();
+        assert_eq!(anim.sample(0.0), 0.0, "spring not 0 at t=0");
+        // Underway: moving toward the target, still within a sane band.
+        let early = anim.sample(0.1);
+        assert!(early > 0.0, "spring made no progress: {early}");
+        // By the settle horizon the curve is pinned to exactly 1.0.
+        assert_eq!(anim.sample(anim.duration), 1.0);
+        assert_eq!(anim.sample(anim.duration + 1.0), 1.0);
+        // Just before the horizon it should already be near the target.
+        let near = anim.sample(anim.duration - 1e-3);
+        assert!(
+            (near - 1.0).abs() < 0.1,
+            "spring not settled near horizon: {near}"
+        );
+    }
+
+    /// A critically/over-damped spring preset must not overshoot past 1.0 while
+    /// sampling (the no-overshoot guarantee carried over to the timed sampler).
+    #[test]
+    fn overdamped_spring_preset_does_not_overshoot() {
+        let anim = Animation::spring_with(0.4, 1.0, 1.0);
+        for i in 0..=1000 {
+            let t = anim.duration * (i as f32) / 1000.0;
+            // Below duration the raw physics value is exposed; it must not pass 1.
+            if t < anim.duration {
+                let p = anim.sample(t);
+                assert!(p <= 1.0 + 1e-4, "overdamped spring overshot: {p} at {t}");
+            }
+        }
+    }
+
+    /// The spring descriptor maps `response`/`dampingFraction` onto the physics
+    /// `Spring` consistently with `damping_ratio`.
+    #[test]
+    fn spring_descriptor_maps_to_physics() {
+        let anim = Animation::spring_with(0.5, 0.825, 1.0);
+        let spring = anim.as_spring().expect("spring curve yields a Spring");
+        assert!(
+            (spring.damping_ratio() - 0.825).abs() < 1e-3,
+            "damping ratio mismatch: {}",
+            spring.damping_ratio()
+        );
+        // Non-spring curves yield None.
+        assert!(Animation::linear(1.0).as_spring().is_none());
+    }
+
+    /// Zero/degenerate durations are floored, not panicking, and still report a
+    /// finished animation for any positive `t`.
+    #[test]
+    fn degenerate_duration_is_safe() {
+        let anim = Animation::linear(0.0);
+        assert_eq!(anim.sample(0.0), 0.0);
+        assert_eq!(anim.sample(1.0), 1.0);
     }
 
     #[cfg(feature = "std")]

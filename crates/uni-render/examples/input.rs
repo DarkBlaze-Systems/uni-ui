@@ -27,6 +27,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: logical_h,
         color: 0x0a0a0aff,
         corner_radius: 0.0,
+        rotation: 0.0,
     }];
 
     let card_w = 360.0_f32.min(logical_w - 40.0).max(80.0);
@@ -41,6 +42,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: card_h,
         color: 0xffffffff,
         corner_radius: 16.0,
+        rotation: 0.0,
     });
     scene.push(DrawCmd::Text {
         x: card_x + 24.0,

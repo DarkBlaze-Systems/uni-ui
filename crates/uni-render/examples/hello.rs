@@ -27,6 +27,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: logical_h,
         color: 0x0a0a0aff,
         corner_radius: 0.0,
+        rotation: 0.0,
     }];
 
     // A centered white rounded card.
@@ -42,6 +43,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: card_h,
         color: 0xffffffff,
         corner_radius: 16.0,
+        rotation: 0.0,
     });
 
     // Label inside the card (dark text on the white card).

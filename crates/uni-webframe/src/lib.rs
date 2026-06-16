@@ -151,6 +151,7 @@ impl WebBackend for StubWebBackend {
             h: rect.h,
             color: 0x10_14_18_ff,
             corner_radius: 8.0,
+            rotation: 0.0,
         });
 
         // The label, inset from the panel's top-left, proving which URL this
@@ -239,6 +240,7 @@ mod tests {
             h: 10.0,
             color: 0xffffffff,
             corner_radius: 0.0,
+            rotation: 0.0,
         });
         // Web commands occupy the earlier (behind) slots; chrome is last (on top).
         assert!(after_web >= 2);

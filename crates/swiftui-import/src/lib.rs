@@ -18,6 +18,11 @@
 //!   `.alert(title, isPresented:$x)`, `.popover(isPresented:$x)`,
 //!   `.overlay { … }` / `.background(View)` (overlay/underlay layers, distinct
 //!   from `.background(Color)` which stays a style prop)
+//! - Transform & animation modifiers: `.offset(x:,y:)` / `.offset(CGSize)` →
+//!   `offset_x`/`offset_y`; `.rotationEffect(.degrees(d))` → `rotation`;
+//!   `.scaleEffect(s)` → `scale`; `.animation(.curve(duration:), value:)` → an
+//!   `animation` descriptor prop (`"<curve>:<duration>"`); `.transition(.opacity
+//!   /.slide/.scale)` → `transition`; `withAnimation { … }` wrappers recognized
 //! - Line comments (`//`)
 
 use uni_ir::{Action, Document, Mutation, NodeId, Origin, Value};
@@ -775,6 +780,222 @@ fn background_is_view_layer(lex: &mut Lexer<'_>) -> bool {
     decided
 }
 
+/// `.offset(x:,y:)` / `.offset(CGSize(width:,height:))` / `.offset(10, 20)`.
+///
+/// Assumes `lex` is positioned just after the opening `(`. Reads to (but does
+/// not consume) the matching `)` — the generic close-paren drain in
+/// [`apply_modifiers`] swallows the trailing `)`. Sets `offset_x` / `offset_y`
+/// as float props on `view` for whichever axes were given.
+fn parse_offset_args(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+) -> Result<(), SwiftUIImportError> {
+    // `.offset(CGSize(width: 10, height: 20))` — unwrap the CGSize and read its
+    // `width`/`height` as x/y.
+    let saved_pos = lex.pos;
+    let saved_line = lex.line;
+    if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+        let ident = lex.read_ident();
+        lex.skip_ws();
+        if ident == "CGSize" && lex.peek() == Some(b'(') {
+            lex.advance(); // (
+            read_offset_kv(lex, view, "width", "height")?;
+            // consume the CGSize's own closing ) if present
+            lex.skip_ws();
+            if lex.peek() == Some(b')') {
+                lex.advance();
+            }
+            return Ok(());
+        }
+        // Not a CGSize — rewind and fall through to the labeled/positional path.
+        lex.pos = saved_pos;
+        lex.line = saved_line;
+    }
+    // Labeled `x:`/`y:` or positional `10, 20`.
+    read_offset_kv(lex, view, "x", "y")?;
+    Ok(())
+}
+
+/// Read a comma-separated list of `<x_key>:`/`<y_key>:` labeled values (or two
+/// positional floats, mapped to x then y) into `offset_x`/`offset_y` props.
+/// Stops at — and does not consume — the closing `)`.
+fn read_offset_kv(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+    x_key: &str,
+    y_key: &str,
+) -> Result<(), SwiftUIImportError> {
+    let mut positional = 0usize;
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') | None => break,
+            Some(c) if c.is_ascii_alphabetic() => {
+                let key = lex.read_ident();
+                lex.skip_ws();
+                if lex.peek() == Some(b':') {
+                    lex.advance();
+                }
+                lex.skip_ws();
+                let v = parse_value(lex)?;
+                if let SwiftValue::Float(f) = v {
+                    if key == x_key {
+                        view.props.push(("offset_x".into(), SwiftValue::Float(f)));
+                    } else if key == y_key {
+                        view.props.push(("offset_y".into(), SwiftValue::Float(f)));
+                    }
+                }
+            }
+            _ => {
+                // A positional float: first → x, second → y.
+                let v = parse_value(lex)?;
+                if let SwiftValue::Float(f) = v {
+                    let key = if positional == 0 { "offset_x" } else { "offset_y" };
+                    view.props.push((key.into(), SwiftValue::Float(f)));
+                }
+                positional += 1;
+            }
+        }
+        lex.skip_ws();
+        if lex.peek() == Some(b',') {
+            lex.advance();
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a rotation angle starting just after the modifier's `(`. Handles
+/// `.degrees(d)`, `.radians(r)`, and `Angle(degrees: d)` / `Angle(radians: r)`.
+/// Returns the angle in degrees. Reads to (but does not consume) the outer `)`.
+fn parse_angle_degrees(lex: &mut Lexer<'_>) -> Result<Option<f64>, SwiftUIImportError> {
+    lex.skip_ws();
+    // `.degrees(...)` / `.radians(...)`
+    if lex.peek() == Some(b'.') {
+        lex.advance(); // .
+        let unit = lex.read_ident();
+        lex.skip_ws();
+        if lex.peek() == Some(b'(') {
+            lex.advance(); // (
+            lex.skip_ws();
+            let n = lex.read_number();
+            lex.skip_ws();
+            if lex.peek() == Some(b')') {
+                lex.advance();
+            }
+            return Ok(Some(if unit == "radians" {
+                n.to_degrees()
+            } else {
+                n
+            }));
+        }
+        return Ok(None);
+    }
+    // `Angle(degrees: d)` / `Angle(radians: r)`
+    if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+        let ident = lex.read_ident();
+        lex.skip_ws();
+        if ident == "Angle" && lex.peek() == Some(b'(') {
+            lex.advance(); // (
+            lex.skip_ws();
+            let key = lex.read_ident();
+            lex.skip_ws();
+            if lex.peek() == Some(b':') {
+                lex.advance();
+            }
+            lex.skip_ws();
+            let n = lex.read_number();
+            lex.skip_ws();
+            if lex.peek() == Some(b')') {
+                lex.advance();
+            }
+            return Ok(Some(if key == "radians" {
+                n.to_degrees()
+            } else {
+                n
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Parse an `.animation(curve, value: x)` argument list into a `"<curve>:<dur>"`
+/// descriptor string. The curve is the leading `.easeInOut(duration: 0.3)` /
+/// `.linear` / `.spring()` token; `value:` (the trigger) is ignored. Reads to
+/// (but does not consume) the outer `)`.
+fn parse_animation_descriptor(lex: &mut Lexer<'_>) -> Result<String, SwiftUIImportError> {
+    let mut curve = String::from("default");
+    let mut duration: Option<f64> = None;
+    lex.skip_ws();
+    if lex.peek() == Some(b'.') {
+        lex.advance(); // .
+        curve = lex.read_ident();
+        lex.skip_ws();
+        // Optional `(duration: 0.3)` / `(...)` arg list on the curve.
+        if lex.peek() == Some(b'(') {
+            lex.advance(); // (
+            loop {
+                lex.skip_ws();
+                match lex.peek() {
+                    Some(b')') | None => {
+                        if lex.peek() == Some(b')') {
+                            lex.advance();
+                        }
+                        break;
+                    }
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        let key = lex.read_ident();
+                        lex.skip_ws();
+                        if lex.peek() == Some(b':') {
+                            lex.advance();
+                        }
+                        lex.skip_ws();
+                        let v = parse_value(lex)?;
+                        if key == "duration" {
+                            if let SwiftValue::Float(f) = v {
+                                duration = Some(f);
+                            }
+                        }
+                    }
+                    _ => {
+                        lex.advance();
+                    }
+                }
+                lex.skip_ws();
+                if lex.peek() == Some(b',') {
+                    lex.advance();
+                }
+            }
+        }
+    }
+    Ok(match duration {
+        Some(d) => format!("{curve}:{d}"),
+        None => curve,
+    })
+}
+
+/// Parse a `.transition(...)` argument into its named transition. Handles
+/// `.opacity` / `.slide` / `.scale` (and any other dotted name). Reads to (but
+/// does not consume) the outer `)`.
+fn parse_transition_name(lex: &mut Lexer<'_>) -> Result<String, SwiftUIImportError> {
+    lex.skip_ws();
+    if lex.peek() == Some(b'.') {
+        lex.advance(); // .
+        let name = lex.read_ident();
+        return Ok(name);
+    }
+    // A non-dotted form (`.transition(AnyTransition.scale)`) — take the trailing
+    // dotted member if present, else the bare identifier.
+    let id = lex.read_ident();
+    lex.skip_ws();
+    if lex.peek() == Some(b'.') {
+        lex.advance();
+        return Ok(lex.read_ident());
+    }
+    Ok(id)
+}
+
 /// After parsing a view's block/args, consume any `.modifier(...)` chains.
 fn apply_modifiers(
     lex: &mut Lexer<'_>,
@@ -955,6 +1176,45 @@ fn apply_modifiers(
                 let v = parse_value(lex)?;
                 view.props.push(("opacity".into(), v));
             }
+            "offset" => {
+                // `.offset(x: 10, y: 20)` — labeled args — or `.offset(CGSize(width:
+                // 10, height: 20))`, or the positional `.offset(10, 20)` shorthand.
+                // All three resolve to `offset_x` / `offset_y` px props.
+                parse_offset_args(lex, &mut view)?;
+            }
+            "rotationEffect" => {
+                // `.rotationEffect(.degrees(d))` / `.rotationEffect(.radians(r))` /
+                // `.rotationEffect(Angle(degrees: d))`. Surface a `rotation` prop in
+                // degrees (radians are converted).
+                if let Some(deg) = parse_angle_degrees(lex)? {
+                    view.props
+                        .push(("rotation".into(), SwiftValue::Float(deg)));
+                }
+            }
+            "scaleEffect" => {
+                // `.scaleEffect(1.5)` — a uniform scale factor → `scale` prop.
+                let v = parse_value(lex)?;
+                if let SwiftValue::Float(s) = v {
+                    view.props.push(("scale".into(), SwiftValue::Float(s)));
+                }
+            }
+            "animation" => {
+                // `.animation(.easeInOut(duration: 0.3), value: x)` — lower the
+                // curve + duration into a single `animation` descriptor prop of the
+                // shape `"<curve>:<duration>"` (e.g. `"easeInOut:0.3"`). The
+                // `value:` trigger has no IR home and is ignored.
+                let desc = parse_animation_descriptor(lex)?;
+                view.props
+                    .push(("animation".into(), SwiftValue::Str(desc)));
+            }
+            "transition" => {
+                // `.transition(.opacity)` / `.transition(.slide)` /
+                // `.transition(.scale)` — carry the named transition through as a
+                // `transition` prop.
+                let name = parse_transition_name(lex)?;
+                view.props
+                    .push(("transition".into(), SwiftValue::Str(name)));
+            }
             "bold" => {
                 // `.bold()` — empty parens, sets a weight prop.
                 view.props
@@ -1004,6 +1264,37 @@ fn apply_modifiers(
     Ok(view)
 }
 
+/// Peek the identifier at the current position without consuming it.
+fn peek_ident(lex: &Lexer<'_>) -> String {
+    let mut i = lex.pos;
+    let mut s = String::new();
+    while let Some(&c) = lex.src.get(i) {
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            s.push(c as char);
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// Consume a `withAnimation` tail: an optional `(.curve…)` animation argument
+/// followed by its `{ … }` mutation closure. Both are skipped — `withAnimation`
+/// carries no view content, only imperative state changes.
+fn skip_with_animation_tail(lex: &mut Lexer<'_>) {
+    lex.skip_ws();
+    if lex.peek() == Some(b'(') {
+        lex.advance();
+        lex.skip_balanced(b'(', b')');
+        lex.skip_ws();
+    }
+    if lex.peek() == Some(b'{') {
+        lex.advance();
+        lex.skip_balanced(b'{', b'}');
+    }
+}
+
 struct ParsedFile {
     views: Vec<SwiftView>,
     state_vars: Vec<String>,
@@ -1045,6 +1336,15 @@ fn parse_file(lex: &mut Lexer<'_>) -> Result<ParsedFile, SwiftUIImportError> {
                 let kind = lex.read_ident();
                 let view = parse_view_body(lex, kind)?;
                 views.push(view);
+            }
+            // `withAnimation(.easeInOut) { state.toggle() }` — a SwiftUI animation
+            // wrapper around imperative state mutations. We recognize it so the
+            // scanner does not mis-read its lowercase body as stray tokens; the
+            // animation argument and the mutation closure have no view content, so
+            // both are consumed.
+            Some(c) if c.is_ascii_lowercase() && peek_ident(lex) == "withAnimation" => {
+                lex.read_ident();
+                skip_with_animation_tail(lex);
             }
             _ => {
                 lex.advance();
@@ -1160,7 +1460,14 @@ fn lower_view(
                 // If key is size/width/height/padding/corner_radius, use Px
                 if matches!(
                     key,
-                    "size" | "width" | "height" | "padding" | "corner_radius" | "opacity"
+                    "size"
+                        | "width"
+                        | "height"
+                        | "padding"
+                        | "corner_radius"
+                        | "opacity"
+                        | "offset_x"
+                        | "offset_y"
                 ) {
                     Value::Px(*f as f32)
                 } else {
@@ -1918,5 +2225,169 @@ mod tests {
             .unsupported
             .iter()
             .any(|u| u.text == "modifier .presentationDetents"));
+    }
+
+    // ── T1: transform & animation modifiers ──────────────────────────────────
+
+    #[test]
+    fn parse_offset_labeled_x_y() {
+        let doc = parse(r#"Text("Hi").offset(x: 10, y: 20)"#).unwrap();
+        let root = doc.root().unwrap();
+        let props = &doc.get(root).unwrap().props;
+        assert_eq!(props.get("offset_x"), Some(&Value::Px(10.0)));
+        assert_eq!(props.get("offset_y"), Some(&Value::Px(20.0)));
+    }
+
+    #[test]
+    fn parse_offset_only_y() {
+        // SwiftUI allows omitting an axis; only the given one is set.
+        let doc = parse(r#"Text("Hi").offset(y: 8)"#).unwrap();
+        let props = &doc.get(doc.root().unwrap()).unwrap().props;
+        assert_eq!(props.get("offset_y"), Some(&Value::Px(8.0)));
+        assert!(!props.contains_key("offset_x"));
+    }
+
+    #[test]
+    fn parse_offset_cgsize() {
+        // `.offset(CGSize(width: 5, height: 15))` → offset_x / offset_y.
+        let doc = parse(r#"Text("Hi").offset(CGSize(width: 5, height: 15))"#).unwrap();
+        let props = &doc.get(doc.root().unwrap()).unwrap().props;
+        assert_eq!(props.get("offset_x"), Some(&Value::Px(5.0)));
+        assert_eq!(props.get("offset_y"), Some(&Value::Px(15.0)));
+    }
+
+    #[test]
+    fn parse_offset_positional() {
+        // Positional shorthand `.offset(3, 4)` maps to x then y.
+        let doc = parse(r#"Text("Hi").offset(3, 4)"#).unwrap();
+        let props = &doc.get(doc.root().unwrap()).unwrap().props;
+        assert_eq!(props.get("offset_x"), Some(&Value::Px(3.0)));
+        assert_eq!(props.get("offset_y"), Some(&Value::Px(4.0)));
+    }
+
+    #[test]
+    fn parse_rotation_effect_degrees() {
+        let v = root_prop(r#"Text("Hi").rotationEffect(.degrees(45))"#, "rotation");
+        assert_eq!(v, Some(Value::Float(45.0)));
+    }
+
+    #[test]
+    fn parse_rotation_effect_radians_converts() {
+        // `.radians(π)` ≈ 180°.
+        let doc = parse(r#"Text("Hi").rotationEffect(.radians(3.14159265))"#).unwrap();
+        let v = doc.get(doc.root().unwrap()).unwrap().props.get("rotation").cloned();
+        match v {
+            Some(Value::Float(deg)) => assert!((deg - 180.0).abs() < 0.01, "got {deg}"),
+            other => panic!("expected Float ~180, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rotation_effect_angle_form() {
+        let v = root_prop(r#"Text("Hi").rotationEffect(Angle(degrees: 90))"#, "rotation");
+        assert_eq!(v, Some(Value::Float(90.0)));
+    }
+
+    #[test]
+    fn parse_scale_effect_sets_scale() {
+        let v = root_prop(r#"Text("Hi").scaleEffect(1.5)"#, "scale");
+        assert_eq!(v, Some(Value::Float(1.5)));
+    }
+
+    #[test]
+    fn parse_animation_curve_and_duration() {
+        // `.animation(.easeInOut(duration: 0.3), value: x)` → "easeInOut:0.3".
+        let v = root_prop(
+            r#"Text("Hi").animation(.easeInOut(duration: 0.3), value: count)"#,
+            "animation",
+        );
+        assert_eq!(v, Some(Value::Text("easeInOut:0.3".into())));
+    }
+
+    #[test]
+    fn parse_animation_curve_no_duration() {
+        // `.animation(.linear, value: x)` → just the curve name.
+        let v = root_prop(r#"Text("Hi").animation(.linear, value: x)"#, "animation");
+        assert_eq!(v, Some(Value::Text("linear".into())));
+    }
+
+    #[test]
+    fn parse_animation_spring_with_parens() {
+        // `.spring()` curve with no duration arg still lowers to the curve name.
+        let v = root_prop(r#"Text("Hi").animation(.spring(), value: x)"#, "animation");
+        assert_eq!(v, Some(Value::Text("spring".into())));
+    }
+
+    #[test]
+    fn parse_transition_opacity() {
+        let v = root_prop(r#"Text("Hi").transition(.opacity)"#, "transition");
+        assert_eq!(v, Some(Value::Text("opacity".into())));
+    }
+
+    #[test]
+    fn parse_transition_slide() {
+        let v = root_prop(r#"Text("Hi").transition(.slide)"#, "transition");
+        assert_eq!(v, Some(Value::Text("slide".into())));
+    }
+
+    #[test]
+    fn parse_transition_scale() {
+        let v = root_prop(r#"Text("Hi").transition(.scale)"#, "transition");
+        assert_eq!(v, Some(Value::Text("scale".into())));
+    }
+
+    #[test]
+    fn animation_and_transition_no_longer_reported_unsupported() {
+        // Regression: these were previously only recorded as Unsupported. They
+        // are now lowered, so the report must be clean.
+        let report = parse_with_report(
+            r#"Text("Hi").animation(.easeInOut(duration: 0.2), value: x).transition(.opacity)"#,
+        )
+        .unwrap();
+        assert!(
+            report.unsupported.is_empty(),
+            "animation/transition should be lowered, not reported: {:?}",
+            report.unsupported
+        );
+        let node = report.document.get(report.document.root().unwrap()).unwrap();
+        assert_eq!(node.props.get("animation"), Some(&Value::Text("easeInOut:0.2".into())));
+        assert_eq!(node.props.get("transition"), Some(&Value::Text("opacity".into())));
+    }
+
+    #[test]
+    fn with_animation_wrapper_is_recognized() {
+        // `withAnimation { … }` wraps imperative mutations — it is recognized and
+        // skipped, and the view declared alongside it still lowers.
+        let src = r#"
+            withAnimation(.easeInOut) { isExpanded.toggle() }
+            VStack { Text("hi") }
+        "#;
+        let doc = parse(src).unwrap();
+        let root = doc.root().unwrap();
+        assert_eq!(doc.get(root).unwrap().kind, "Column");
+    }
+
+    #[test]
+    fn with_animation_no_arg_is_recognized() {
+        let src = r#"
+            withAnimation { count += 1 }
+            Text("done")
+        "#;
+        let doc = parse(src).unwrap();
+        let root = doc.root().unwrap();
+        assert_eq!(
+            doc.get(root).unwrap().props.get("content"),
+            Some(&Value::Text("done".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_transform_like_modifier_still_reported() {
+        // A genuinely-unknown transform stays surfaced (no silent eating).
+        let report = parse_with_report(r#"Text("Hi").rotation3DEffect(.degrees(10))"#).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "modifier .rotation3DEffect"));
     }
 }

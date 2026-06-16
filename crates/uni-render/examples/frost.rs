@@ -32,6 +32,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: logical_h,
         color: 0x101018ff,
         corner_radius: 0.0,
+        rotation: 0.0,
     });
 
     // Colorful content behind the glass: a grid of vivid overlapping blobs.
@@ -60,6 +61,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
                 h: blob,
                 color: palette[i % palette.len()],
                 corner_radius: blob * 0.35,
+                rotation: 0.0,
             });
             i += 1;
         }
@@ -73,6 +75,7 @@ fn build_scene(logical_w: f32, logical_h: f32) -> Scene {
         h: 24.0,
         color: 0xffffffff,
         corner_radius: 12.0,
+        rotation: 0.0,
     });
 
     // The frosted-glass panel, centered, floating over the colorful content.

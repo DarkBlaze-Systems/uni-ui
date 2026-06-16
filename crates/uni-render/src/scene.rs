@@ -20,6 +20,12 @@ pub enum DrawCmd {
         /// Corner radius in logical pixels. `0.0` == sharp corners. Clamped to
         /// half the shorter side by the backend.
         corner_radius: f32,
+        /// Clockwise rotation in **degrees** about the rect's own center
+        /// (`(x + w/2, y + h/2)`). `0.0` == axis-aligned (the identity); this
+        /// is the default for every rect emitted by the layout/paint pass that
+        /// carries no `rotationEffect`, so existing scenes are unchanged. A
+        /// backend that cannot rotate may treat the rect as axis-aligned.
+        rotation: f32,
     },
     /// A **frosted-glass panel**: a rounded rectangle whose interior shows the
     /// scene drawn *before* it, blurred (a real backdrop blur), with a
@@ -56,6 +62,25 @@ pub enum DrawCmd {
         /// Text color, packed `0xRRGGBBAA`.
         color: u32,
     },
+}
+
+impl DrawCmd {
+    /// An axis-aligned [`DrawCmd::FilledRect`] (`rotation == 0.0`).
+    ///
+    /// Convenience for the common, un-rotated case so callers don't have to
+    /// spell out `rotation: 0.0`. Use the struct literal directly when you do
+    /// want a `rotationEffect`.
+    pub fn filled_rect(x: f32, y: f32, w: f32, h: f32, color: u32, corner_radius: f32) -> Self {
+        DrawCmd::FilledRect {
+            x,
+            y,
+            w,
+            h,
+            color,
+            corner_radius,
+            rotation: 0.0,
+        }
+    }
 }
 
 /// An ordered list of draw commands. Painted front-to-back in `Vec` order.

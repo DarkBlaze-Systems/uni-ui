@@ -77,7 +77,7 @@ use uni_reactor::Store;
 use uni_render::{
     translate_window_event, InputEvent, PointerButton, RenderError, Renderer, Scene, WgpuRenderer,
 };
-use uni_spring::{Spring, SpringState};
+use uni_spring::{Animation, Curve, Spring, SpringState};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::Window;
@@ -104,6 +104,135 @@ struct AnimationEntry {
     spring: Spring,
     state: SpringState,
 }
+
+// ============================================================================
+// Implicit animation — descriptor-driven, time-curve interpolation
+// ============================================================================
+//
+// The spring path above ([`Runtime::animate`] / [`Runtime::tick_animations`]) is
+// the *explicit* surface: a caller hands a from/target and a `Spring`. The
+// surface below is the *implicit* one: a node carries an `animation` descriptor
+// (a `Value::Text` prop, e.g. `"300ms ease-in-out"`), and whenever a *watched*
+// numeric prop on that node changes, the runtime automatically enqueues an
+// animation that interpolates the prop from its old value to its new value
+// across the descriptor's curve and duration. Transitions ride the same
+// machinery: a node gaining/losing `presented` (or being inserted) animates its
+// `opacity` 0<->1. All writes go back into the doc as audited `Origin::System`
+// `SetProp`s — exactly the accountability discipline the rest of the runtime
+// keeps.
+
+// The animation *descriptor* type the implicit path samples is
+// [`uni_spring::Animation`] — the SwiftUI-style `Curve` + `duration` pairing,
+// whose [`uni_spring::Animation::sample`] maps elapsed time onto a `0.0..=1.0`
+// progress fraction (and whose `Spring` curve reuses the same physics
+// integrator the explicit path does — the "use uni-spring" hook). The runtime
+// only adds the *parser* that turns a node's `animation` prop string into one of
+// those descriptors, and the orchestration that composes the sampled fraction
+// with an old→new value pair.
+
+const MIN_DURATION: f32 = 1e-3;
+
+/// The default implicit animation: `300ms`, ease-in-out.
+fn default_animation() -> Animation {
+    Animation::ease_in_out(0.3)
+}
+
+/// Parse an `animation` descriptor string into a [`uni_spring::Animation`].
+///
+/// Examples: `"300ms ease-in-out"`, `"0.5s spring"`, `"200ms linear"`,
+/// `"150ms ease-out"`. Tokens are order-independent and case-insensitive;
+/// anything unrecognized falls back to the default curve/duration. Duration
+/// accepts `<n>ms`, `<n>s`, or a bare number (seconds).
+fn parse_animation(desc: &str) -> Animation {
+    let mut curve = Curve::EaseInOut;
+    let mut duration = 0.3f32;
+    for tok in desc.split_whitespace() {
+        let lower = tok.to_ascii_lowercase();
+        match lower.as_str() {
+            "linear" => curve = Curve::Linear,
+            "ease-in" | "easein" => curve = Curve::EaseIn,
+            "ease-out" | "easeout" => curve = Curve::EaseOut,
+            "ease-in-out" | "ease" | "easeinout" => curve = Curve::EaseInOut,
+            // A spring curve, parameterised the SwiftUI way (response/damping).
+            "spring" => {
+                return {
+                    // `spring_with` carries its own settle `duration`; keep any
+                    // explicit duration token already seen, else use a snappy
+                    // default period.
+                    let resp = 0.3;
+                    Animation::spring_with(resp, 0.825, duration.max(MIN_DURATION))
+                };
+            }
+            _ => {
+                if let Some(d) = parse_duration(&lower) {
+                    duration = if d > MIN_DURATION { d } else { MIN_DURATION };
+                }
+            }
+        }
+    }
+    Animation::new(curve, duration.max(MIN_DURATION))
+}
+
+/// A single active *implicit* animation: interpolates one numeric prop on one
+/// node from `from` to `to` along an [`uni_spring::Animation`] curve over
+/// wall-clock time.
+struct ImplicitEntry {
+    id: NodeId,
+    prop: String,
+    from: f32,
+    to: f32,
+    anim: Animation,
+    elapsed: f32,
+}
+
+impl ImplicitEntry {
+    /// The current interpolated value at this entry's elapsed time.
+    ///
+    /// Composes [`uni_spring::Animation::sample`]'s `0..=1` progress with the
+    /// `from`→`to` span. Once finished the value snaps exactly onto `to`.
+    fn value(&self) -> f32 {
+        if self.is_done() {
+            return self.to;
+        }
+        let f = self.anim.sample(self.elapsed);
+        self.from + (self.to - self.from) * f
+    }
+
+    /// Whether the animation has run out its descriptor's duration. (uni-spring's
+    /// `sample` normalizes every curve — spring included — to reach `1.0` at
+    /// `duration`, so a single time comparison settles them all.)
+    fn is_done(&self) -> bool {
+        self.elapsed >= self.anim.duration
+    }
+}
+
+/// Parse a duration token: `<n>ms`, `<n>s`, or a bare number (seconds).
+fn parse_duration(tok: &str) -> Option<f32> {
+    if let Some(ms) = tok.strip_suffix("ms") {
+        ms.parse::<f32>().ok().map(|v| v / 1000.0)
+    } else if let Some(s) = tok.strip_suffix('s') {
+        s.parse::<f32>().ok()
+    } else {
+        tok.parse::<f32>().ok()
+    }
+}
+
+/// Pull a numeric value out of a [`uni_ir::Value`] for animation purposes.
+/// `Px`, `Float`, `Int` and `Bool` all map to an `f32`; anything else is `None`.
+fn value_as_f32(v: &uni_ir::Value) -> Option<f32> {
+    match v {
+        uni_ir::Value::Px(x) => Some(*x),
+        uni_ir::Value::Float(x) => Some(*x as f32),
+        uni_ir::Value::Int(x) => Some(*x as f32),
+        uni_ir::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// The numeric props the implicit-animation watcher tracks for change. A change
+/// on any of these (on a node carrying an `animation` descriptor) enqueues an
+/// interpolation from the old value to the new one.
+const WATCHED_PROPS: &[&str] = &["width", "height", "opacity", "x", "y", "corner_radius"];
 
 /// The interactive runtime: the live document, its layout/viewport, the handler
 /// registry, and (optionally) a window + GPU renderer.
@@ -135,6 +264,20 @@ pub struct Runtime {
     env: Env,
     /// Active spring animations: each entry drives one prop on one node per-frame.
     animations: Vec<AnimationEntry>,
+    /// Active *implicit* (descriptor-driven, time-curve) animations. Populated by
+    /// [`Runtime::tick`] when a watched numeric prop changes on a node carrying an
+    /// `animation` descriptor, or when a `presented`/insertion transition fires.
+    implicit: Vec<ImplicitEntry>,
+    /// Last-seen value of every watched numeric prop on every animated node,
+    /// keyed by `(node, prop)`. [`Runtime::tick`] diffs the live doc against this
+    /// to detect the changes that start an implicit animation. The *displayed*
+    /// value (mid-flight interpolation) is what's stored, so a change redirects
+    /// from where the prop currently is, not from the stale target.
+    prop_snapshot: HashMap<(NodeId, String), f32>,
+    /// The set of node ids that existed (and were `presented`) on the previous
+    /// tick, so insertions and presented-gain/loss transitions can be detected.
+    presence_snapshot: BTreeSet<NodeId>,
+    presented_snapshot: BTreeSet<NodeId>,
     /// Currently focused node (Tab/arrow-key navigation target).
     focused: Option<NodeId>,
     /// **D3 — incremental-layout foundation.** The set of node ids touched by
@@ -175,6 +318,10 @@ impl Runtime {
             renderer: None,
             env,
             animations: Vec::new(),
+            implicit: Vec::new(),
+            prop_snapshot: HashMap::new(),
+            presence_snapshot: BTreeSet::new(),
+            presented_snapshot: BTreeSet::new(),
             focused: None,
             dirty: BTreeSet::new(),
             audit_cursor: 0,
@@ -185,6 +332,9 @@ impl Runtime {
         // the very first frame reflects the store (not just literal defaults).
         rt.sync_bindings();
         rt.relayout();
+        // Seed the implicit-animation watcher so the *first* real change (not the
+        // initial prop values) is what triggers an animation.
+        rt.seed_animation_snapshots();
         rt
     }
 
@@ -249,6 +399,20 @@ impl Runtime {
     /// `Px` prop values to the document (Origin::System), remove settled ones,
     /// and re-layout if anything moved. Returns `true` when animations remain.
     pub fn tick_animations(&mut self, dt: f32) -> bool {
+        if self.animations.is_empty() {
+            return false;
+        }
+        let running = self.step_springs(dt);
+        self.relayout();
+        running
+    }
+
+    /// Step every active spring animation by `dt`, write the resulting `Px` prop
+    /// values into the doc (audited `Origin::System`), and remove settled ones —
+    /// **without** relaying out. The relayout is the caller's, so several
+    /// animation paths can share a single recompute per frame (see
+    /// [`Runtime::tick`]). Returns `true` while springs remain.
+    fn step_springs(&mut self, dt: f32) -> bool {
         const EPS: f32 = 0.5; // pixel-level settle threshold
         if self.animations.is_empty() {
             return false;
@@ -269,8 +433,238 @@ impl Runtime {
                 },
             );
         }
-        self.relayout();
         !self.animations.is_empty()
+    }
+
+    // -- implicit, descriptor-driven animation --------------------------------
+
+    /// Read a node's `animation` descriptor prop, if it carries one.
+    ///
+    /// The descriptor is a `Value::Text` like `"300ms ease-in-out"`. A node with
+    /// no `animation` prop is *not* implicitly animated — its prop changes apply
+    /// instantly, as before.
+    fn node_animation(&self, id: NodeId) -> Option<Animation> {
+        let node = self.doc.get(id)?;
+        match node.props.get("animation") {
+            Some(uni_ir::Value::Text(desc)) => Some(parse_animation(desc)),
+            // A bare `animation: true` (or any present non-text value) opts in
+            // with the default curve/duration.
+            Some(_) => Some(default_animation()),
+            None => None,
+        }
+    }
+
+    /// Snapshot the current watched-prop values + presence/presented sets without
+    /// enqueueing anything. Used at construction so only *subsequent* changes
+    /// animate.
+    fn seed_animation_snapshots(&mut self) {
+        let mut snap: HashMap<(NodeId, String), f32> = HashMap::new();
+        let mut present: BTreeSet<NodeId> = BTreeSet::new();
+        let mut presented: BTreeSet<NodeId> = BTreeSet::new();
+        if let Some(root) = self.doc.root() {
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                let Some(node) = self.doc.get(id) else {
+                    continue;
+                };
+                present.insert(id);
+                if Self::node_is_presented(node) {
+                    presented.insert(id);
+                }
+                for key in WATCHED_PROPS {
+                    if let Some(v) = node.props.get(*key).and_then(value_as_f32) {
+                        snap.insert((id, (*key).to_string()), v);
+                    }
+                }
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        self.prop_snapshot = snap;
+        self.presence_snapshot = present;
+        self.presented_snapshot = presented;
+    }
+
+    /// Whether a node is currently "presented" — its `presented` prop is a truthy
+    /// bool/number. The presentation flag drives opacity transitions.
+    fn node_is_presented(node: &uni_ir::Node) -> bool {
+        match node.props.get("presented") {
+            Some(uni_ir::Value::Bool(b)) => *b,
+            Some(v) => value_as_f32(v).map(|x| x != 0.0).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// **Detect changes and enqueue implicit animations.**
+    ///
+    /// Walk the live doc and, for every node carrying an `animation` descriptor,
+    /// compare each watched numeric prop against the last-seen snapshot. A change
+    /// enqueues (or redirects) an [`ImplicitEntry`] interpolating from the
+    /// currently-*displayed* value to the new value over the descriptor's curve.
+    ///
+    /// Transitions: a node that newly *gains* `presented` (or is freshly
+    /// inserted while presented) animates `opacity` 0→1; a node that *loses*
+    /// `presented` animates `opacity` 1→0. These ride the same `ImplicitEntry`
+    /// queue, using the node's descriptor (or the default animation).
+    fn detect_implicit_animations(&mut self) {
+        let mut to_enqueue: Vec<ImplicitEntry> = Vec::new();
+        let mut next_present: BTreeSet<NodeId> = BTreeSet::new();
+        let mut next_presented: BTreeSet<NodeId> = BTreeSet::new();
+
+        if let Some(root) = self.doc.root() {
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                let Some(node) = self.doc.get(id) else {
+                    continue;
+                };
+                next_present.insert(id);
+                let presented_now = Self::node_is_presented(node);
+                if presented_now {
+                    next_presented.insert(id);
+                }
+                let anim = self.node_animation(id);
+
+                // --- watched numeric prop changes -------------------------
+                if let Some(anim) = anim {
+                    for key in WATCHED_PROPS {
+                        let Some(new_v) = node.props.get(*key).and_then(value_as_f32) else {
+                            continue;
+                        };
+                        let skey = (id, (*key).to_string());
+                        match self.prop_snapshot.get(&skey).copied() {
+                            Some(old_v) if (old_v - new_v).abs() > f32::EPSILON => {
+                                // Redirect from where the prop is *currently
+                                // displayed* (mid-flight), not the stale old value.
+                                let from = self
+                                    .implicit
+                                    .iter()
+                                    .find(|e| e.id == id && e.prop == *key)
+                                    .map(ImplicitEntry::value)
+                                    .unwrap_or(old_v);
+                                to_enqueue.push(ImplicitEntry {
+                                    id,
+                                    prop: (*key).to_string(),
+                                    from,
+                                    to: new_v,
+                                    anim,
+                                    elapsed: 0.0,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // --- presented / insertion opacity transitions ------------
+                let was_present = self.presence_snapshot.contains(&id);
+                let was_presented = self.presented_snapshot.contains(&id);
+                let trans = anim.unwrap_or_else(default_animation);
+                if presented_now && (!was_presented || !was_present) {
+                    // Gained presented (or inserted while presented): fade in.
+                    to_enqueue.push(ImplicitEntry {
+                        id,
+                        prop: "opacity".to_string(),
+                        from: 0.0,
+                        to: 1.0,
+                        anim: trans,
+                        elapsed: 0.0,
+                    });
+                } else if !presented_now && was_presented {
+                    // Lost presented: fade out.
+                    to_enqueue.push(ImplicitEntry {
+                        id,
+                        prop: "opacity".to_string(),
+                        from: 1.0,
+                        to: 0.0,
+                        anim: trans,
+                        elapsed: 0.0,
+                    });
+                }
+
+                stack.extend(node.children.iter().copied());
+            }
+        }
+
+        // Apply: a new entry for the same (id, prop) replaces any in-flight one.
+        for entry in to_enqueue {
+            // Record the new *target* in the snapshot so we don't re-detect it.
+            self.prop_snapshot
+                .insert((entry.id, entry.prop.clone()), entry.to);
+            self.implicit
+                .retain(|e| !(e.id == entry.id && e.prop == entry.prop));
+            self.implicit.push(entry);
+        }
+        self.presence_snapshot = next_present;
+        self.presented_snapshot = next_presented;
+    }
+
+    /// **Advance implicit animations by `dt`, write interpolated props back.**
+    ///
+    /// For each active [`ImplicitEntry`]: advance its clock, compute the
+    /// interpolated value, and apply it to the doc as an audited `Origin::System`
+    /// `SetProp` (a `Value::Px`). Settled entries (clock past the descriptor's
+    /// duration) snap to the target and are removed. Returns `true` while any
+    /// implicit animation is still running.
+    ///
+    /// The displayed value is also written back into the snapshot so a *further*
+    /// change mid-flight redirects from the current on-screen value.
+    fn advance_implicit(&mut self, dt: f32) -> bool {
+        if self.implicit.is_empty() {
+            return false;
+        }
+        let mut updates: Vec<(NodeId, String, f32)> = Vec::new();
+        for entry in &mut self.implicit {
+            entry.elapsed += dt;
+            let v = entry.value();
+            updates.push((entry.id, entry.prop.clone(), v));
+        }
+        // Drop the finished ones (they've reached `to`).
+        self.implicit.retain(|e| !e.is_done());
+
+        for (id, prop, value) in updates {
+            // Keep the snapshot in step with what's displayed so an interrupting
+            // change redirects from here, and a settle records the final target.
+            self.prop_snapshot.insert((id, prop.clone()), value);
+            let _ = self.doc.apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: prop,
+                    value: uni_ir::Value::Px(value),
+                },
+            );
+        }
+        !self.implicit.is_empty()
+    }
+
+    /// **The implicit-animation frame.** Detect prop/presentation changes and
+    /// enqueue animations for them, advance every active animation (spring +
+    /// implicit) by `dt` seconds, write the interpolated props back into the doc
+    /// (audited `Origin::System`), and re-layout. Returns `true` while any
+    /// animation is still running.
+    ///
+    /// This is the single entry a frame loop calls. A prop change on an
+    /// `animation`-bearing node does **not** snap instantly: it interpolates
+    /// across successive `tick` calls and reaches the target when the curve
+    /// completes, at which point the entry settles and is removed.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        self.detect_implicit_animations();
+        // Advance the explicit spring path (no-op + no relayout if empty), then
+        // the implicit path. Both write `Origin::System` SetProps into the doc.
+        let spring_running = if self.animations.is_empty() {
+            false
+        } else {
+            // Step springs but defer the relayout to the single one below.
+            self.step_springs(dt)
+        };
+        let implicit_running = self.advance_implicit(dt);
+        // One relayout folds in every prop the two paths just wrote.
+        self.relayout();
+        spring_running || implicit_running
+    }
+
+    /// True when no implicit animation is in flight.
+    pub fn implicit_settled(&self) -> bool {
+        self.implicit.is_empty()
     }
 
     /// **Push live state into the literal props of bound nodes — id-stable.**
@@ -1544,6 +1938,310 @@ mod tests {
             Some(uni_ir::Value::Px(v)) => assert!((v - 200.0).abs() < 1.0, "width={v}"),
             other => panic!("expected Px, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Implicit, descriptor-driven animation (the `tick` surface)
+    // -----------------------------------------------------------------------
+
+    /// Build a single `Rect` root carrying an `animation` descriptor and an
+    /// initial `width`. Returns the runtime + the node id.
+    fn animated_rect(desc: &str, width: f32) -> (Runtime, NodeId) {
+        let mut doc = Document::new();
+        let id = doc.fresh_id();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id,
+                kind: "Rect".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key: "animation".into(),
+                value: Value::Text(desc.into()),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key: "width".into(),
+                value: Value::Px(width),
+            },
+        )
+        .unwrap();
+        let rt = Runtime::new(doc, (800.0, 600.0));
+        (rt, id)
+    }
+
+    fn width_of(rt: &Runtime, id: NodeId) -> f32 {
+        match rt.doc().get(id).unwrap().props.get("width") {
+            Some(Value::Px(v)) => *v,
+            other => panic!("expected Px width, got {other:?}"),
+        }
+    }
+
+    /// **The core requirement.** A watched prop change on an `animation`-bearing
+    /// node interpolates across ticks (it is *not* applied instantly) and reaches
+    /// the target; the animation then settles and is removed.
+    #[test]
+    fn implicit_prop_change_interpolates_across_ticks_then_settles() {
+        let (mut rt, id) = animated_rect("300ms linear", 0.0);
+
+        // A change to a watched prop. This sets the *target*; it must NOT take
+        // geometric effect instantly.
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "width".into(),
+                    value: Value::Px(300.0),
+                },
+            )
+            .unwrap();
+
+        // First tick: detect the change, advance one small step. The displayed
+        // width must be partway, not the full 300 (interpolation, not snap).
+        let dt = 1.0 / 60.0;
+        let running = rt.tick(dt);
+        assert!(running, "an implicit animation should be in flight");
+        assert!(!rt.implicit_settled());
+        let after_one = width_of(&rt, id);
+        assert!(
+            after_one > 0.0 && after_one < 300.0,
+            "width should be mid-flight after one tick, got {after_one}"
+        );
+
+        // Keep ticking until the curve completes.
+        let mut prev = after_one;
+        let mut steps = 1;
+        while rt.tick(dt) {
+            let now = width_of(&rt, id);
+            assert!(
+                now + 1e-3 >= prev,
+                "linear interpolation should be monotonic up: {prev} -> {now}"
+            );
+            prev = now;
+            steps += 1;
+            assert!(steps < 1000, "should settle in finite ticks");
+        }
+
+        // Settled: removed from the queue and snapped exactly onto the target.
+        assert!(rt.implicit_settled(), "animation removed when done");
+        let final_w = width_of(&rt, id);
+        assert!(
+            (final_w - 300.0).abs() < 1e-3,
+            "reaches the target exactly, got {final_w}"
+        );
+        // It genuinely took multiple frames (~0.3s / (1/60s) ~= 18 ticks).
+        assert!(steps > 5, "should span many ticks, took {steps}");
+    }
+
+    /// A node *without* an `animation` descriptor applies prop changes instantly
+    /// (no interpolation enqueued) — the opt-in is the descriptor.
+    #[test]
+    fn no_descriptor_means_no_implicit_animation() {
+        let mut doc = Document::new();
+        let id = doc.fresh_id();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id,
+                kind: "Rect".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id })
+            .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key: "width".into(),
+                value: Value::Px(10.0),
+            },
+        )
+        .unwrap();
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "width".into(),
+                    value: Value::Px(500.0),
+                },
+            )
+            .unwrap();
+        let running = rt.tick(1.0 / 60.0);
+        assert!(!running, "no descriptor → nothing animates");
+        assert!(rt.implicit_settled());
+        // The prop is exactly the value that was set — unchanged by tick.
+        assert_eq!(width_of(&rt, id), 500.0);
+    }
+
+    /// **Transitions.** A node that gains `presented` animates its `opacity`
+    /// from 0 toward 1 across ticks (the insertion/presentation fade-in); losing
+    /// `presented` fades it back toward 0.
+    #[test]
+    fn presented_gain_and_loss_animates_opacity() {
+        let (mut rt, id) = animated_rect("200ms linear", 50.0);
+
+        // Gain `presented`.
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "presented".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .unwrap();
+        let dt = 1.0 / 60.0;
+        assert!(rt.tick(dt), "fade-in should be running");
+        let op_in = match rt.doc().get(id).unwrap().props.get("opacity") {
+            Some(Value::Px(v)) => *v,
+            other => panic!("expected opacity Px, got {other:?}"),
+        };
+        assert!(
+            op_in > 0.0 && op_in < 1.0,
+            "opacity mid fade-in, got {op_in}"
+        );
+        // Run the fade-in to completion → opacity ~= 1.
+        while rt.tick(dt) {}
+        let op_done = match rt.doc().get(id).unwrap().props.get("opacity") {
+            Some(Value::Px(v)) => *v,
+            other => panic!("{other:?}"),
+        };
+        assert!((op_done - 1.0).abs() < 1e-3, "fades in to 1, got {op_done}");
+
+        // Now lose `presented` → fade-out toward 0.
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "presented".into(),
+                    value: Value::Bool(false),
+                },
+            )
+            .unwrap();
+        assert!(rt.tick(dt), "fade-out should be running");
+        while rt.tick(dt) {}
+        let op_out = match rt.doc().get(id).unwrap().props.get("opacity") {
+            Some(Value::Px(v)) => *v,
+            other => panic!("{other:?}"),
+        };
+        assert!(op_out.abs() < 1e-3, "fades out to 0, got {op_out}");
+    }
+
+    /// The `Spring` curve is sourced from `uni-spring`: it reaches (and, being
+    /// under-damped/spatial, may briefly pass) the target, and settles onto it.
+    #[test]
+    fn spring_curve_uses_uni_spring_and_reaches_target() {
+        // A spatial (under-damped) spring curve, short duration.
+        let anim = parse_animation("100ms spring");
+        assert!(matches!(anim.curve, Curve::Spring { .. }));
+        // At t=0 progress is 0. uni-spring's `sample` integrates the physics
+        // toward 1 and normalizes the spring curve to land on 1.0 at the
+        // descriptor's duration, so the prop reaches its target there.
+        assert!(anim.sample(0.0).abs() < 1e-3);
+        let at_end = anim.sample(anim.duration);
+        assert!(
+            (at_end - 1.0).abs() < 1e-3,
+            "spring sample reaches 1 at duration, got {at_end}"
+        );
+
+        // Drive a real prop with it end-to-end.
+        let (mut rt, id) = animated_rect("100ms spring", 0.0);
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "width".into(),
+                    value: Value::Px(120.0),
+                },
+            )
+            .unwrap();
+        let dt = 1.0 / 120.0;
+        let mut ticks = 0;
+        while rt.tick(dt) {
+            ticks += 1;
+            assert!(ticks < 1000);
+        }
+        assert!(ticks > 1, "spring animation spans multiple ticks");
+        // Settles exactly on the target (we snap at the duration budget).
+        assert!((width_of(&rt, id) - 120.0).abs() < 1e-3);
+    }
+
+    /// `Animation::sample` maps elapsed time onto the right progress fraction for
+    /// each curve, clamped to the unit interval at the ends.
+    #[test]
+    fn animation_sample_curves_behave() {
+        let lin = Animation::new(Curve::Linear, 1.0);
+        assert!((lin.sample(0.0) - 0.0).abs() < 1e-6);
+        assert!((lin.sample(0.5) - 0.5).abs() < 1e-6);
+        assert!((lin.sample(1.0) - 1.0).abs() < 1e-6);
+        assert!((lin.sample(2.0) - 1.0).abs() < 1e-6, "clamps past the end");
+
+        let ease = Animation::new(Curve::EaseInOut, 1.0);
+        assert!(ease.sample(0.0).abs() < 1e-6);
+        assert!((ease.sample(0.5) - 0.5).abs() < 1e-6, "symmetric at the mid");
+        assert!((ease.sample(1.0) - 1.0).abs() < 1e-6);
+        // Eased mid-rise is slower at the start than linear.
+        assert!(ease.sample(0.2) < lin.sample(0.2));
+    }
+
+    /// A change *mid-flight* redirects the animation from the currently-displayed
+    /// value (not the stale original) and still reaches the new target.
+    #[test]
+    fn midflight_change_redirects_and_reaches_new_target() {
+        let (mut rt, id) = animated_rect("300ms linear", 0.0);
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "width".into(),
+                    value: Value::Px(300.0),
+                },
+            )
+            .unwrap();
+        let dt = 1.0 / 60.0;
+        // A few ticks in.
+        for _ in 0..5 {
+            rt.tick(dt);
+        }
+        let mid = width_of(&rt, id);
+        assert!(mid > 0.0 && mid < 300.0);
+
+        // Redirect to a new target.
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "width".into(),
+                    value: Value::Px(100.0),
+                },
+            )
+            .unwrap();
+        while rt.tick(dt) {}
+        assert!(
+            (width_of(&rt, id) - 100.0).abs() < 1e-3,
+            "redirected animation reaches the new target"
+        );
     }
 
     #[test]

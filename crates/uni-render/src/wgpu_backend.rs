@@ -588,6 +588,7 @@ impl WgpuRenderer {
                 h,
                 color,
                 corner_radius,
+                rotation,
             } = cmd
             {
                 if *w <= 0.0 || *h <= 0.0 {
@@ -609,13 +610,32 @@ impl WgpuRenderer {
                 }
                 let path = builder.build();
 
+                // `rotationEffect`: rotate the emitted geometry clockwise by
+                // `rotation` degrees about the rect's own center. `0.0` leaves
+                // every vertex untouched (the identity), so un-rotated rects
+                // tessellate exactly as before.
+                let rotate = *rotation != 0.0;
+                let (sin, cos, cx, cy) = if rotate {
+                    let r = rotation.to_radians();
+                    (r.sin(), r.cos(), *x + *w * 0.5, *y + *h * 0.5)
+                } else {
+                    (0.0, 1.0, 0.0, 0.0)
+                };
+
                 tessellator
                     .tessellate_path(
                         &path,
                         &FillOptions::tolerance(0.1),
-                        &mut BuffersBuilder::new(&mut geometry, move |v: FillVertex| Vertex {
-                            pos: v.position().to_array(),
-                            color: linear,
+                        &mut BuffersBuilder::new(&mut geometry, move |v: FillVertex| {
+                            let [px, py] = v.position().to_array();
+                            let pos = if rotate {
+                                let dx = px - cx;
+                                let dy = py - cy;
+                                [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
+                            } else {
+                                [px, py]
+                            };
+                            Vertex { pos, color: linear }
                         }),
                     )
                     .expect("lyon tessellation failed");

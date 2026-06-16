@@ -140,6 +140,7 @@ mod canvas_tests {
             h: 4.0,
             color: 0xFF0000FF, // red, fully opaque
             corner_radius: 0.0,
+            rotation: 0.0,
         }])
         .unwrap();
         // Pixel at (3,3) should be red.
@@ -159,6 +160,7 @@ mod canvas_tests {
             h: 4.0,
             color: 0x00FF00FF,
             corner_radius: 0.0,
+            rotation: 0.0,
         }])
         .unwrap();
         r.render(&vec![]).unwrap(); // empty scene

@@ -1069,14 +1069,7 @@ fn paint_presentation_surface(node: &Node, rect: ComputedRect, vw: f32, vh: f32,
     // 1) Scrim: a dim full-viewport veil under modal surfaces only.
     if modal {
         let scrim = color_of(node, "scrim").unwrap_or(0x00000099);
-        scene.push(DrawCmd::FilledRect {
-            x: 0.0,
-            y: 0.0,
-            w: vw,
-            h: vh,
-            color: scrim,
-            corner_radius: 0.0,
-        });
+        scene.push(DrawCmd::filled_rect(0.0, 0.0, vw, vh, scrim, 0.0));
     }
 
     // 2) Card: the surface panel at its laid-out rect.
@@ -1092,14 +1085,120 @@ fn paint_presentation_surface(node: &Node, rect: ComputedRect, vw: f32, vh: f32,
     let corner_radius = px_of(node, "corner_radius")
         .or_else(|| px_of(node, "radius"))
         .unwrap_or(default_radius);
-    scene.push(DrawCmd::FilledRect {
-        x: rect.x,
-        y: rect.y,
-        w: rect.w,
-        h: rect.h,
-        color: fill,
+    scene.push(DrawCmd::filled_rect(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        fill,
         corner_radius,
-    });
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// SwiftUI paint-time transforms: offset / scaleEffect / rotationEffect
+// ---------------------------------------------------------------------------
+
+/// An accumulated paint-time transform for one node, composed down the tree.
+///
+/// SwiftUI's `.offset(x:y:)`, `.scaleEffect(_:)` and `.rotationEffect(_:)` are
+/// *render-time* modifiers: they move/scale/rotate a view (and its whole
+/// subtree) **after** layout, without changing the laid-out rects of siblings.
+/// We model the cumulative effect of a node's own modifiers and all of its
+/// ancestors' as a uniform `scale` (about each rect's own center), a
+/// translation `(dx, dy)`, and a `rotation` in degrees (about the final
+/// center, recorded on the emitted draw command).
+///
+/// The identity (`scale == 1`, `dx == dy == 0`, `rotation == 0`) leaves a rect
+/// untouched — and no existing scene carries these props — so prior output is
+/// unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Transform {
+    /// Cumulative uniform scale factor (multiplied down the tree).
+    scale: f32,
+    /// Cumulative translation in logical px (already scaled by ancestors).
+    dx: f32,
+    dy: f32,
+    /// Cumulative rotation in degrees (summed down the tree).
+    rotation: f32,
+}
+
+impl Transform {
+    const IDENTITY: Transform = Transform {
+        scale: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+        rotation: 0.0,
+    };
+
+    fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.dx == 0.0 && self.dy == 0.0 && self.rotation == 0.0
+    }
+
+    /// Apply this transform to an axis-aligned laid-out rect, returning the
+    /// transformed axis-aligned rect (`scaleEffect` about the rect's own center,
+    /// then `offset`) plus the rotation (deg) to record on the draw command.
+    fn apply(&self, r: ComputedRect) -> (ComputedRect, f32) {
+        let cx = r.x + r.w * 0.5;
+        let cy = r.y + r.h * 0.5;
+        let w = r.w * self.scale;
+        let h = r.h * self.scale;
+        // Scale about the rect center, then translate the center by the offset.
+        let ncx = cx + self.dx;
+        let ncy = cy + self.dy;
+        (
+            ComputedRect {
+                x: ncx - w * 0.5,
+                y: ncy - h * 0.5,
+                w,
+                h,
+            },
+            self.rotation,
+        )
+    }
+}
+
+/// Read a node's own `offset_x` / `offset_y` / `scale` / `rotation` props.
+fn own_transform(node: &Node) -> Transform {
+    let dx = px_of(node, "offset_x").unwrap_or(0.0);
+    let dy = px_of(node, "offset_y").unwrap_or(0.0);
+    // `scale` defaults to 1 (identity). A non-positive scale is treated as the
+    // identity to avoid collapsing/inverting a rect on a bad value.
+    let scale = px_of(node, "scale").unwrap_or(1.0);
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let rotation = px_of(node, "rotation").unwrap_or(0.0);
+    Transform { scale, dx, dy, rotation }
+}
+
+/// Compose a parent's accumulated transform with a child's own transform: the
+/// parent scale multiplies the child's offset, scales compound, rotations and
+/// translations accumulate.
+fn compose(parent: Transform, own: Transform) -> Transform {
+    Transform {
+        scale: parent.scale * own.scale,
+        dx: parent.dx + own.dx * parent.scale,
+        dy: parent.dy + own.dy * parent.scale,
+        rotation: parent.rotation + own.rotation,
+    }
+}
+
+/// Pre-compute each node's accumulated [`Transform`] by walking the doc tree
+/// root-down, so the paint pass can transform every node's rect and its whole
+/// subtree travels with it (matching SwiftUI modifier semantics).
+fn accumulate_transforms(doc: &Document) -> HashMap<NodeId, Transform> {
+    let mut out: HashMap<NodeId, Transform> = HashMap::new();
+    if let Some(root) = doc.root() {
+        let mut stack = vec![(root, Transform::IDENTITY)];
+        while let Some((id, parent_t)) = stack.pop() {
+            let Some(node) = doc.get(id) else { continue };
+            let t = compose(parent_t, own_transform(node));
+            out.insert(id, t);
+            for &c in &node.children {
+                stack.push((c, t));
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,13 +1228,27 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
     let mut dormant_subtree: std::collections::HashSet<NodeId> =
         std::collections::HashSet::new();
 
+    // SwiftUI paint-time transforms (offset / scaleEffect / rotationEffect),
+    // accumulated down the tree so a transformed node carries its subtree.
+    let transforms = accumulate_transforms(doc);
+
     let order = paint_order(doc, layout);
     for (idx, &id) in order.iter().enumerate() {
         let Some(node) = doc.get(id) else {
             continue;
         };
-        let Some(rect) = layout.rect(id) else {
+        let Some(laid_out) = layout.rect(id) else {
             continue;
+        };
+        // Apply this node's accumulated transform to its laid-out rect. `node_rot`
+        // is the rotation (deg) recorded on the emitted rect; for non-rect
+        // primitives (Text/Frost/Divider) the transform moves the bounds but the
+        // primitive itself stays axis-aligned in v0.
+        let xf = transforms.get(&id).copied().unwrap_or(Transform::IDENTITY);
+        let (rect, node_rot) = if xf.is_identity() {
+            (laid_out, 0.0)
+        } else {
+            xf.apply(laid_out)
         };
         let is_root = root == Some(id);
 
@@ -1227,24 +1340,10 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                 // centered on the short axis, with the given thickness.
                 if rect.w >= rect.h {
                     let y = rect.y + (rect.h - thickness) * 0.5;
-                    scene.push(DrawCmd::FilledRect {
-                        x: rect.x,
-                        y,
-                        w: rect.w,
-                        h: thickness,
-                        color,
-                        corner_radius: 0.0,
-                    });
+                    scene.push(DrawCmd::filled_rect(rect.x, y, rect.w, thickness, color, 0.0));
                 } else {
                     let x = rect.x + (rect.w - thickness) * 0.5;
-                    scene.push(DrawCmd::FilledRect {
-                        x,
-                        y: rect.y,
-                        w: thickness,
-                        h: rect.h,
-                        color,
-                        corner_radius: 0.0,
-                    });
+                    scene.push(DrawCmd::filled_rect(x, rect.y, thickness, rect.h, color, 0.0));
                 }
             }
             "Image" => {
@@ -1265,6 +1364,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     h: rect.h,
                     color: scale_alpha(color, opacity),
                     corner_radius,
+                    rotation: node_rot,
                 });
             }
             "Form" | "Section" => {
@@ -1283,6 +1383,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     h: rect.h,
                     color: scale_alpha(color, opacity),
                     corner_radius,
+                    rotation: node_rot,
                 });
             }
             "Stack" | "Column" | "Row" | "Grid" | "List" | "LazyVStack" => {
@@ -1294,14 +1395,14 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     if is_root && idx == 0 {
                         // Root background fills the whole viewport (the renderer
                         // treats the first full-cover rect as its clear color).
-                        scene.push(DrawCmd::FilledRect {
-                            x: 0.0,
-                            y: 0.0,
-                            w: vw,
-                            h: vh,
-                            color: scale_alpha(color, opacity),
-                            corner_radius: 0.0,
-                        });
+                        scene.push(DrawCmd::filled_rect(
+                            0.0,
+                            0.0,
+                            vw,
+                            vh,
+                            scale_alpha(color, opacity),
+                            0.0,
+                        ));
                     } else {
                         scene.push(DrawCmd::FilledRect {
                             x: rect.x,
@@ -1310,6 +1411,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                             h: rect.h,
                             color: scale_alpha(color, opacity),
                             corner_radius,
+                            rotation: node_rot,
                         });
                     }
                 }
@@ -1326,6 +1428,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     h: rect.h,
                     color: scale_alpha(color, opacity),
                     corner_radius,
+                    rotation: node_rot,
                 });
             }
             "Frost" | "FrostedRect" => {
@@ -2586,5 +2689,107 @@ mod tests {
         // Items paint after (on top of) the menu card.
         let i0 = rect_idx(&scene, 0x010000ff).expect("item 0 painted");
         assert!(i0 > card_idx, "menu items paint over the card: {i0} > {card_idx}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiftUI transform modifiers at paint: offset / scaleEffect / rotationEffect
+    // -----------------------------------------------------------------------
+
+    /// The emitted `FilledRect` of a given color: `(x, y, w, h, rotation)`.
+    fn find_rect(scene: &Scene, want: u32) -> Option<(f32, f32, f32, f32, f32)> {
+        scene.iter().find_map(|c| match c {
+            DrawCmd::FilledRect { x, y, w, h, color, rotation, .. } if *color == want => {
+                Some((*x, *y, *w, *h, *rotation))
+            }
+            _ => None,
+        })
+    }
+
+    /// Root Stack holding one fixed 40x40 colored Rect. Returns `(doc, rect_id, color)`.
+    fn doc_with_one_rect() -> (Document, NodeId, u32) {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let r = node(&mut doc, "Rect");
+        prop(&mut doc, r, "width", Value::Px(40.0));
+        prop(&mut doc, r, "height", Value::Px(40.0));
+        let color = 0xabcdefff;
+        prop(&mut doc, r, "color", Value::Color(color));
+        child(&mut doc, root, r);
+        (doc, r, color)
+    }
+
+    /// `offset(x, y)` shifts the painted rect's emitted x/y by exactly (x, y),
+    /// leaving size and rotation untouched.
+    #[test]
+    fn offset_shifts_emitted_position() {
+        let (mut doc, r, color) = doc_with_one_rect();
+        let vp = (400.0, 400.0);
+        let (bx, by, bw, bh, _) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+
+        prop(&mut doc, r, "offset_x", Value::Px(30.0));
+        prop(&mut doc, r, "offset_y", Value::Px(-12.0));
+        let (ox, oy, ow, oh, orot) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+
+        assert_eq!(ox, bx + 30.0, "x shifted by offset_x");
+        assert_eq!(oy, by - 12.0, "y shifted by offset_y");
+        assert_eq!((ow, oh), (bw, bh), "offset leaves size unchanged");
+        assert_eq!(orot, 0.0, "offset adds no rotation");
+    }
+
+    /// `scaleEffect(s)` scales the painted rect's width/height about its center.
+    #[test]
+    fn scale_resizes_about_center() {
+        let (mut doc, r, color) = doc_with_one_rect();
+        let vp = (400.0, 400.0);
+        let (bx, by, bw, bh, _) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+        let (bcx, bcy) = (bx + bw * 0.5, by + bh * 0.5);
+
+        prop(&mut doc, r, "scale", Value::Float(2.0));
+        let (sx, sy, sw, sh, _) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+
+        assert_eq!((sw, sh), (bw * 2.0, bh * 2.0), "size doubled by scaleEffect");
+        let (scx, scy) = (sx + sw * 0.5, sy + sh * 0.5);
+        assert!((scx - bcx).abs() < 1e-4, "center x preserved under scale");
+        assert!((scy - bcy).abs() < 1e-4, "center y preserved under scale");
+    }
+
+    /// `rotationEffect(deg)` is recorded on the emitted `FilledRect` (the backend
+    /// rotates about the rect center); the axis-aligned box is unchanged.
+    #[test]
+    fn rotation_is_recorded_about_center() {
+        let (mut doc, r, color) = doc_with_one_rect();
+        let vp = (400.0, 400.0);
+        let (bx, by, bw, bh, brot) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+        assert_eq!(brot, 0.0, "no rotation by default");
+
+        prop(&mut doc, r, "rotation", Value::Float(45.0));
+        let (rx, ry, rw, rh, rrot) = find_rect(&lower(&doc, vp), color).expect("rect painted");
+
+        assert_eq!(rrot, 45.0, "rotation degrees recorded on the rect");
+        assert_eq!((rx, ry, rw, rh), (bx, by, bw, bh), "rotation preserves the rect box");
+    }
+
+    /// A transform on a container carries its whole subtree: a child Rect moves
+    /// with the parent's `offset`.
+    #[test]
+    fn transform_propagates_to_subtree() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        prop(&mut doc, root, "offset_x", Value::Px(25.0));
+        let r = node(&mut doc, "Rect");
+        prop(&mut doc, r, "width", Value::Px(20.0));
+        prop(&mut doc, r, "height", Value::Px(20.0));
+        let color = 0x123456ff;
+        prop(&mut doc, r, "color", Value::Color(color));
+        child(&mut doc, root, r);
+        let vp = (300.0, 300.0);
+
+        let (x_off, ..) = find_rect(&lower(&doc, vp), color).expect("child painted");
+        prop(&mut doc, root, "offset_x", Value::Px(0.0));
+        let (x_base, ..) = find_rect(&lower(&doc, vp), color).expect("child painted");
+
+        assert_eq!(x_off, x_base + 25.0, "child inherits parent's offset");
     }
 }
