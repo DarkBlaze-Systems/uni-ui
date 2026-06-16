@@ -39,7 +39,8 @@ version = "0.0.1"
 edition = "2021"
 authors = ["DarkBlaze"]
 publish = false
-# license: LicenseRef-DarkBlaze-Sanity (BSL 1.1 + no-compete grant) — to be finalized.
+# DarkBlaze Sanity License v1.0 (Interim) — BSL 1.1 variant + no-compete grant. See LICENSE.
+license = "LicenseRef-DarkBlaze-Sanity"
 
 [profile.release]
 opt-level = 3

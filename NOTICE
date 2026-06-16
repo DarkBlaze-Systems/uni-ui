@@ -1,0 +1,16 @@
+DarkBlaze Uni-UI
+Copyright (c) 2026 T. Billy Ekkerd / DarkBlaze Systems.
+
+This product is licensed under the DarkBlaze Sanity License, a Business
+Source License 1.1 variant. See the LICENSE file for terms.
+
+Uni-UI is an independent, clean-room implementation. It contains no source
+copied from GPL/copyleft projects, including Slint. It depends only on
+permissively licensed third-party crates (MIT / Apache-2.0 / BSD / Zlib);
+those dependencies retain their own licenses and copyright notices, which
+are preserved in their respective source distributions and in Cargo.lock.
+
+Trademarks referenced for interoperability (e.g. "Slint", "Flutter",
+"SwiftUI") are the property of their respective owners. Uni-UI is not
+affiliated with, endorsed by, or sponsored by those owners; their names
+appear only to describe the source dialects this engine can import.

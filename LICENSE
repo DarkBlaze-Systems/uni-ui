@@ -1,28 +1,113 @@
-DarkBlaze Uni-UI — License Notice (INTERIM)
+DarkBlaze Sanity License, Version 1.0 (Interim)
+================================================
 
-Copyright (c) 2026 DarkBlaze Systems. All rights reserved.
+A source-available, time-limited-exclusivity license in the spirit of the
+Business Source License 1.1. This Version 1.0 (Interim) is the operative
+license until a counsel-reviewed Version 1.1 replaces it; Version 1.1 may only
+broaden the rights granted here, never narrow them retroactively for a given
+release.
 
-This source is published publicly for transparency and provenance. It is
-destined to be released under the "DarkBlaze Sanity License" — a Business
-Source License (BSL 1.1) variant carrying a no-compete Additional Use Grant
-and a Change Date on which it converts to an open-source license.
+Preamble
+--------
+DarkBlaze Systems publishes the Licensed Work so that anyone may read, study,
+learn from, and use it. The single purpose of this license is stewardship, not
+lock-in: it permits broad use while reserving, for a limited time, the right to
+commercialize the Licensed Work as a competing hosted or packaged UI engine. On
+the Change Date the Licensed Work becomes fully open source under the Change
+License below.
 
-UNTIL that license is finalized and applied, this is published under
-all-rights-reserved terms: no rights to use, copy, modify, or distribute this
-software are granted, except (a) viewing the source, and (b) any rights
-required by the licenses of its third-party dependencies. A permissive license
-will only ever broaden these terms, never narrow your viewing rights.
 
-CLEAN-ROOM NOTICE
------------------
-Uni-UI is an independent, clean-room implementation. It depends only on
-permissively licensed (MIT / Apache-2.0 / BSD / Zlib) crates and contains no
-source copied from GPL/copyleft projects — including, explicitly, none of
-Slint's `i-slint-*` crates — and none from any proprietary framework. Any
-language or API surface it accepts (e.g. importers) is reconstructed from
-public documentation only.
+Parameters
+----------
+Licensor:              T. Billy Ekkerd, trading as DarkBlaze Systems.
+Licensed Work:         "DarkBlaze Uni-UI" — the Rust UI engine in this
+                       repository (its compiler, intermediate representation,
+                       runtime, DSL, and supporting crates), together with any
+                       future version the Licensor releases under this license.
+Additional Use Grant:  You may use, copy, modify, and create derivative works
+                       of the Licensed Work for any purpose EXCEPT offering the
+                       Licensed Work or a derivative to third parties as a
+                       hosted, managed, or commercial UI engine or
+                       UI-as-a-service that competes with the Licensor.
+                       Internal use, evaluation, research, education, and
+                       non-competing production use are permitted.
+Change Date:           2030-06-16.
+Change License:        Apache License, Version 2.0.
 
-Third-party permissive components retain their own licenses; their required
-attribution / NOTICE accompanies distributed builds.
 
-Questions: open an issue, or contact DarkBlaze Systems.
+Terms
+-----
+1. Grant. Subject to the restriction in Section 2, the Licensor grants you a
+   worldwide, royalty-free, non-exclusive license to use, copy, modify, create
+   derivative works of, and redistribute the Licensed Work.
+
+2. Restriction. Until the Change Date, you may not use the Licensed Work in a
+   way that falls outside the Additional Use Grant above. Any use beyond that
+   Grant requires a separate commercial license from the Licensor.
+
+3. Change Date conversion. On the Change Date, the restriction in Section 2
+   ends for the then-current and all prior versions of the Licensed Work, and
+   that code is thereafter governed by the Change License (Apache-2.0). Each
+   version's Change Date is the date stated in the Parameters of the license
+   accompanying that version.
+
+4. Redistribution. You must retain this license text, the NOTICE file, and all
+   copyright and attribution notices in any copy or derivative you distribute.
+
+5. Trademarks. This license grants no rights in the names, logos, or marks of
+   the Licensor, including "DarkBlaze", "Uni-UI", and "Sanity License". The
+   names "Slint", "Flutter", and "SwiftUI" are referenced solely to describe
+   the source dialects this engine can import (nominative use); they are the
+   property of their respective owners, who do not endorse this work.
+
+6. Clean-room statement. The Licensed Work is an independent, clean-room
+   implementation and incorporates no source from copyleft-licensed projects.
+   Third-party dependencies are licensed permissively and retain their own
+   licenses.
+
+7. Warranty disclaimer. To the maximum extent permitted by applicable law, the
+   Licensed Work is provided "AS IS", without warranty of any kind, express or
+   implied, including warranties of merchantability, fitness for a particular
+   purpose, and non-infringement.
+
+8. Limitation of liability. To the maximum extent permitted by applicable law,
+   the Licensor is not liable for any indirect, incidental, special, or
+   consequential damages arising from the Licensed Work. Nothing in this
+   license limits liability that applicable mandatory law does not allow to be
+   limited — including, where they apply, liability for willful misconduct or
+   gross negligence (dolo o colpa grave / dolo), and any liability or consumer
+   right that the mandatory law of the user's jurisdiction renders
+   non-excludable.
+
+9. Author's moral rights. Where applicable mandatory law confers inalienable
+   moral rights on the author (as under the law of Italy and Argentina, among
+   others), those rights are expressly preserved and are not waived by this
+   license.
+
+10. Governing law and local mandatory rules. This license is governed by its
+    plain terms and is intended to be valid and enforceable wherever the
+    Licensed Work is used, including South Africa, Italy, and Argentina. Where
+    any term conflicts with the mandatory law of a jurisdiction in which the
+    Licensed Work is used — including consumer-protection law (e.g. South
+    Africa's Consumer Protection Act 68 of 2008) and author-protection law
+    (e.g. Italian Civil Code provisions on moral rights and clausole
+    vessatorie; Argentina's Ley 11.723) — that term applies only to the maximum
+    extent that jurisdiction permits, and the remainder of this license
+    continues in force.
+
+11. Severability. If any provision is held unenforceable, it is read down to
+    the minimum extent necessary to be valid, and the remaining provisions
+    remain in effect.
+
+12. Language. The controlling version of this license is English, except where
+    a jurisdiction's mandatory law requires an official local-language version,
+    in which case the local-language version controls in that jurisdiction to
+    the extent of any conflict.
+
+
+NOTE (non-binding): This Interim Version 1.0 is a good-faith, source-available
+license, not legal advice. A qualified attorney in each target jurisdiction
+(South Africa, Italy, Argentina) should review and confirm enforceability
+before this is relied upon commercially. The license terminology draws on the
+Business Source License 1.1 concept; "Business Source License" is a trademark
+of MariaDB Corporation Ab, which does not endorse this work.
