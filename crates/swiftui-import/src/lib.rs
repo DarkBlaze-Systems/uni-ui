@@ -74,6 +74,8 @@ enum SwiftValue {
     Color(u32),
     FontRole(f32), // resolved to a px size
     Ident(String),
+    /// A closed range `lo...hi` (SwiftUI `Slider(in:)`). Lowered as two props.
+    Range(f64, f64),
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +176,15 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self) -> f64 {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == b'.' {
+            if c.is_ascii_digit() {
+                s.push(c as char);
+                self.advance();
+            } else if c == b'.' {
+                // Stop at `..` so a range operator (`0...100`) is not swallowed
+                // into the number literal; a lone `.` is a decimal point.
+                if self.src.get(self.pos + 1).copied() == Some(b'.') {
+                    break;
+                }
                 s.push(c as char);
                 self.advance();
             } else {
@@ -209,6 +219,13 @@ fn map_kind(swiftui: &str) -> &str {
         "ScrollView" => "Stack",
         "RoundedRectangle" | "Rectangle" => "Rect",
         "Spacer" => "Rect",
+        // Leaf views keep their SwiftUI name as the IR kind — these have no
+        // layout-container analogue, they *are* their own element.
+        "Image" => "Image",
+        "Divider" => "Divider",
+        "Toggle" => "Toggle",
+        "Slider" => "Slider",
+        "ProgressView" => "ProgressView",
         _ => swiftui,
     }
 }
@@ -231,8 +248,8 @@ fn named_dot_color(name: &str) -> Option<u32> {
     }
 }
 
-fn font_role_px(role: &str) -> f32 {
-    match role {
+fn font_role_px(role: &str) -> Option<f32> {
+    Some(match role {
         "largeTitle" => 34.0,
         "title" | "title1" => 28.0,
         "title2" => 22.0,
@@ -243,8 +260,10 @@ fn font_role_px(role: &str) -> f32 {
         "subheadline" => 14.0,
         "footnote" => 13.0,
         "caption" | "caption2" => 12.0,
-        _ => 16.0,
-    }
+        // Not a known text style — let the caller treat the dotted name as a
+        // plain identifier (e.g. `.infinity`, `.bold`).
+        _ => return None,
+    })
 }
 
 // ─────────────────────────────────────────────────────────── parser ──────────
@@ -408,22 +427,43 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
     lex.skip_ws();
     match lex.peek() {
         Some(b'"') => Ok(SwiftValue::Str(lex.read_string()?)),
+        // `$state` — a SwiftUI two-way binding projection. We can't resolve the
+        // state graph in a clean-room importer, so we carry the bound name as an
+        // identifier (e.g. `isOn: $flag` → bound state name "flag").
+        Some(b'$') => {
+            lex.advance(); // $
+            Ok(SwiftValue::Ident(lex.read_ident()))
+        }
         Some(b'.') => {
             lex.advance();
             let name = lex.read_ident();
             // Font role or color
             if let Some(c) = named_dot_color(&name) {
                 Ok(SwiftValue::Color(c))
+            } else if let Some(px) = font_role_px(&name) {
+                Ok(SwiftValue::FontRole(px))
             } else {
-                let px = font_role_px(&name);
-                if px > 0.0 {
-                    Ok(SwiftValue::FontRole(px))
-                } else {
-                    Ok(SwiftValue::Ident(name))
-                }
+                Ok(SwiftValue::Ident(name))
             }
         }
-        Some(c) if c.is_ascii_digit() => Ok(SwiftValue::Float(lex.read_number())),
+        Some(c) if c.is_ascii_digit() => {
+            let lo = lex.read_number();
+            // Range literal `lo...hi` (or `lo..<hi`) — used by `Slider(in:)`.
+            if lex.peek() == Some(b'.') && lex.src.get(lex.pos + 1).copied() == Some(b'.') {
+                // consume the run of '.' and an optional '<'
+                while lex.peek() == Some(b'.') {
+                    lex.advance();
+                }
+                if lex.peek() == Some(b'<') {
+                    lex.advance();
+                }
+                lex.skip_ws();
+                let hi = lex.read_number();
+                Ok(SwiftValue::Range(lo, hi))
+            } else {
+                Ok(SwiftValue::Float(lo))
+            }
+        }
         Some(_) => {
             let id = lex.read_ident();
             match id.as_str() {
@@ -452,6 +492,16 @@ fn apply_modifiers(
         let modifier = lex.read_ident();
         lex.skip_ws();
         if lex.peek() != Some(b'(') {
+            // A parenthesis-less, property-style modifier such as `.isHidden`.
+            // Only a curated few have an IR home; the rest are dropped + logged.
+            match modifier.as_str() {
+                "isHidden" => view.props.push(("hidden".into(), SwiftValue::Bool(true))),
+                "" => {} // a stray `.` — nothing to record
+                other => view.unsupported.push(Unsupported {
+                    line: modifier_line,
+                    text: format!("modifier .{other}"),
+                }),
+            }
             continue;
         }
         lex.advance(); // (
@@ -494,6 +544,17 @@ fn apply_modifiers(
                     match key.as_str() {
                         "width" | "minWidth" => view.props.push(("width".into(), v)),
                         "height" | "minHeight" => view.props.push(("height".into(), v)),
+                        // `maxWidth: .infinity` / `maxHeight: .infinity` is
+                        // SwiftUI's "fill the cross axis" — our `grow=1`.
+                        "maxWidth" | "maxHeight" => {
+                            if matches!(&v, SwiftValue::Ident(s) if s == "infinity") {
+                                view.props.push(("grow".into(), SwiftValue::Float(1.0)));
+                            } else {
+                                // a finite max bound maps to the dimension itself
+                                let dim = if key == "maxWidth" { "width" } else { "height" };
+                                view.props.push((dim.into(), v));
+                            }
+                        }
                         _ => {}
                     }
                     lex.skip_ws();
@@ -506,16 +567,74 @@ fn apply_modifiers(
                 let v = parse_value(lex)?;
                 view.props.push(("padding".into(), v));
             }
-            "cornerRadius" | "clipShape" => {
+            "cornerRadius" => {
                 let v = parse_value(lex)?;
                 if let SwiftValue::Float(r) = v {
                     view.props
                         .push(("corner_radius".into(), SwiftValue::Float(r)));
                 }
             }
+            "clipShape" => {
+                // `.clipShape(RoundedRectangle(cornerRadius: r))` — reach into the
+                // nested shape and pull out its corner radius. Other clip shapes
+                // (Circle, Capsule, …) have no radius to surface.
+                let shape = lex.read_ident();
+                lex.skip_ws();
+                if shape == "RoundedRectangle" && lex.peek() == Some(b'(') {
+                    lex.advance(); // (
+                    loop {
+                        lex.skip_ws();
+                        if lex.peek() == Some(b')') {
+                            lex.advance();
+                            break;
+                        }
+                        if lex.peek().is_none() {
+                            break;
+                        }
+                        let key = lex.read_ident();
+                        lex.skip_ws();
+                        if lex.peek() == Some(b':') {
+                            lex.advance();
+                        }
+                        lex.skip_ws();
+                        let v = parse_value(lex)?;
+                        if key == "cornerRadius" {
+                            if let SwiftValue::Float(r) = v {
+                                view.props
+                                    .push(("corner_radius".into(), SwiftValue::Float(r)));
+                            }
+                        }
+                        lex.skip_ws();
+                        if lex.peek() == Some(b',') {
+                            lex.advance();
+                        }
+                    }
+                }
+            }
             "opacity" => {
                 let v = parse_value(lex)?;
                 view.props.push(("opacity".into(), v));
+            }
+            "bold" => {
+                // `.bold()` — empty parens, sets a weight prop.
+                view.props
+                    .push(("weight".into(), SwiftValue::Ident("bold".into())));
+            }
+            "fontWeight" => {
+                // `.fontWeight(.bold)` — carry the named weight through.
+                let v = parse_value(lex)?;
+                let weight = match v {
+                    SwiftValue::Ident(w) => w,
+                    _ => "regular".into(),
+                };
+                view.props.push(("weight".into(), SwiftValue::Ident(weight)));
+            }
+            "italic" => {
+                view.props.push(("italic".into(), SwiftValue::Bool(true)));
+            }
+            "hidden" => {
+                // `.hidden()` — empty parens.
+                view.props.push(("hidden".into(), SwiftValue::Bool(true)));
             }
             "onTapGesture" | "onLongPressGesture" => {
                 view.callbacks.push("click".into());
@@ -573,6 +692,8 @@ fn swiftval_to_ir(v: SwiftValue) -> Value {
         SwiftValue::Color(c) => Value::Color(c),
         SwiftValue::FontRole(px) => Value::Px(px),
         SwiftValue::Ident(s) => Value::Text(s),
+        // A bare range that escaped split-lowering — represent both bounds.
+        SwiftValue::Range(lo, hi) => Value::List(vec![Value::Float(lo), Value::Float(hi)]),
     }
 }
 
@@ -603,11 +724,34 @@ fn lower_view(
     }
 
     for (key, val) in &view.props {
+        // `Image(name:)` and `Image(systemName:)` both name the picture the view
+        // shows — normalize to one `content` prop in our vocabulary.
+        let key: &str = match (view.kind.as_str(), key.as_str()) {
+            ("Image", "name") | ("Image", "systemName") => "content",
+            _ => key.as_str(),
+        };
+
+        // A range bound (`Slider(in: 0...100)`) is two scalars in the IR.
+        if let SwiftValue::Range(lo, hi) = val {
+            for (k, bound) in [("range_min", *lo), ("range_max", *hi)] {
+                doc.apply_from(
+                    Origin::System,
+                    Mutation::SetProp {
+                        id,
+                        key: k.into(),
+                        value: Value::Float(bound),
+                    },
+                )
+                .ok();
+            }
+            continue;
+        }
+
         let ir_val = match val {
             SwiftValue::Float(f) => {
                 // If key is size/width/height/padding/corner_radius, use Px
                 if matches!(
-                    key.as_str(),
+                    key,
                     "size" | "width" | "height" | "padding" | "corner_radius" | "opacity"
                 ) {
                     Value::Px(*f as f32)
@@ -621,7 +765,7 @@ fn lower_view(
             Origin::System,
             Mutation::SetProp {
                 id,
-                key: key.clone(),
+                key: key.into(),
                 value: ir_val,
             },
         )
@@ -851,5 +995,176 @@ mod tests {
         // Back-compat: `parse` signature unchanged, drops are silent.
         let doc = parse(r#"Text("Hi").shadow(radius: 4)"#).unwrap();
         assert!(doc.root().is_some());
+    }
+
+    // ── S1: new leaf views ────────────────────────────────────────────────────
+
+    fn root_kind(src: &str) -> String {
+        let doc = parse(src).expect("parse ok");
+        let root = doc.root().expect("has root");
+        doc.get(root).unwrap().kind.clone()
+    }
+
+    #[test]
+    fn parse_image_system_name_carries_content() {
+        let doc = parse(r#"Image(systemName: "star.fill")"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Image");
+        assert_eq!(
+            node.props.get("content"),
+            Some(&Value::Text("star.fill".into()))
+        );
+    }
+
+    #[test]
+    fn parse_image_named_carries_content() {
+        // `Image("logo")` — positional string also lands in `content`.
+        let doc = parse(r#"Image("logo")"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Image");
+        assert_eq!(node.props.get("content"), Some(&Value::Text("logo".into())));
+    }
+
+    #[test]
+    fn parse_divider_lowers_to_divider() {
+        assert_eq!(root_kind("Divider()"), "Divider");
+    }
+
+    #[test]
+    fn parse_toggle_label_and_bound_state() {
+        let doc = parse(r#"Toggle("Wi-Fi", isOn: $wifiEnabled)"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Toggle");
+        // label → content; bound state name carried through `isOn`.
+        assert_eq!(
+            node.props.get("content"),
+            Some(&Value::Text("Wi-Fi".into()))
+        );
+        assert_eq!(
+            node.props.get("isOn"),
+            Some(&Value::Text("wifiEnabled".into()))
+        );
+    }
+
+    #[test]
+    fn parse_slider_value_and_range() {
+        let doc = parse(r#"Slider(value: $volume, in: 0...100)"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Slider");
+        assert_eq!(
+            node.props.get("value"),
+            Some(&Value::Text("volume".into()))
+        );
+        assert_eq!(node.props.get("range_min"), Some(&Value::Float(0.0)));
+        assert_eq!(node.props.get("range_max"), Some(&Value::Float(100.0)));
+    }
+
+    #[test]
+    fn parse_progressview_with_value() {
+        let doc = parse(r#"ProgressView(value: 0.5)"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "ProgressView");
+        assert_eq!(node.props.get("value"), Some(&Value::Float(0.5)));
+    }
+
+    #[test]
+    fn parse_progressview_indeterminate() {
+        // No value — still lowers, just carries no `value` prop.
+        let doc = parse(r#"ProgressView()"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "ProgressView");
+        assert!(!node.props.contains_key("value"));
+    }
+
+    // ── S1: new modifiers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_opacity_modifier() {
+        let v = root_prop(r#"Text("Hi").opacity(0.4)"#, "opacity");
+        assert_eq!(v, Some(Value::Px(0.4)));
+    }
+
+    #[test]
+    fn parse_hidden_modifier() {
+        let v = root_prop(r#"Text("Hi").hidden()"#, "hidden");
+        assert_eq!(v, Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_is_hidden_property_modifier() {
+        // Parenthesis-less property form.
+        let v = root_prop(r#"Text("Hi").isHidden"#, "hidden");
+        assert_eq!(v, Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_clip_shape_rounded_rect_corner_radius() {
+        let v = root_prop(
+            r#"Rectangle().clipShape(RoundedRectangle(cornerRadius: 12))"#,
+            "corner_radius",
+        );
+        assert_eq!(v, Some(Value::Px(12.0)));
+    }
+
+    #[test]
+    fn parse_foreground_style_aliases_color() {
+        let v = root_prop(r#"Text("Hi").foregroundStyle(.red)"#, "color");
+        assert_eq!(v, Some(Value::Color(0xFF00_00FF)));
+    }
+
+    #[test]
+    fn parse_bold_sets_weight() {
+        let v = root_prop(r#"Text("Hi").bold()"#, "weight");
+        assert_eq!(v, Some(Value::Text("bold".into())));
+    }
+
+    #[test]
+    fn parse_font_weight_bold_sets_weight() {
+        let v = root_prop(r#"Text("Hi").fontWeight(.bold)"#, "weight");
+        assert_eq!(v, Some(Value::Text("bold".into())));
+    }
+
+    #[test]
+    fn parse_italic_sets_italic() {
+        let v = root_prop(r#"Text("Hi").italic()"#, "italic");
+        assert_eq!(v, Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_frame_max_width_infinity_sets_grow() {
+        let v = root_prop(r#"Text("Hi").frame(maxWidth: .infinity)"#, "grow");
+        assert_eq!(v, Some(Value::Float(1.0)));
+    }
+
+    // ── S1: unsupported telemetry for a deliberately-unknown modifier ─────────
+
+    #[test]
+    fn unknown_modifier_among_supported_is_reported() {
+        // `.blur(radius: 3)` is deliberately unknown; the surrounding supported
+        // modifiers (`.bold()`, `.italic()`) must NOT be reported.
+        let report = parse_with_report(r#"Text("Hi").bold().blur(radius: 3).italic()"#).unwrap();
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].text, "modifier .blur");
+        // The supported props still landed.
+        let root = report.document.root().unwrap();
+        let node = report.document.get(root).unwrap();
+        assert_eq!(node.props.get("weight"), Some(&Value::Text("bold".into())));
+        assert_eq!(node.props.get("italic"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn unknown_property_modifier_is_reported() {
+        // A parenthesis-less unknown like `.redacted` is captured, not dropped.
+        let report = parse_with_report(r#"Text("Hi").redacted"#).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "modifier .redacted"));
     }
 }

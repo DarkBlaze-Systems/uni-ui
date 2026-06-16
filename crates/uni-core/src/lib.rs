@@ -77,6 +77,33 @@ fn str_of<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
     }
 }
 
+fn bool_of(node: &Node, key: &str) -> Option<bool> {
+    match node.props.get(key) {
+        Some(Value::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Read a 0..1 float (`Float`/`Int`/`Px` accepted) and clamp it into `[0, 1]`.
+fn unit_of(node: &Node, key: &str) -> Option<f32> {
+    match node.props.get(key) {
+        Some(Value::Float(v)) => Some(*v as f32),
+        Some(Value::Int(v)) => Some(*v as f32),
+        Some(Value::Px(v)) => Some(*v),
+        _ => None,
+    }
+    .map(|v| v.clamp(0.0, 1.0))
+}
+
+/// Scale the alpha byte of a packed `0xRRGGBBAA` color by `factor` (0..1),
+/// leaving RGB untouched. Used by the `opacity` modifier.
+fn scale_alpha(color: u32, factor: f32) -> u32 {
+    let factor = factor.clamp(0.0, 1.0);
+    let a = (color & 0xff) as f32;
+    let scaled = (a * factor).round().clamp(0.0, 255.0) as u32;
+    (color & 0xffffff00) | scaled
+}
+
 /// Is this a flex/grid container kind (as opposed to a drawing leaf)?
 fn is_container(kind: &str) -> bool {
     matches!(kind, "Stack" | "Column" | "Row" | "Grid")
@@ -267,6 +294,19 @@ fn style_for(node: &Node, viewport: (f32, f32), is_root: bool) -> Style {
     // flex_grow: `grow` prop (Int/Float/Px all accepted).
     if let Some(g) = px_of(node, "grow") {
         style.flex_grow = g;
+    }
+
+    // SwiftUI `Spacer`: a flex child that expands to fill the available
+    // main-axis space. With no explicit size and no explicit `grow`, default
+    // its `flex_grow` to 1 so it pushes its siblings apart (and stays auto-
+    // sized so it claims none of its own intrinsic space). A leaf, paints
+    // nothing — handled in `paint`.
+    if node.kind == "Spacer"
+        && style.flex_grow == 0.0
+        && px_of(node, "width").is_none()
+        && px_of(node, "height").is_none()
+    {
+        style.flex_grow = 1.0;
     }
 
     // Absolute positioning: `position: "absolute"` + optional `left`/`top`/
@@ -714,6 +754,10 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
     let (vw, vh) = layout.viewport;
     let root = doc.root();
 
+    // Nodes suppressed by a `hidden` ancestor (the whole subtree is skipped).
+    let mut hidden_subtree: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
+
     for (idx, &id) in layout.order().iter().enumerate() {
         let Some(node) = doc.get(id) else {
             continue;
@@ -723,7 +767,109 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
         };
         let is_root = root == Some(id);
 
+        // `hidden` modifier (Bool true): skip this node AND its whole subtree.
+        // Order is parent-before-child, so marking the children here suppresses
+        // them when we reach them later in the walk.
+        if hidden_subtree.contains(&id) || bool_of(node, "hidden") == Some(true) {
+            let mut stack = vec![id];
+            while let Some(n) = stack.pop() {
+                hidden_subtree.insert(n);
+                if let Some(node) = doc.get(n) {
+                    stack.extend(node.children.iter().copied());
+                }
+            }
+            continue;
+        }
+
+        // `opacity` modifier (Float 0..1): scales the alpha of this node's
+        // painted fill/text. (Subtree-wide opacity would need a layer; v0
+        // scales the node's own primitives, which covers leaves and a
+        // container's own background.)
+        let opacity = unit_of(node, "opacity").unwrap_or(1.0);
+
+        // `shadow` modifier: a soft offset dark rounded rect painted *behind*
+        // the node. `shadow` (Px) or `shadow_radius` give the blur radius;
+        // `shadow_color` overrides the default translucent black.
+        let shadow_radius = px_of(node, "shadow").or_else(|| px_of(node, "shadow_radius"));
+        if let Some(sr) = shadow_radius {
+            if sr > 0.0 {
+                let shadow_color = color_of(node, "shadow_color").unwrap_or(0x00000066);
+                let corner_radius = px_of(node, "corner_radius")
+                    .or_else(|| px_of(node, "radius"))
+                    .unwrap_or(0.0);
+                // Offset down-right by a fraction of the radius, and reuse the
+                // Frost backend's blur to soften the edge.
+                let off = (sr * 0.5).min(8.0);
+                scene.push(DrawCmd::FrostedRect {
+                    x: rect.x + off,
+                    y: rect.y + off,
+                    w: rect.w,
+                    h: rect.h,
+                    corner_radius,
+                    tint: scale_alpha(shadow_color, opacity),
+                    blur_radius: sr,
+                });
+            }
+        }
+
         match node.kind.as_str() {
+            "Spacer" => {
+                // A layout-only flex spacer: claims main-axis space (handled in
+                // `style_for`) but paints nothing.
+            }
+            "Divider" => {
+                // A thin line spanning the node's cross axis. `thickness` (Px)
+                // sets the line weight (default 1px); `color`/`background` give
+                // a subtle ink color (default translucent white).
+                let thickness = px_of(node, "thickness").unwrap_or(1.0).max(0.0);
+                let color = color_of(node, "color")
+                    .or_else(|| color_of(node, "background"))
+                    .unwrap_or(0xffffff26);
+                let color = scale_alpha(color, opacity);
+                // Draw the line along the longer axis of the laid-out rect,
+                // centered on the short axis, with the given thickness.
+                if rect.w >= rect.h {
+                    let y = rect.y + (rect.h - thickness) * 0.5;
+                    scene.push(DrawCmd::FilledRect {
+                        x: rect.x,
+                        y,
+                        w: rect.w,
+                        h: thickness,
+                        color,
+                        corner_radius: 0.0,
+                    });
+                } else {
+                    let x = rect.x + (rect.w - thickness) * 0.5;
+                    scene.push(DrawCmd::FilledRect {
+                        x,
+                        y: rect.y,
+                        w: thickness,
+                        h: rect.h,
+                        color,
+                        corner_radius: 0.0,
+                    });
+                }
+            }
+            "Image" => {
+                // Placeholder box honoring width/height/cornerRadius/background.
+                // Real asset decode (`src`/`content`) lands later; for now we
+                // always render the filled rounded placeholder rect.
+                let color = color_of(node, "background")
+                    .or_else(|| color_of(node, "color"))
+                    .unwrap_or(0xffffff14);
+                let corner_radius = px_of(node, "cornerRadius")
+                    .or_else(|| px_of(node, "corner_radius"))
+                    .or_else(|| px_of(node, "radius"))
+                    .unwrap_or(0.0);
+                scene.push(DrawCmd::FilledRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    color: scale_alpha(color, opacity),
+                    corner_radius,
+                });
+            }
             "Stack" | "Column" | "Row" | "Grid" => {
                 // Container background, painted behind its children.
                 if let Some(color) = color_of(node, "background") {
@@ -738,7 +884,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                             y: 0.0,
                             w: vw,
                             h: vh,
-                            color,
+                            color: scale_alpha(color, opacity),
                             corner_radius: 0.0,
                         });
                     } else {
@@ -747,7 +893,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                             y: rect.y,
                             w: rect.w,
                             h: rect.h,
-                            color,
+                            color: scale_alpha(color, opacity),
                             corner_radius,
                         });
                     }
@@ -763,7 +909,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     y: rect.y,
                     w: rect.w,
                     h: rect.h,
-                    color,
+                    color: scale_alpha(color, opacity),
                     corner_radius,
                 });
             }
@@ -783,7 +929,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     w: rect.w,
                     h: rect.h,
                     corner_radius,
-                    tint,
+                    tint: scale_alpha(tint, opacity),
                     blur_radius,
                 });
             }
@@ -796,7 +942,7 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     y: rect.y,
                     content,
                     size,
-                    color,
+                    color: scale_alpha(color, opacity),
                 });
             }
             _ => {}
@@ -1295,6 +1441,225 @@ mod tests {
         set_root(&mut doc, col_root);
         let col = layout_with_measure(&doc, (1000.0, 1000.0), &Fixed);
         assert_eq!(col.rect(t2).unwrap().h, 33.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiftUI-equivalent views + modifiers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spacer_grows_to_fill_main_axis() {
+        // A Row: [fixed 100px Rect][Spacer][fixed 100px Rect] in a 400px row.
+        // The Spacer should expand to the 200px gap, pushing the second rect
+        // to the far end — SwiftUI `Spacer()` behavior.
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Row");
+        set_root(&mut doc, root);
+
+        let a = node(&mut doc, "Rect");
+        prop(&mut doc, a, "width", Value::Px(100.0));
+        prop(&mut doc, a, "height", Value::Px(40.0));
+        child(&mut doc, root, a);
+
+        let spacer = node(&mut doc, "Spacer");
+        child(&mut doc, root, spacer);
+
+        let b = node(&mut doc, "Rect");
+        prop(&mut doc, b, "width", Value::Px(100.0));
+        prop(&mut doc, b, "height", Value::Px(40.0));
+        child(&mut doc, root, b);
+
+        let l = layout(&doc, (400.0, 100.0));
+        let sr = l.rect(spacer).unwrap();
+        let br = l.rect(b).unwrap();
+        // Spacer fills the 400 - 100 - 100 = 200px gap.
+        assert!((sr.w - 200.0).abs() < 0.5, "spacer width {}", sr.w);
+        // Second rect pushed to the far end.
+        assert!((br.x - 300.0).abs() < 0.5, "b x {}", br.x);
+        // Spacer paints nothing.
+        let scene = paint(&doc, &l);
+        // Two rects, no command at the spacer's position.
+        assert_eq!(
+            scene
+                .iter()
+                .filter(|c| matches!(c, DrawCmd::FilledRect { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn divider_paints_a_thin_line() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Column");
+        set_root(&mut doc, root);
+
+        let d = node(&mut doc, "Divider");
+        prop(&mut doc, d, "width", Value::Px(200.0));
+        prop(&mut doc, d, "thickness", Value::Px(2.0));
+        prop(&mut doc, d, "color", Value::Color(0x808080ff));
+        child(&mut doc, root, d);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        let line = scene
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::FilledRect {
+                    w,
+                    h,
+                    color,
+                    corner_radius,
+                    ..
+                } => Some((*w, *h, *color, *corner_radius)),
+                _ => None,
+            })
+            .expect("divider emits a filled rect line");
+        // Thin line: thickness 2px tall, spanning the 200px width.
+        assert_eq!(line.1, 2.0, "thickness");
+        assert_eq!(line.0, 200.0, "spans cross axis width");
+        assert_eq!(line.2, 0x808080ff, "ink color");
+        assert_eq!(line.3, 0.0, "line has no rounding");
+    }
+
+    #[test]
+    fn image_renders_rounded_placeholder() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        let img = node(&mut doc, "Image");
+        prop(&mut doc, img, "width", Value::Px(64.0));
+        prop(&mut doc, img, "height", Value::Px(64.0));
+        prop(&mut doc, img, "cornerRadius", Value::Px(12.0));
+        prop(&mut doc, img, "background", Value::Color(0x223344ff));
+        // A src present — should still just paint the placeholder box.
+        prop(&mut doc, img, "src", Value::Text("logo.png".into()));
+        child(&mut doc, root, img);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        let placeholder = scene
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::FilledRect {
+                    w,
+                    h,
+                    color,
+                    corner_radius,
+                    ..
+                } if *w == 64.0 => Some((*h, *color, *corner_radius)),
+                _ => None,
+            })
+            .expect("image emits a placeholder rect");
+        assert_eq!(placeholder.0, 64.0, "height");
+        assert_eq!(placeholder.1, 0x223344ff, "background");
+        assert_eq!(placeholder.2, 12.0, "cornerRadius honored");
+    }
+
+    #[test]
+    fn opacity_modifier_reduces_alpha() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        let r = node(&mut doc, "Rect");
+        prop(&mut doc, r, "width", Value::Px(50.0));
+        prop(&mut doc, r, "height", Value::Px(50.0));
+        // Fully-opaque red, at 50% opacity → alpha halved.
+        prop(&mut doc, r, "color", Value::Color(0xff0000ff));
+        prop(&mut doc, r, "opacity", Value::Float(0.5));
+        child(&mut doc, root, r);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        let rect = scene
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::FilledRect { w, color, .. } if *w == 50.0 => Some(*color),
+                _ => None,
+            })
+            .expect("rect present");
+        // RGB preserved; alpha 0xff scaled by 0.5 → ~0x80 (127.5 rounds to 128).
+        assert_eq!(rect & 0xffffff00, 0xff000000, "rgb preserved");
+        let alpha = rect & 0xff;
+        assert!(alpha < 0xff, "alpha reduced, got {alpha:#x}");
+        assert_eq!(alpha, 128, "0xff * 0.5 → 128");
+    }
+
+    #[test]
+    fn hidden_modifier_omits_node_and_subtree() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Column");
+        set_root(&mut doc, root);
+
+        // A visible rect.
+        let visible = node(&mut doc, "Rect");
+        prop(&mut doc, visible, "width", Value::Px(30.0));
+        prop(&mut doc, visible, "height", Value::Px(30.0));
+        prop(&mut doc, visible, "color", Value::Color(0x00ff00ff));
+        child(&mut doc, root, visible);
+
+        // A hidden subtree: a Stack with a child rect, both must be omitted.
+        let hidden_box = node(&mut doc, "Stack");
+        prop(&mut doc, hidden_box, "hidden", Value::Bool(true));
+        prop(&mut doc, hidden_box, "background", Value::Color(0xff0000ff));
+        child(&mut doc, root, hidden_box);
+        let inner = node(&mut doc, "Rect");
+        prop(&mut doc, inner, "width", Value::Px(40.0));
+        prop(&mut doc, inner, "height", Value::Px(40.0));
+        prop(&mut doc, inner, "color", Value::Color(0x0000ffff));
+        child(&mut doc, hidden_box, inner);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        // Only the visible green rect survives — neither the hidden Stack's
+        // background nor its inner blue rect is painted.
+        assert!(
+            scene
+                .iter()
+                .any(|c| matches!(c, DrawCmd::FilledRect { color: 0x00ff00ff, .. })),
+            "visible rect painted"
+        );
+        assert!(
+            !scene
+                .iter()
+                .any(|c| matches!(c, DrawCmd::FilledRect { color: 0xff0000ff, .. })),
+            "hidden node's background omitted"
+        );
+        assert!(
+            !scene
+                .iter()
+                .any(|c| matches!(c, DrawCmd::FilledRect { color: 0x0000ffff, .. })),
+            "hidden node's subtree omitted"
+        );
+    }
+
+    #[test]
+    fn shadow_modifier_paints_behind_node() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        let r = node(&mut doc, "Rect");
+        prop(&mut doc, r, "width", Value::Px(60.0));
+        prop(&mut doc, r, "height", Value::Px(60.0));
+        prop(&mut doc, r, "color", Value::Color(0xffffffff));
+        prop(&mut doc, r, "shadow", Value::Px(10.0));
+        child(&mut doc, root, r);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        // The shadow is a soft (frosted) rect painted BEFORE the rect's fill.
+        let shadow_idx = scene
+            .iter()
+            .position(|c| matches!(c, DrawCmd::FrostedRect { .. }))
+            .expect("shadow frosted rect present");
+        let rect_idx = scene
+            .iter()
+            .position(|c| matches!(c, DrawCmd::FilledRect { color: 0xffffffff, w: 60.0, .. }))
+            .expect("rect fill present");
+        assert!(shadow_idx < rect_idx, "shadow paints behind the node");
+        // Shadow carries the requested blur radius.
+        match &scene[shadow_idx] {
+            DrawCmd::FrostedRect { blur_radius, .. } => assert_eq!(*blur_radius, 10.0),
+            _ => unreachable!(),
+        }
     }
 
     #[cfg(feature = "real-text")]

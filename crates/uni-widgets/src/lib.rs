@@ -1111,6 +1111,357 @@ pub fn tooltip(doc: &mut Document, tokens: &Tokens, text: &str, visible_key: &st
     root
 }
 
+// ---------------------------------------------------------------------------
+// spacer — SwiftUI `Spacer`
+// ---------------------------------------------------------------------------
+
+/// A flexible, empty gap that pushes siblings apart.
+///
+/// Mirrors SwiftUI's `Spacer`: a `Spacer` leaf carrying `grow: 1.0` so that in
+/// a flex container (`Row` / `Column`) it expands to consume the free space,
+/// shoving the nodes on either side to the ends. It paints nothing and holds no
+/// children. Returns the `Spacer` id.
+pub fn spacer(doc: &mut Document) -> NodeId {
+    let s = create(doc, "Spacer");
+    prop(doc, s, "grow", Value::Float(1.0));
+    s
+}
+
+// ---------------------------------------------------------------------------
+// divider — SwiftUI `Divider`
+// ---------------------------------------------------------------------------
+
+/// A thin separating rule painted in the faint ink color.
+///
+/// Mirrors SwiftUI's `Divider`: a `Divider` leaf one pixel thick (`thickness`)
+/// tinted with `tokens.palette.ink_faint` so it reads as a hairline against the
+/// substrate without competing with content. Returns the `Divider` id.
+pub fn divider(doc: &mut Document, tokens: &Tokens) -> NodeId {
+    let d = create(doc, "Divider");
+    prop(doc, d, "thickness", Value::Px(1.0));
+    prop(doc, d, "color", Value::Color(tokens.palette.ink_faint));
+    d
+}
+
+// ---------------------------------------------------------------------------
+// image — SwiftUI `Image`
+// ---------------------------------------------------------------------------
+
+/// A fixed-size image referencing a source by name/path.
+///
+/// Mirrors SwiftUI's `Image`: an `Image` leaf carrying its `src`, an explicit
+/// `width`/`height`, and a `corner_radius` from the shape scale so it clips to
+/// the house rounding. The renderer is responsible for fetching and painting
+/// `src`; this builder establishes the IR node and its box. Returns the
+/// `Image` id.
+pub fn image(doc: &mut Document, tokens: &Tokens, src: &str, w: f32, h: f32) -> NodeId {
+    let img = create(doc, "Image");
+    prop(doc, img, "src", Value::Text(src.into()));
+    prop(doc, img, "width", Value::Px(w));
+    prop(doc, img, "height", Value::Px(h));
+    prop(doc, img, "corner_radius", Value::Px(tokens.shape.small));
+    img
+}
+
+// ---------------------------------------------------------------------------
+// toggle — SwiftUI `Toggle`
+// ---------------------------------------------------------------------------
+
+/// A labelled switch-style toggle bound to `state_key`.
+///
+/// Mirrors SwiftUI's `Toggle`: presented as a `Row` **container** holding a
+/// caption beside a switch. The switch is a pill-shaped `Rect` (large corner
+/// radius) painted in accent, whose on/off `checked` state is bound to
+/// `state_key`, with a circular `Rect` thumb riding inside it. Like
+/// [`checkbox`], clicking fires `toggle(state_key)`, but it presents as a
+/// switch, not a box. Returns the `Row` id.
+pub fn toggle(doc: &mut Document, tokens: &Tokens, label_text: &str, state_key: &str) -> NodeId {
+    let row = create(doc, "Row");
+    prop(doc, row, "gap", Value::Px(tokens.space.snug));
+    prop(doc, row, "align", Value::Text("center".into()));
+    prop(doc, row, "justify", Value::Text("between".into()));
+    callback(
+        doc,
+        row,
+        "click",
+        Action {
+            name: "toggle".into(),
+            args: vec![Value::Text(state_key.into())],
+        },
+    );
+
+    // The caption sits first, the switch trails (SwiftUI label-leading layout).
+    let caption = label(doc, tokens, label_text, false);
+    append(doc, row, caption);
+
+    // The switch track: a pill-shaped Rect whose on/off state is bound.
+    let track = create(doc, "Rect");
+    let track_w = tokens.space.comfy * 2.0;
+    let track_h = tokens.space.comfy;
+    prop(doc, track, "width", Value::Px(track_w));
+    prop(doc, track, "height", Value::Px(track_h));
+    // Pill: corner radius half the height fully rounds the ends.
+    prop(doc, track, "corner_radius", Value::Px(track_h / 2.0));
+    prop(doc, track, "color", Value::Color(tokens.palette.accent));
+    prop(doc, track, "role", Value::Text("switch".into()));
+    binding(doc, track, "checked", state_key);
+
+    // The thumb: a circular knob riding inside the track, bound to the same key.
+    let thumb = create(doc, "Rect");
+    let thumb_side = track_h - tokens.space.tight;
+    prop(doc, thumb, "width", Value::Px(thumb_side));
+    prop(doc, thumb, "height", Value::Px(thumb_side));
+    prop(doc, thumb, "corner_radius", Value::Px(thumb_side / 2.0));
+    prop(doc, thumb, "color", Value::Color(tokens.palette.substrate));
+    binding(doc, thumb, "checked", state_key);
+    append(doc, track, thumb);
+
+    append(doc, row, track);
+    row
+}
+
+// ---------------------------------------------------------------------------
+// slider — SwiftUI `Slider`
+// ---------------------------------------------------------------------------
+
+/// A horizontal slider: a track with a thumb at the bound value.
+///
+/// Mirrors SwiftUI's `Slider`: a `Row` **container** holding a track (`Rect`,
+/// pill-rounded, faint ink) with a thumb (`Rect`, accent, circular) composed
+/// over it. The thumb's position is bound to `value_key`, and the `min`/`max`
+/// bounds are recorded as props so the runtime can map value → x-offset. A
+/// `"change"` callback fires `slider_set(value_key)`. Returns the `Row` id.
+pub fn slider(doc: &mut Document, tokens: &Tokens, value_key: &str, min: f32, max: f32) -> NodeId {
+    let row = create(doc, "Row");
+    prop(doc, row, "align", Value::Text("center".into()));
+    prop(doc, row, "min", Value::Px(min));
+    prop(doc, row, "max", Value::Px(max));
+    prop(doc, row, "role", Value::Text("slider".into()));
+    binding(doc, row, "value", value_key);
+    callback(
+        doc,
+        row,
+        "change",
+        Action {
+            name: "slider_set".into(),
+            args: vec![Value::Text(value_key.into())],
+        },
+    );
+
+    // The track: a flat pill-rounded Rect filling the slider width.
+    let track = create(doc, "Rect");
+    let track_h = tokens.space.snug;
+    prop(doc, track, "width", Value::Px(160.0));
+    prop(doc, track, "height", Value::Px(track_h));
+    prop(doc, track, "corner_radius", Value::Px(track_h / 2.0));
+    prop(doc, track, "color", Value::Color(tokens.palette.ink_faint));
+    append(doc, row, track);
+
+    // The thumb: a circular accent knob whose position honors the bound value.
+    let thumb = create(doc, "Rect");
+    let thumb_side = tokens.space.comfy;
+    prop(doc, thumb, "width", Value::Px(thumb_side));
+    prop(doc, thumb, "height", Value::Px(thumb_side));
+    prop(doc, thumb, "corner_radius", Value::Px(thumb_side / 2.0));
+    prop(doc, thumb, "color", Value::Color(tokens.palette.accent));
+    // Bind the thumb's offset to the value so the runtime can place it.
+    binding(doc, thumb, "value", value_key);
+    append(doc, row, thumb);
+
+    row
+}
+
+// ---------------------------------------------------------------------------
+// progress_view — SwiftUI `ProgressView` (determinate)
+// ---------------------------------------------------------------------------
+
+/// A determinate progress bar whose fill proportion is bound to `value_key`.
+///
+/// Mirrors SwiftUI's determinate `ProgressView`: a `Stack` **container** acting
+/// as the track (pill-rounded, faint ink) over which a filled `Rect` (accent)
+/// is laid. The fill's `value` is bound to `value_key` (a `0.0..=1.0`
+/// fraction) so the runtime sizes its width as that proportion of the track.
+/// Returns the `Stack` (track) id.
+pub fn progress_view(doc: &mut Document, tokens: &Tokens, value_key: &str) -> NodeId {
+    let track = create(doc, "Stack");
+    let h = tokens.space.snug;
+    prop(doc, track, "width", Value::Px(160.0));
+    prop(doc, track, "height", Value::Px(h));
+    prop(doc, track, "corner_radius", Value::Px(h / 2.0));
+    prop(doc, track, "color", Value::Color(tokens.palette.ink_faint));
+    prop(doc, track, "role", Value::Text("progress".into()));
+
+    // The fill: an accent Rect whose width proportion is the bound value.
+    let fill = create(doc, "Rect");
+    prop(doc, fill, "height", Value::Px(h));
+    prop(doc, fill, "corner_radius", Value::Px(h / 2.0));
+    prop(doc, fill, "color", Value::Color(tokens.palette.accent));
+    // Bind the proportion (0..=1) the runtime maps to the fill's width.
+    binding(doc, fill, "value", value_key);
+    append(doc, track, fill);
+
+    track
+}
+
+#[cfg(test)]
+mod swiftui_control_tests {
+    use super::*;
+    use uni_tokens::{Tokens, Variant};
+
+    fn toks() -> Tokens {
+        Tokens::for_variant(Variant::Internal)
+    }
+
+    #[test]
+    fn spacer_is_a_growing_empty_leaf() {
+        let mut doc = Document::new();
+        let s = spacer(&mut doc);
+        let n = doc.get(s).unwrap();
+        assert_eq!(n.kind, "Spacer");
+        // Grows to consume free space; paints nothing and holds no children.
+        assert_eq!(n.props.get("grow"), Some(&Value::Float(1.0)));
+        assert!(n.children.is_empty());
+    }
+
+    #[test]
+    fn divider_is_a_thin_faint_rule() {
+        let mut doc = Document::new();
+        let t = toks();
+        let d = divider(&mut doc, &t);
+        let n = doc.get(d).unwrap();
+        assert_eq!(n.kind, "Divider");
+        // Hairline thickness, faint-ink tint.
+        assert_eq!(n.props.get("thickness"), Some(&Value::Px(1.0)));
+        assert_eq!(
+            n.props.get("color"),
+            Some(&Value::Color(t.palette.ink_faint))
+        );
+        assert!(n.children.is_empty());
+    }
+
+    #[test]
+    fn image_carries_src_size_and_corner_radius() {
+        let mut doc = Document::new();
+        let t = toks();
+        let img = image(&mut doc, &t, "logo.png", 120.0, 80.0);
+        let n = doc.get(img).unwrap();
+        assert_eq!(n.kind, "Image");
+        assert_eq!(n.props.get("src"), Some(&Value::Text("logo.png".into())));
+        assert_eq!(n.props.get("width"), Some(&Value::Px(120.0)));
+        assert_eq!(n.props.get("height"), Some(&Value::Px(80.0)));
+        assert_eq!(
+            n.props.get("corner_radius"),
+            Some(&Value::Px(t.shape.small))
+        );
+    }
+
+    #[test]
+    fn toggle_is_a_switch_bound_to_state_key() {
+        let mut doc = Document::new();
+        let t = toks();
+        let tg = toggle(&mut doc, &t, "Wi-Fi", "settings.wifi");
+
+        let row = doc.get(tg).unwrap();
+        assert_eq!(row.kind, "Row");
+
+        // toggle(state_key) on click — same intent as checkbox.
+        let click = row.callbacks.get("click").expect("click callback");
+        assert_eq!(click.name, "toggle");
+        assert_eq!(click.args, vec![Value::Text("settings.wifi".into())]);
+
+        // Caption first, then the switch track.
+        assert_eq!(row.children.len(), 2);
+        let caption = doc.get(row.children[0]).unwrap();
+        assert_eq!(caption.kind, "Text");
+        assert_eq!(
+            caption.props.get("content"),
+            Some(&Value::Text("Wi-Fi".into()))
+        );
+
+        // The track is a switch-role Rect bound to the state key.
+        let track = doc.get(row.children[1]).unwrap();
+        assert_eq!(track.kind, "Rect");
+        assert_eq!(track.props.get("role"), Some(&Value::Text("switch".into())));
+        assert_eq!(
+            track.bindings.get("checked"),
+            Some(&Binding {
+                expr: "settings.wifi".into()
+            })
+        );
+
+        // It has a thumb child also bound to the state key.
+        assert_eq!(track.children.len(), 1);
+        let thumb = doc.get(track.children[0]).unwrap();
+        assert_eq!(thumb.kind, "Rect");
+        assert!(thumb.bindings.contains_key("checked"));
+    }
+
+    #[test]
+    fn slider_track_and_thumb_honor_bound_value() {
+        let mut doc = Document::new();
+        let t = toks();
+        let s = slider(&mut doc, &t, "volume", 0.0, 100.0);
+
+        let row = doc.get(s).unwrap();
+        assert_eq!(row.kind, "Row");
+        // Bounds recorded as props; value bound to the key.
+        assert_eq!(row.props.get("min"), Some(&Value::Px(0.0)));
+        assert_eq!(row.props.get("max"), Some(&Value::Px(100.0)));
+        assert_eq!(
+            row.bindings.get("value"),
+            Some(&Binding {
+                expr: "volume".into()
+            })
+        );
+        // change → slider_set(value_key).
+        let change = row.callbacks.get("change").expect("change callback");
+        assert_eq!(change.name, "slider_set");
+        assert_eq!(change.args, vec![Value::Text("volume".into())]);
+
+        // Track then thumb; the thumb's position is bound to the value.
+        assert_eq!(row.children.len(), 2);
+        let track = doc.get(row.children[0]).unwrap();
+        assert_eq!(track.kind, "Rect");
+        let thumb = doc.get(row.children[1]).unwrap();
+        assert_eq!(thumb.kind, "Rect");
+        assert_eq!(
+            thumb.bindings.get("value"),
+            Some(&Binding {
+                expr: "volume".into()
+            })
+        );
+        assert_eq!(thumb.props.get("color"), Some(&Value::Color(t.palette.accent)));
+    }
+
+    #[test]
+    fn progress_view_fill_proportion_is_bound() {
+        let mut doc = Document::new();
+        let t = toks();
+        let p = progress_view(&mut doc, &t, "download.progress");
+
+        let track = doc.get(p).unwrap();
+        assert_eq!(track.kind, "Stack");
+        assert_eq!(track.props.get("role"), Some(&Value::Text("progress".into())));
+        // Track is faint; it has exactly one fill child.
+        assert_eq!(
+            track.props.get("color"),
+            Some(&Value::Color(t.palette.ink_faint))
+        );
+        assert_eq!(track.children.len(), 1);
+
+        // The fill is an accent Rect whose value (proportion) is bound.
+        let fill = doc.get(track.children[0]).unwrap();
+        assert_eq!(fill.kind, "Rect");
+        assert_eq!(fill.props.get("color"), Some(&Value::Color(t.palette.accent)));
+        assert_eq!(
+            fill.bindings.get("value"),
+            Some(&Binding {
+                expr: "download.progress".into()
+            })
+        );
+    }
+}
+
 #[cfg(test)]
 mod scroll_input_tests {
     use super::*;
