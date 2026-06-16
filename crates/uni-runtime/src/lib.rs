@@ -151,6 +151,12 @@ pub struct Runtime {
     /// nodes each relayout and lets taffy skip clean subtrees. See
     /// [`uni_core::LayoutCache`].
     layout_cache: LayoutCache,
+    /// **Navigation stack.** An ordered list of route keys; the last element is
+    /// the *current* route. [`Runtime::navigate`] pushes, [`Runtime::back`]
+    /// pops. The bottom route is never popped, so there is always somewhere to
+    /// be. Drives screen/destination selection in a router-style UI; both edits
+    /// ride the same audited action path (see [`Runtime::navigate`]).
+    nav_stack: Vec<String>,
 }
 
 impl Runtime {
@@ -173,6 +179,7 @@ impl Runtime {
             dirty: BTreeSet::new(),
             audit_cursor: 0,
             layout_cache: LayoutCache::new(),
+            nav_stack: Vec::new(),
         };
         // Push any state already present into the bound props, then lay out, so
         // the very first frame reflects the store (not just literal defaults).
@@ -554,6 +561,121 @@ impl Runtime {
     /// Returns `true` if a handler ran.
     pub fn invoke(&mut self, node: NodeId, event: &str, origin: Origin) -> bool {
         self.dispatch(node, event, origin)
+    }
+
+    // -- navigation + presentation state (over Store + the audited path) ------
+
+    /// The current route — the top of the navigation stack — or `None` when the
+    /// stack is empty (nothing has been navigated to yet).
+    ///
+    /// The route stack is plain presentation state: a `Vec<String>` of route
+    /// keys threaded through the same audited action path as everything else
+    /// (see [`Runtime::navigate`]). A router-style UI reads this to pick which
+    /// screen/destination to show.
+    pub fn route(&self) -> Option<&str> {
+        self.nav_stack.last().map(String::as_str)
+    }
+
+    /// The whole navigation stack, bottom → top (the top is the current route).
+    pub fn nav_stack(&self) -> &[String] {
+        &self.nav_stack
+    }
+
+    /// **Push a route onto the navigation stack with an explicit [`Origin`].**
+    ///
+    /// This is the navigation primitive both a human tap and an AI drive funnel
+    /// through. It records an audited [`Mutation::Invoke`] on the document root —
+    /// tagged with `origin`, exactly like a fired callback — *before* mutating
+    /// the route stack, so every navigation is attributable in
+    /// [`Document::audit_log`]. The audited event encodes the destination as
+    /// `"navigate:<route>"`. It also mirrors the current route into the [`Store`]
+    /// under the `"route"` key, so a binding to `$route` reflects the destination
+    /// on the next [`sync_bindings`](Runtime::sync_bindings).
+    ///
+    /// Returns `true` (a navigation always takes effect).
+    pub fn navigate(&mut self, route: impl Into<String>, origin: Origin) -> bool {
+        let route = route.into();
+        // Audited anchor: the same Invoke surface human input rides, so a
+        // navigation is attributable to Human or Ai in the log. The event string
+        // carries the destination.
+        self.record_nav_invoke(format!("navigate:{route}"), origin);
+        self.nav_stack.push(route.clone());
+        self.store.set("route", uni_ir::Value::Text(route));
+        self.sync_bindings();
+        self.relayout();
+        true
+    }
+
+    /// **Pop the current route off the navigation stack with an explicit
+    /// [`Origin`].**
+    ///
+    /// The inverse of [`navigate`](Runtime::navigate): records an audited
+    /// `"back"` [`Mutation::Invoke`] on the root (tagged with `origin`), then
+    /// pops the top route and re-mirrors the now-current route into the
+    /// [`Store`]'s `"route"` key. Returns `true` if a route was popped, `false`
+    /// when the stack was already empty (nothing to go back to).
+    pub fn back(&mut self, origin: Origin) -> bool {
+        if self.nav_stack.is_empty() {
+            return false;
+        }
+        self.record_nav_invoke("back".to_string(), origin);
+        self.nav_stack.pop();
+        match self.nav_stack.last() {
+            Some(route) => self.store.set("route", uni_ir::Value::Text(route.clone())),
+            None => self.store.set("route", uni_ir::Value::Text(String::new())),
+        }
+        self.sync_bindings();
+        self.relayout();
+        true
+    }
+
+    /// **Present a Sheet/Alert/Popover bound to `key`.**
+    ///
+    /// Sets the [`Store`] key to `Value::Bool(true)` through the same audited
+    /// action path (recording a `"present"` [`Mutation::Invoke`] on the root,
+    /// tagged `origin`), then syncs bindings + relays out so a node whose
+    /// `presented` (or any `$key`-bound bool prop) reflects the new state on the
+    /// next paint. Returns `true`.
+    pub fn present(&mut self, key: impl Into<String>, origin: Origin) -> bool {
+        self.set_presented(key.into(), true, "present", origin)
+    }
+
+    /// **Dismiss the Sheet/Alert/Popover bound to `key`.**
+    ///
+    /// The inverse of [`present`](Runtime::present): clears the [`Store`] key to
+    /// `Value::Bool(false)` through the audited path (a `"dismiss"`
+    /// [`Mutation::Invoke`] on the root, tagged `origin`). Returns `true`.
+    pub fn dismiss(&mut self, key: impl Into<String>, origin: Origin) -> bool {
+        self.set_presented(key.into(), false, "dismiss", origin)
+    }
+
+    /// True when the presentation key is currently set to `Bool(true)` in the
+    /// store (i.e. the bound Sheet/Alert/Popover is showing).
+    pub fn is_presented(&self, key: &str) -> bool {
+        matches!(self.store.get(key), Some(uni_ir::Value::Bool(true)))
+    }
+
+    /// Shared core for [`present`](Runtime::present) / [`dismiss`](Runtime::dismiss):
+    /// record an audited Invoke on the root naming the action + key, flip the
+    /// bound store bool, then sync + relayout so a bound node reflects it.
+    fn set_presented(&mut self, key: String, value: bool, action: &str, origin: Origin) -> bool {
+        self.record_nav_invoke(format!("{action}:{key}"), origin);
+        self.store.set(key, uni_ir::Value::Bool(value));
+        self.sync_bindings();
+        self.relayout();
+        true
+    }
+
+    /// Record an audited [`Mutation::Invoke`] on the document root carrying
+    /// `event` and tagged with `origin` — the shared accountability anchor for
+    /// navigation and presentation state changes. Mirrors the same audited
+    /// fire() surface human input rides; no-op only when the doc has no root.
+    fn record_nav_invoke(&mut self, event: String, origin: Origin) {
+        if let Some(root) = self.doc.root() {
+            let _ = self
+                .doc
+                .apply_from(origin, Mutation::Invoke { id: root, event });
+        }
     }
 
     // -- windowed entry point -------------------------------------------------
@@ -1667,6 +1789,89 @@ mod tests {
         assert!(activated, "Enter on a focused node should return true");
         assert_eq!(*hit0.borrow(), 1, "hit_0 handler should have fired once");
         assert_eq!(*hit1.borrow(), 0, "hit_1 should not have fired");
+    }
+
+    // -----------------------------------------------------------------------
+    // Navigation + presentation state (over Store + the audited action path)
+    // -----------------------------------------------------------------------
+
+    /// `navigate` pushes a route (observable via `route()`/`nav_stack()`) and
+    /// `back` pops it — the route stack behaves like a navigation stack, and
+    /// each edit lands an audited Invoke in the log.
+    #[test]
+    fn navigate_pushes_and_back_pops() {
+        let mut rt = counter_runtime();
+
+        // Empty to start.
+        assert_eq!(rt.route(), None);
+        assert!(rt.nav_stack().is_empty());
+
+        // Push two routes (Human, then Ai — both ride the audited path).
+        assert!(rt.navigate("home", Origin::Human));
+        assert_eq!(rt.route(), Some("home"));
+        assert!(rt.navigate("details", Origin::Ai));
+        assert_eq!(rt.route(), Some("details"));
+        assert_eq!(rt.nav_stack(), &["home".to_string(), "details".to_string()]);
+
+        // The current route is mirrored into the store for $route bindings.
+        assert_eq!(rt.store().get("route"), Some(Value::Text("details".into())));
+
+        // back() pops the top → the previous route is current again.
+        assert!(rt.back(Origin::Human));
+        assert_eq!(rt.route(), Some("home"));
+        assert_eq!(rt.store().get("route"), Some(Value::Text("home".into())));
+
+        // Pop the last one → empty stack, back() now returns false.
+        assert!(rt.back(Origin::Human));
+        assert_eq!(rt.route(), None);
+        assert!(!rt.back(Origin::Human), "nothing left to pop");
+
+        // The navigation edits are attributable in the audit log: one Human +
+        // one Ai navigate Invoke recorded on push (back records its own too).
+        let (human, ai) = rt.invoke_counts();
+        assert!(human >= 1 && ai >= 1, "both origins recorded: {human} H, {ai} A");
+    }
+
+    /// `present(key)` sets the bound bool true, and after `sync_bindings` a
+    /// relayout reflects it on the bound node's prop; `dismiss(key)` clears it.
+    #[test]
+    fn present_sets_bound_key_and_dismiss_clears_it() {
+        // A Stack whose `visible` prop is bound to the `"sheet"` state key — the
+        // Sheet/Alert/Popover show-flag.
+        const UI: &str = r#"
+            Stack {
+              Sheet { visible: $sheet; width: 100px; height: 100px; }
+            }
+        "#;
+        let mut rt = Runtime::from_uni(UI, (400.0, 400.0)).expect("ui parses");
+        let root = rt.doc().root().unwrap();
+        let sheet = rt.doc().get(root).unwrap().children[0];
+
+        // Not presented initially.
+        assert!(!rt.is_presented("sheet"));
+
+        // present() flips the store bool true, syncs it into the bound prop, and
+        // relays out — the bound node's `visible` prop now reads Bool(true).
+        assert!(rt.present("sheet", Origin::Human));
+        assert!(rt.is_presented("sheet"));
+        assert_eq!(
+            rt.doc().get(sheet).unwrap().props.get("visible"),
+            Some(&Value::Bool(true)),
+            "the bound key drove the prop true after a relayout"
+        );
+
+        // dismiss() clears it back to false on the same bound node.
+        assert!(rt.dismiss("sheet", Origin::Ai));
+        assert!(!rt.is_presented("sheet"));
+        assert_eq!(
+            rt.doc().get(sheet).unwrap().props.get("visible"),
+            Some(&Value::Bool(false)),
+            "dismiss cleared the bound prop to false"
+        );
+
+        // Both present + dismiss are audited (one Human, one Ai Invoke at least).
+        let (human, ai) = rt.invoke_counts();
+        assert!(human >= 1 && ai >= 1, "present/dismiss audited: {human} H, {ai} A");
     }
 
     #[test]

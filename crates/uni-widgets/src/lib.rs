@@ -1971,3 +1971,615 @@ mod scroll_input_tests {
         assert_eq!(n.children.len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// navigation_stack — SwiftUI `NavigationStack`
+// ---------------------------------------------------------------------------
+
+/// A navigation container: a titled stack that hosts a pushable content flow.
+///
+/// Mirrors SwiftUI's `NavigationStack`: a `Column` **container** stamped with
+/// `role: "nav"` so the runtime knows it owns a navigation path. Its first
+/// child is a **title bar** slot — a `Row` (`role: "nav-bar"`) carrying an
+/// emphasized title `Text` — beneath which the caller appends the navigable
+/// body (rows, [`navigation_link`]s, etc.). Returns the `Column` (nav root) id.
+pub fn navigation_stack(doc: &mut Document, tokens: &Tokens, title: &str) -> NodeId {
+    let root = create(doc, "Column");
+    prop(doc, root, "role", Value::Text("nav".into()));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
+    prop(doc, root, "gap", Value::Px(tokens.space.snug));
+
+    // The title bar slot: a Row holding the navigation title.
+    let bar = create(doc, "Row");
+    prop(doc, bar, "role", Value::Text("nav-bar".into()));
+    prop(doc, bar, "align", Value::Text("center".into()));
+    prop(doc, bar, "padding", Value::Px(tokens.space.comfy));
+
+    let head = create(doc, "Text");
+    prop(doc, head, "content", Value::Text(title.into()));
+    prop(
+        doc,
+        head,
+        "size",
+        Value::Px(tokens.r#type.scaled(tokens.r#type.title.emphasized.size)),
+    );
+    prop(
+        doc,
+        head,
+        "weight",
+        Value::Int(tokens.r#type.title.emphasized.weight as i64),
+    );
+    prop(doc, head, "color", Value::Color(tokens.palette.ink));
+    append(doc, bar, head);
+
+    append(doc, root, bar);
+    root
+}
+
+// ---------------------------------------------------------------------------
+// navigation_link — SwiftUI `NavigationLink`
+// ---------------------------------------------------------------------------
+
+/// A tappable row that pushes a destination onto the navigation path.
+///
+/// Mirrors SwiftUI's `NavigationLink`: a `Row` **container** (`role: "nav-link"`)
+/// carrying a leading `label` caption and a trailing chevron `Text`. A
+/// `"click"` callback fires `navigate(destination_key)`, so the runtime sets the
+/// active destination to `destination_key` and pushes its view. Returns the
+/// `Row` id.
+pub fn navigation_link(
+    doc: &mut Document,
+    tokens: &Tokens,
+    label_text: &str,
+    destination_key: &str,
+) -> NodeId {
+    let row = create(doc, "Row");
+    prop(doc, row, "role", Value::Text("nav-link".into()));
+    prop(doc, row, "gap", Value::Px(tokens.space.snug));
+    prop(doc, row, "align", Value::Text("center".into()));
+    prop(doc, row, "justify", Value::Text("between".into()));
+    prop(doc, row, "padding", Value::Px(tokens.space.comfy));
+    callback(
+        doc,
+        row,
+        "click",
+        Action {
+            name: "navigate".into(),
+            args: vec![Value::Text(destination_key.into())],
+        },
+    );
+
+    // Leading caption.
+    let caption = label(doc, tokens, label_text, false);
+    append(doc, row, caption);
+
+    // Trailing chevron hinting the push.
+    let chevron = create(doc, "Text");
+    prop(doc, chevron, "content", Value::Text("›".into()));
+    prop(
+        doc,
+        chevron,
+        "size",
+        Value::Px(tokens.r#type.scaled(tokens.r#type.body.emphasized.size)),
+    );
+    prop(doc, chevron, "color", Value::Color(tokens.palette.ink_soft));
+    append(doc, row, chevron);
+
+    row
+}
+
+// ---------------------------------------------------------------------------
+// tab_view — SwiftUI `TabView`
+// ---------------------------------------------------------------------------
+
+/// A tabbed container: a content area above a bottom tab bar.
+///
+/// Mirrors SwiftUI's `TabView` with the default (bottom-bar) style: a `Stack`
+/// **container** (`role: "tab-view"`) whose selected tab index is bound to
+/// `selection_key`. It holds two children — a content area `Stack`
+/// (`role: "tab-content"`, where the caller appends each tab's page) and a
+/// bottom tab bar `Row` (`role: "tab-bar"`) with one tab button per entry in
+/// `tabs`. Each tab button is a `Stack` carrying its title `Text`, a 0-indexed
+/// `index` prop, and a `"select"` callback firing `select_tab(selection_key, i)`.
+/// Returns the outer `Stack` id.
+pub fn tab_view(
+    doc: &mut Document,
+    tokens: &Tokens,
+    tabs: &[&str],
+    selection_key: &str,
+) -> NodeId {
+    let root = create(doc, "Stack");
+    prop(doc, root, "role", Value::Text("tab-view".into()));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
+    binding(doc, root, "selection", selection_key);
+
+    // The content area: where the active tab's page is shown.
+    let content = create(doc, "Stack");
+    prop(doc, content, "role", Value::Text("tab-content".into()));
+    prop(doc, content, "grow", Value::Float(1.0));
+    binding(doc, content, "selection", selection_key);
+    append(doc, root, content);
+
+    // The bottom tab bar: one button per tab.
+    let bar = create(doc, "Row");
+    prop(doc, bar, "role", Value::Text("tab-bar".into()));
+    prop(
+        doc,
+        bar,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
+    prop(doc, bar, "justify", Value::Text("between".into()));
+    prop(doc, bar, "padding", Value::Px(tokens.space.snug));
+    binding(doc, bar, "selection", selection_key);
+
+    for (i, title) in tabs.iter().enumerate() {
+        let btn = create(doc, "Stack");
+        prop(doc, btn, "role", Value::Text("tab".into()));
+        prop(doc, btn, "index", Value::Int(i as i64));
+        prop(doc, btn, "grow", Value::Float(1.0));
+        prop(doc, btn, "align", Value::Text("center".into()));
+        prop(doc, btn, "justify", Value::Text("center".into()));
+        prop(doc, btn, "padding", Value::Px(tokens.space.snug));
+        callback(
+            doc,
+            btn,
+            "select",
+            Action {
+                name: "select_tab".into(),
+                args: vec![Value::Text(selection_key.into()), Value::Int(i as i64)],
+            },
+        );
+
+        let txt = create(doc, "Text");
+        prop(doc, txt, "content", Value::Text((*title).into()));
+        prop(
+            doc,
+            txt,
+            "size",
+            Value::Px(tokens.r#type.scaled(tokens.r#type.caption.base.size)),
+        );
+        prop(doc, txt, "color", Value::Color(tokens.palette.ink));
+        append(doc, btn, txt);
+
+        append(doc, bar, btn);
+    }
+
+    append(doc, root, bar);
+    root
+}
+
+// ---------------------------------------------------------------------------
+// presentation surfaces — sheet / alert / popover / menu
+// ---------------------------------------------------------------------------
+
+/// Shared builder for a gated presentation surface.
+///
+/// Emits a `Stack` **container** stamped `role: <kind>` (one of `Sheet` /
+/// `Alert` / `Popover` / `Menu`), absolutely positioned to overlay the UI and
+/// gated on `presented_key` (bound to `presented`, so the runtime shows it only
+/// while the key is truthy). Behind the card it lays a dimming **scrim** `Rect`
+/// (`role: "scrim"`) that fills the overlay; in front it composes a `card`
+/// surface, returned so the caller can append the surface's content. The
+/// outer overlay `Stack` id is returned.
+fn presentation_surface(
+    doc: &mut Document,
+    tokens: &Tokens,
+    kind: &str,
+    presented_key: &str,
+) -> NodeId {
+    let root = create(doc, "Stack");
+    prop(doc, root, "role", Value::Text(kind.into()));
+    prop(doc, root, "position", Value::Text("absolute".into()));
+    prop(doc, root, "left", Value::Px(0.0));
+    prop(doc, root, "top", Value::Px(0.0));
+    prop(doc, root, "right", Value::Px(0.0));
+    prop(doc, root, "bottom", Value::Px(0.0));
+    prop(doc, root, "align", Value::Text("center".into()));
+    prop(doc, root, "justify", Value::Text("center".into()));
+    // Gate visibility on the presented key.
+    binding(doc, root, "presented", presented_key);
+
+    // The dimming scrim: an absolute Rect covering the overlay, painted in ink.
+    let scrim = create(doc, "Rect");
+    prop(doc, scrim, "role", Value::Text("scrim".into()));
+    prop(doc, scrim, "position", Value::Text("absolute".into()));
+    prop(doc, scrim, "left", Value::Px(0.0));
+    prop(doc, scrim, "top", Value::Px(0.0));
+    prop(doc, scrim, "right", Value::Px(0.0));
+    prop(doc, scrim, "bottom", Value::Px(0.0));
+    prop(doc, scrim, "color", Value::Color(tokens.palette.ink));
+    // A dismiss tap on the scrim closes the surface.
+    callback(
+        doc,
+        scrim,
+        "click",
+        Action {
+            name: "dismiss".into(),
+            args: vec![Value::Text(presented_key.into())],
+        },
+    );
+    append(doc, root, scrim);
+
+    // The presented card surface, composed in front of the scrim.
+    let surface = card(doc, tokens);
+    append(doc, root, surface);
+
+    root
+}
+
+/// A modal sheet surface (kind `Sheet`) gated on `presented_key`.
+///
+/// Mirrors SwiftUI's `.sheet(isPresented:)`: a dimming scrim + a [`card`]
+/// surface, shown only while `presented_key` is truthy. The caller appends the
+/// sheet's content to the surface (the overlay's second child). Returns the
+/// overlay `Stack` id.
+pub fn sheet(doc: &mut Document, tokens: &Tokens, presented_key: &str) -> NodeId {
+    presentation_surface(doc, tokens, "Sheet", presented_key)
+}
+
+/// An alert surface (kind `Alert`) gated on `presented_key`.
+///
+/// Mirrors SwiftUI's `.alert(...)`: a dimming scrim + a [`card`] surface onto
+/// which a `title` (emphasized) and a `message` (body) `Text` are composed, plus
+/// an "OK" dismiss [`button`] firing `dismiss(presented_key)`. Shown only while
+/// `presented_key` is truthy. Returns the overlay `Stack` id.
+pub fn alert(
+    doc: &mut Document,
+    tokens: &Tokens,
+    title: &str,
+    message: &str,
+    presented_key: &str,
+) -> NodeId {
+    let root = presentation_surface(doc, tokens, "Alert", presented_key);
+    // The card surface is the overlay's second child (scrim is first).
+    let surface = doc.get(root).unwrap().children[1];
+
+    // Title (emphasized) and message (body) composed onto the card.
+    let title_lbl = label(doc, tokens, title, true);
+    append(doc, surface, title_lbl);
+    let msg_lbl = label(doc, tokens, message, false);
+    append(doc, surface, msg_lbl);
+
+    // A dismiss button closing the alert.
+    let ok = button(doc, tokens, "OK", "dismiss");
+    // Wire the dismiss to carry the presented key it closes.
+    callback(
+        doc,
+        ok,
+        "click",
+        Action {
+            name: "dismiss".into(),
+            args: vec![Value::Text(presented_key.into())],
+        },
+    );
+    append(doc, surface, ok);
+
+    root
+}
+
+/// A popover surface (kind `Popover`) gated on `presented_key`.
+///
+/// Mirrors SwiftUI's `.popover(isPresented:)`: a dimming scrim + a [`card`]
+/// surface, shown only while `presented_key` is truthy. The caller appends the
+/// popover's content to the surface (the overlay's second child). Returns the
+/// overlay `Stack` id.
+pub fn popover(doc: &mut Document, tokens: &Tokens, presented_key: &str) -> NodeId {
+    presentation_surface(doc, tokens, "Popover", presented_key)
+}
+
+/// A menu surface (kind `Menu`) gated on `presented_key`.
+///
+/// Mirrors SwiftUI's `Menu`: a dimming scrim + a [`card`] surface holding one
+/// tappable row per entry in `items`. Each row (`role: "menu-item"`) carries its
+/// label and a 0-indexed `index` prop, firing `menu_select(presented_key, i)` on
+/// `"click"`. Shown only while `presented_key` is truthy. Returns the overlay
+/// `Stack` id.
+pub fn menu(doc: &mut Document, tokens: &Tokens, items: &[&str], presented_key: &str) -> NodeId {
+    let root = presentation_surface(doc, tokens, "Menu", presented_key);
+    let surface = doc.get(root).unwrap().children[1];
+
+    for (i, item) in items.iter().enumerate() {
+        let mrow = create(doc, "Row");
+        prop(doc, mrow, "role", Value::Text("menu-item".into()));
+        prop(doc, mrow, "index", Value::Int(i as i64));
+        prop(doc, mrow, "align", Value::Text("center".into()));
+        prop(doc, mrow, "padding", Value::Px(tokens.space.snug));
+        callback(
+            doc,
+            mrow,
+            "click",
+            Action {
+                name: "menu_select".into(),
+                args: vec![Value::Text(presented_key.into()), Value::Int(i as i64)],
+            },
+        );
+
+        let caption = label(doc, tokens, item, false);
+        append(doc, mrow, caption);
+
+        append(doc, surface, mrow);
+    }
+
+    root
+}
+
+#[cfg(test)]
+mod navigation_presentation_tests {
+    use super::*;
+    use uni_tokens::{Tokens, Variant};
+
+    fn toks() -> Tokens {
+        Tokens::for_variant(Variant::Internal)
+    }
+
+    fn is_container_kind(kind: &str) -> bool {
+        matches!(kind, "Stack" | "Column" | "Row" | "Grid")
+    }
+
+    #[test]
+    fn navigation_stack_is_a_nav_column_with_a_title_bar() {
+        let mut doc = Document::new();
+        let t = toks();
+        let nav = navigation_stack(&mut doc, &t, "Inbox");
+
+        let node = doc.get(nav).unwrap();
+        assert_eq!(node.kind, "Column");
+        assert!(is_container_kind(&node.kind));
+        // Carries the nav role.
+        assert_eq!(node.props.get("role"), Some(&Value::Text("nav".into())));
+
+        // First child is the title-bar slot carrying the title.
+        let bar = doc.get(node.children[0]).unwrap();
+        assert_eq!(bar.props.get("role"), Some(&Value::Text("nav-bar".into())));
+        let head = doc.get(bar.children[0]).unwrap();
+        assert_eq!(head.kind, "Text");
+        assert_eq!(
+            head.props.get("content"),
+            Some(&Value::Text("Inbox".into()))
+        );
+
+        // Caller can append a navigable body; it nests under the nav root.
+        let body = label(&mut doc, &t, "Row", false);
+        append(&mut doc, nav, body);
+        assert!(doc.get(nav).unwrap().children.contains(&body));
+    }
+
+    #[test]
+    fn navigation_link_fires_navigate_setting_destination() {
+        let mut doc = Document::new();
+        let t = toks();
+        let link = navigation_link(&mut doc, &t, "Settings", "settings.detail");
+
+        let row = doc.get(link).unwrap();
+        assert_eq!(row.kind, "Row");
+        assert!(is_container_kind(&row.kind));
+        assert_eq!(
+            row.props.get("role"),
+            Some(&Value::Text("nav-link".into()))
+        );
+
+        // click → navigate(destination_key).
+        let click = row.callbacks.get("click").expect("click callback");
+        assert_eq!(click.name, "navigate");
+        assert_eq!(click.args, vec![Value::Text("settings.detail".into())]);
+
+        // Leading caption carries the label.
+        let caption = doc.get(row.children[0]).unwrap();
+        assert_eq!(caption.kind, "Text");
+        assert_eq!(
+            caption.props.get("content"),
+            Some(&Value::Text("Settings".into()))
+        );
+    }
+
+    #[test]
+    fn tab_view_has_content_and_a_bound_bottom_tab_bar() {
+        let mut doc = Document::new();
+        let t = toks();
+        let tabs = ["Home", "Search", "Profile"];
+        let tv = tab_view(&mut doc, &t, &tabs, "tab.sel");
+
+        let root = doc.get(tv).unwrap();
+        assert_eq!(root.kind, "Stack");
+        assert!(is_container_kind(&root.kind));
+        assert_eq!(
+            root.props.get("role"),
+            Some(&Value::Text("tab-view".into()))
+        );
+        // Selection is bound on the root.
+        assert_eq!(
+            root.bindings.get("selection"),
+            Some(&Binding {
+                expr: "tab.sel".into()
+            })
+        );
+
+        // Two children: content area, then the bottom tab bar.
+        assert_eq!(root.children.len(), 2);
+        let content = doc.get(root.children[0]).unwrap();
+        assert_eq!(
+            content.props.get("role"),
+            Some(&Value::Text("tab-content".into()))
+        );
+
+        let bar = doc.get(root.children[1]).unwrap();
+        assert_eq!(bar.kind, "Row");
+        assert_eq!(bar.props.get("role"), Some(&Value::Text("tab-bar".into())));
+        assert_eq!(bar.children.len(), tabs.len());
+
+        // Each tab button: index prop + select_tab(selection_key, i) callback.
+        for (i, &btn_id) in bar.children.iter().enumerate() {
+            let btn = doc.get(btn_id).unwrap();
+            assert_eq!(btn.props.get("index"), Some(&Value::Int(i as i64)));
+            let sel = btn.callbacks.get("select").expect("select callback");
+            assert_eq!(sel.name, "select_tab");
+            assert_eq!(
+                sel.args,
+                vec![Value::Text("tab.sel".into()), Value::Int(i as i64)]
+            );
+            let txt = doc.get(btn.children[0]).unwrap();
+            assert_eq!(
+                txt.props.get("content"),
+                Some(&Value::Text(tabs[i].into()))
+            );
+        }
+    }
+
+    #[test]
+    fn sheet_is_a_gated_overlay_with_scrim_and_card() {
+        let mut doc = Document::new();
+        let t = toks();
+        let s = sheet(&mut doc, &t, "show.sheet");
+
+        let root = doc.get(s).unwrap();
+        assert_eq!(root.kind, "Stack");
+        assert_eq!(root.props.get("role"), Some(&Value::Text("Sheet".into())));
+        // Gated on the presented key.
+        assert_eq!(
+            root.bindings.get("presented"),
+            Some(&Binding {
+                expr: "show.sheet".into()
+            })
+        );
+
+        // Scrim first, card surface second.
+        assert_eq!(root.children.len(), 2);
+        let scrim = doc.get(root.children[0]).unwrap();
+        assert_eq!(scrim.kind, "Rect");
+        assert_eq!(
+            scrim.props.get("role"),
+            Some(&Value::Text("scrim".into()))
+        );
+        // The card surface is a container ready for content.
+        let surface = doc.get(root.children[1]).unwrap();
+        assert!(is_container_kind(&surface.kind));
+    }
+
+    #[test]
+    fn alert_composes_title_message_and_dismiss() {
+        let mut doc = Document::new();
+        let t = toks();
+        let a = alert(
+            &mut doc,
+            &t,
+            "Delete file?",
+            "This cannot be undone.",
+            "show.alert",
+        );
+
+        let root = doc.get(a).unwrap();
+        assert_eq!(root.props.get("role"), Some(&Value::Text("Alert".into())));
+        assert_eq!(
+            root.bindings.get("presented"),
+            Some(&Binding {
+                expr: "show.alert".into()
+            })
+        );
+
+        // Surface (child 1) holds title, message, and an OK dismiss button.
+        let surface = doc.get(root.children[1]).unwrap();
+        // frost backdrop + title + message + button.
+        let texts: Vec<String> = surface
+            .children
+            .iter()
+            .filter_map(|&c| {
+                let n = doc.get(c).unwrap();
+                if n.kind == "Text" {
+                    if let Some(Value::Text(s)) = n.props.get("content") {
+                        return Some(s.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+        assert!(texts.contains(&"Delete file?".to_string()));
+        assert!(texts.contains(&"This cannot be undone.".to_string()));
+
+        // The OK button fires dismiss(presented_key).
+        let ok = surface
+            .children
+            .iter()
+            .map(|&c| doc.get(c).unwrap())
+            .find(|n| n.callbacks.get("click").map(|a| a.name.as_str()) == Some("dismiss"))
+            .expect("an OK dismiss button");
+        let click = ok.callbacks.get("click").unwrap();
+        assert_eq!(click.args, vec![Value::Text("show.alert".into())]);
+    }
+
+    #[test]
+    fn popover_is_a_gated_popover_surface() {
+        let mut doc = Document::new();
+        let t = toks();
+        let p = popover(&mut doc, &t, "show.pop");
+
+        let root = doc.get(p).unwrap();
+        assert_eq!(root.props.get("role"), Some(&Value::Text("Popover".into())));
+        assert_eq!(
+            root.bindings.get("presented"),
+            Some(&Binding {
+                expr: "show.pop".into()
+            })
+        );
+        // Scrim + card surface.
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(doc.get(root.children[0]).unwrap().kind, "Rect");
+        assert!(is_container_kind(&doc.get(root.children[1]).unwrap().kind));
+    }
+
+    #[test]
+    fn menu_lists_items_each_firing_menu_select() {
+        let mut doc = Document::new();
+        let t = toks();
+        let items = ["Cut", "Copy", "Paste"];
+        let m = menu(&mut doc, &t, &items, "show.menu");
+
+        let root = doc.get(m).unwrap();
+        assert_eq!(root.props.get("role"), Some(&Value::Text("Menu".into())));
+        assert_eq!(
+            root.bindings.get("presented"),
+            Some(&Binding {
+                expr: "show.menu".into()
+            })
+        );
+
+        // Surface (child 1) holds the frost backdrop + one row per item.
+        let surface = doc.get(root.children[1]).unwrap();
+        let menu_rows: Vec<NodeId> = surface
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| {
+                doc.get(c).unwrap().props.get("role") == Some(&Value::Text("menu-item".into()))
+            })
+            .collect();
+        assert_eq!(menu_rows.len(), items.len());
+
+        for (i, &row_id) in menu_rows.iter().enumerate() {
+            let row = doc.get(row_id).unwrap();
+            assert_eq!(row.props.get("index"), Some(&Value::Int(i as i64)));
+            let click = row.callbacks.get("click").expect("menu-item click");
+            assert_eq!(click.name, "menu_select");
+            assert_eq!(
+                click.args,
+                vec![Value::Text("show.menu".into()), Value::Int(i as i64)]
+            );
+            // The row carries its label text.
+            let caption = doc.get(row.children[0]).unwrap();
+            assert_eq!(
+                caption.props.get("content"),
+                Some(&Value::Text(items[i].into()))
+            );
+        }
+    }
+}

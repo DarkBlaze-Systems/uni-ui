@@ -11,6 +11,13 @@
 //! - Containers: `List`/`List(data)`, `LazyVStack`/`LazyHStack` (lazy `List`/`Row`),
 //!   `Grid`/`GridRow`, `Form`, `Section(header:)`, `Picker(selection:)`, `Stepper(value:)`
 //! - `@State var name` declarations and `$binding` call-site uses (bound names recorded)
+//! - Navigation & presentation: `NavigationStack`/`NavigationView`,
+//!   `NavigationLink("label") { dest }` / `NavigationLink(value:)`, `TabView`
+//!   with `.tabItem` metadata, `Menu("label") { … }`
+//! - Presentation modifiers as bound child *layers*: `.sheet(isPresented:$x)`,
+//!   `.alert(title, isPresented:$x)`, `.popover(isPresented:$x)`,
+//!   `.overlay { … }` / `.background(View)` (overlay/underlay layers, distinct
+//!   from `.background(Color)` which stays a style prop)
 //! - Line comments (`//`)
 
 use uni_ir::{Action, Document, Mutation, NodeId, Origin, Value};
@@ -237,6 +244,12 @@ fn map_kind(swiftui: &str) -> &str {
         "Section" => "Section",
         "Picker" => "Picker",
         "Stepper" => "Stepper",
+        // Navigation / presentation containers keep their SwiftUI name as the IR
+        // kind — they *are* their own structural element in our vocabulary.
+        "NavigationStack" | "NavigationView" => "NavigationStack",
+        "NavigationLink" => "NavigationLink",
+        "TabView" => "TabView",
+        "Menu" => "Menu",
         "RoundedRectangle" | "Rectangle" => "Rect",
         "Spacer" => "Rect",
         // Leaf views keep their SwiftUI name as the IR kind — these have no
@@ -424,28 +437,37 @@ fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, Swift
 
     // Block body `{ child child ... }`
     if lex.peek() == Some(b'{') {
-        lex.advance(); // {
-        loop {
-            lex.skip_ws();
-            if lex.peek() == Some(b'}') {
-                lex.advance();
-                break;
-            }
-            if lex.peek().is_none() {
-                break;
-            }
-            if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
-                let child_kind = lex.read_ident();
-                let child = parse_view_body(lex, child_kind)?;
-                view.children.push(child);
-            } else {
-                // skip unknown token
-                lex.advance();
-            }
-        }
+        let children = parse_children_block(lex)?;
+        view.children.extend(children);
     }
 
     apply_modifiers(lex, view)
+}
+
+/// Parse a `{ View View ... }` content block, returning its child views.
+/// Assumes `lex` is positioned at the opening `{`.
+fn parse_children_block(lex: &mut Lexer<'_>) -> Result<Vec<SwiftView>, SwiftUIImportError> {
+    let mut children = Vec::new();
+    lex.advance(); // {
+    loop {
+        lex.skip_ws();
+        if lex.peek() == Some(b'}') {
+            lex.advance();
+            break;
+        }
+        if lex.peek().is_none() {
+            break;
+        }
+        if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+            let child_kind = lex.read_ident();
+            let child = parse_view_body(lex, child_kind)?;
+            children.push(child);
+        } else {
+            // skip unknown token
+            lex.advance();
+        }
+    }
+    Ok(children)
 }
 
 fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
@@ -525,6 +547,234 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
     }
 }
 
+/// Map a presentation modifier name to the IR layer kind it produces.
+fn present_kind(modifier: &str) -> &'static str {
+    match modifier {
+        "sheet" => "Sheet",
+        "popover" => "Popover",
+        "fullScreenCover" => "FullScreenCover",
+        "alert" => "Alert",
+        "confirmationDialog" => "ConfirmationDialog",
+        _ => "Sheet",
+    }
+}
+
+/// Read a `key: $bound` / `key: value` argument list inside a modifier's
+/// parens, collecting any `isPresented`/`item`/`value`/`for` binding and the
+/// first positional string (a title). Stops at the closing `)`, which it
+/// consumes. Returns `(title, isPresented_binding)`.
+fn parse_present_args(
+    lex: &mut Lexer<'_>,
+) -> Result<(Option<String>, Option<String>), SwiftUIImportError> {
+    let mut title: Option<String> = None;
+    let mut bound: Option<String> = None;
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') => {
+                lex.advance();
+                break;
+            }
+            None => break,
+            Some(b'"') => {
+                // a positional title string (e.g. `.alert("Delete?", …)`)
+                if title.is_none() {
+                    title = Some(lex.read_string()?);
+                } else {
+                    lex.read_string()?;
+                }
+            }
+            Some(c) if c.is_ascii_alphabetic() => {
+                let key = lex.read_ident();
+                lex.skip_ws();
+                if lex.peek() == Some(b':') {
+                    lex.advance();
+                    lex.skip_ws();
+                    let v = parse_value(lex)?;
+                    if matches!(key.as_str(), "isPresented" | "item" | "value" | "for")
+                        && bound.is_none()
+                    {
+                        if let SwiftValue::Ident(name) = &v {
+                            bound = Some(name.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                lex.advance();
+            }
+        }
+        lex.skip_ws();
+        if lex.peek() == Some(b',') {
+            lex.advance();
+        }
+    }
+    Ok((title, bound))
+}
+
+/// Build a synthetic child-layer [`SwiftView`] of the given kind, recording the
+/// presentation binding (`bound_to`) and optional title as props, and folding
+/// its content children up out of `content`.
+fn make_layer(kind: &str, bound_to: Option<String>, title: Option<String>) -> SwiftView {
+    let mut props = Vec::new();
+    if let Some(b) = bound_to {
+        props.push(("bound_to".to_string(), SwiftValue::Ident(b)));
+    }
+    if let Some(t) = title {
+        props.push(("title".to_string(), SwiftValue::Str(t)));
+    }
+    SwiftView {
+        kind: kind.to_string(),
+        label: None,
+        props,
+        callbacks: vec![],
+        children: vec![],
+        unsupported: vec![],
+    }
+}
+
+/// `.sheet(isPresented:$x) { content }` / `.popover(...) { … }` etc. Parses the
+/// optional arg list, then the trailing content closure, and attaches a single
+/// synthetic child layer (kind = `layer_kind`) bound to the presentation state.
+fn parse_presentation_modifier(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+    layer_kind: &str,
+) -> Result<(), SwiftUIImportError> {
+    let (title, bound) = if lex.peek() == Some(b'(') {
+        lex.advance(); // (
+        parse_present_args(lex)?
+    } else {
+        (None, None)
+    };
+    let mut layer = make_layer(layer_kind, bound, title);
+    lex.skip_ws();
+    if lex.peek() == Some(b'{') {
+        layer.children = parse_children_block(lex)?;
+    }
+    view.children.push(layer);
+    Ok(())
+}
+
+/// `.alert(title, isPresented:$x) { actions }` — like a presentation modifier,
+/// but the SwiftUI alert closure holds action buttons rather than content; we
+/// still capture them as the layer's children so they survive the lower.
+fn parse_alert_modifier(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+    layer_kind: &str,
+) -> Result<(), SwiftUIImportError> {
+    parse_presentation_modifier(lex, view, layer_kind)?;
+    // An alert may also carry a trailing message closure: `.alert(…){…} message:{…}`.
+    // SwiftUI's labeled trailing-closure form is rare in practice; if a bare
+    // `{ … }` follows, fold it into the same layer's children.
+    lex.skip_ws();
+    if lex.peek() == Some(b'{') {
+        if let Some(layer) = view.children.last_mut() {
+            let extra = parse_children_block(lex)?;
+            layer.children.extend(extra);
+        } else {
+            parse_children_block(lex)?;
+        }
+    }
+    Ok(())
+}
+
+/// `.overlay { View }` / `.overlay(alignment:.top) { View }` /
+/// `.background { View }` — the closure views become an overlay/underlay layer.
+fn parse_layer_modifier(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+    layer_kind: &str,
+) -> Result<(), SwiftUIImportError> {
+    let mut layer = make_layer(layer_kind, None, None);
+    // Optional `(alignment: …)` or `(View)` positional content.
+    if lex.peek() == Some(b'(') {
+        lex.advance(); // (
+        loop {
+            lex.skip_ws();
+            match lex.peek() {
+                Some(b')') => {
+                    lex.advance();
+                    break;
+                }
+                None => break,
+                // A positional View argument, e.g. `.overlay(Circle())` or
+                // `.background(RoundedRectangle(...))`.
+                Some(c) if c.is_ascii_uppercase() => {
+                    let kind = lex.read_ident();
+                    let child = parse_view_body(lex, kind)?;
+                    layer.children.push(child);
+                }
+                _ => {
+                    lex.advance();
+                }
+            }
+        }
+    }
+    lex.skip_ws();
+    if lex.peek() == Some(b'{') {
+        let kids = parse_children_block(lex)?;
+        layer.children.extend(kids);
+    }
+    view.children.push(layer);
+    Ok(())
+}
+
+/// `.tabItem { Label("Home", systemImage:"house") }` — attaches the tab's
+/// label metadata to *this* view (a tab page). The first string literal seen
+/// in the closure becomes the tab title prop.
+fn parse_tab_item_modifier(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+) -> Result<(), SwiftUIImportError> {
+    view.props
+        .push(("tab_item".to_string(), SwiftValue::Bool(true)));
+    // Optional parens (rare) then the content closure.
+    if lex.peek() == Some(b'(') {
+        lex.skip_balanced(b'(', b')');
+        lex.skip_ws();
+    }
+    if lex.peek() == Some(b'{') {
+        let kids = parse_children_block(lex)?;
+        // Pull a label string out of the closure (Label/Text/Image inside).
+        for kid in &kids {
+            if let Some(label) = &kid.label {
+                view.props
+                    .push(("tab_label".to_string(), SwiftValue::Str(label.clone())));
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Disambiguate `.background(...)`: peek (without consuming) just past the `(`
+/// to decide if it is a *view* layer (uppercase view name) rather than a style
+/// such as `.background(Color.blue)` / `.background(.red)`. `Color(...)` is a
+/// style, so it is excluded.
+fn background_is_view_layer(lex: &mut Lexer<'_>) -> bool {
+    let saved_pos = lex.pos;
+    let saved_line = lex.line;
+    let mut decided = false;
+    if lex.peek() == Some(b'(') {
+        lex.advance();
+        lex.skip_ws();
+        if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+            let ident = lex.read_ident();
+            // `Color(...)` is a style, not a view layer.
+            decided = ident != "Color";
+        }
+    } else {
+        lex.skip_ws();
+        // `.background { View }` (no parens) is always a view layer.
+        decided = lex.peek() == Some(b'{');
+    }
+    lex.pos = saved_pos;
+    lex.line = saved_line;
+    decided
+}
+
 /// After parsing a view's block/args, consume any `.modifier(...)` chains.
 fn apply_modifiers(
     lex: &mut Lexer<'_>,
@@ -539,6 +789,48 @@ fn apply_modifiers(
         lex.advance(); // .
         let modifier = lex.read_ident();
         lex.skip_ws();
+
+        // ── presentation / layering modifiers ───────────────────────────────
+        // These may carry both `(args)` (an `isPresented:`/`value:`/title arg)
+        // and a trailing `{ content }` closure whose views become a *child
+        // layer* on this view, not props. They are handled here, before the
+        // generic `(args)` consumption, because their closure content matters.
+        match modifier.as_str() {
+            "sheet" | "popover" | "fullScreenCover" => {
+                parse_presentation_modifier(lex, &mut view, present_kind(&modifier))?;
+                continue;
+            }
+            "alert" | "confirmationDialog" => {
+                parse_alert_modifier(lex, &mut view, present_kind(&modifier))?;
+                continue;
+            }
+            "overlay" => {
+                parse_layer_modifier(lex, &mut view, "Overlay")?;
+                continue;
+            }
+            "tabItem" => {
+                parse_tab_item_modifier(lex, &mut view)?;
+                continue;
+            }
+            // `.background` is overloaded: `.background(Color)` → a background
+            // *prop* (the existing path below); `.background(View) { }` or
+            // `.background { View }` → an underlay *layer*. Disambiguate by
+            // peeking past `(`: a `Color`/`.named`/numeric arg is a style;
+            // an uppercase view name (or a bare `{`) is content.
+            "background" if background_is_view_layer(lex) => {
+                parse_layer_modifier(lex, &mut view, "Underlay")?;
+                continue;
+            }
+            "navigationDestination" => {
+                // `.navigationDestination(isPresented: $x) { dest }` /
+                // `.navigationDestination(for: T.self) { item in dest }` — the
+                // destination subtree becomes a NavigationLink-style layer.
+                parse_presentation_modifier(lex, &mut view, "NavigationDestination")?;
+                continue;
+            }
+            _ => {}
+        }
+
         if lex.peek() != Some(b'(') {
             // A parenthesis-less, property-style modifier such as `.isHidden`.
             // Only a curated few have an IR home; the rest are dropped + logged.
@@ -1436,5 +1728,195 @@ mod tests {
     fn no_state_vars_when_none_declared() {
         let report = parse_with_report(r#"Text("Hi")"#).unwrap();
         assert!(report.state_vars.is_empty());
+    }
+
+    // ── N1: navigation & presentation lowering ───────────────────────────────
+
+    /// Find the first descendant (incl. root) whose kind matches.
+    fn find_kind<'a>(doc: &'a Document, kind: &str) -> Option<&'a uni_ir::Node> {
+        let mut stack = vec![doc.root()?];
+        while let Some(id) = stack.pop() {
+            let node = doc.get(id)?;
+            if node.kind == kind {
+                return doc.get(id);
+            }
+            for &c in &node.children {
+                stack.push(c);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn parse_navigation_stack_is_container() {
+        let doc = parse(r#"NavigationStack { Text("home") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "NavigationStack");
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_navigation_view_aliases_stack() {
+        // Legacy `NavigationView` normalizes to the same container kind.
+        assert_eq!(root_kind(r#"NavigationView { Text("a") }"#), "NavigationStack");
+    }
+
+    #[test]
+    fn parse_navigation_link_label_and_destination() {
+        // `NavigationLink("label") { dest }` — label carried, destination child.
+        let doc = parse(r#"NavigationLink("Profile") { ProfileView() }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "NavigationLink");
+        assert_eq!(
+            node.props.get("content"),
+            Some(&Value::Text("Profile".into()))
+        );
+        // The destination subtree lowered as a child.
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_navigation_link_value_form() {
+        // `NavigationLink(value: item) { Text("Go") }` — value binding carried,
+        // the label view becomes a child.
+        let doc = parse(r#"NavigationLink(value: item) { Text("Go") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "NavigationLink");
+        assert_eq!(node.props.get("value"), Some(&Value::Text("item".into())));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_navigation_link_inside_stack() {
+        let src = r#"NavigationStack { NavigationLink("Settings") { SettingsView() } }"#;
+        let doc = parse(src).unwrap();
+        let stack = doc.get(doc.root().unwrap()).unwrap();
+        assert_eq!(stack.kind, "NavigationStack");
+        let link = doc.get(stack.children[0]).unwrap();
+        assert_eq!(link.kind, "NavigationLink");
+        assert_eq!(link.props.get("content"), Some(&Value::Text("Settings".into())));
+    }
+
+    #[test]
+    fn parse_tab_view_with_tab_items() {
+        let src = r#"TabView {
+            Text("Home").tabItem { Label("Home", systemImage: "house") }
+            Text("Profile").tabItem { Text("Profile") }
+        }"#;
+        let doc = parse(src).unwrap();
+        let root = doc.root().unwrap();
+        let tabview = doc.get(root).unwrap();
+        assert_eq!(tabview.kind, "TabView");
+        assert_eq!(tabview.children.len(), 2);
+        // Each page carries tab metadata.
+        let page0 = doc.get(tabview.children[0]).unwrap();
+        assert_eq!(page0.props.get("tab_item"), Some(&Value::Bool(true)));
+        assert_eq!(page0.props.get("tab_label"), Some(&Value::Text("Home".into())));
+        let page1 = doc.get(tabview.children[1]).unwrap();
+        assert_eq!(page1.props.get("tab_label"), Some(&Value::Text("Profile".into())));
+    }
+
+    #[test]
+    fn parse_menu_label_and_children() {
+        let doc = parse(r#"Menu("Options") { Button("A") { } Button("B") { } }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Menu");
+        assert_eq!(node.props.get("content"), Some(&Value::Text("Options".into())));
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn parse_sheet_is_bound_child_layer() {
+        // The bound-presentation test: `.sheet(isPresented:$show)` produces a
+        // "Sheet" child layer bound to `show`, with its content folded in.
+        let doc = parse(r#"Text("base").sheet(isPresented: $showSheet) { Text("inside") }"#).unwrap();
+        let sheet = find_kind(&doc, "Sheet").expect("Sheet layer present");
+        assert_eq!(sheet.props.get("bound_to"), Some(&Value::Text("showSheet".into())));
+        // The sheet's content lowered as its child.
+        assert_eq!(sheet.children.len(), 1);
+        let inner = doc.get(sheet.children[0]).unwrap();
+        assert_eq!(inner.props.get("content"), Some(&Value::Text("inside".into())));
+    }
+
+    #[test]
+    fn parse_alert_title_and_binding() {
+        let doc = parse(
+            r#"Text("base").alert("Delete?", isPresented: $showAlert) { Button("OK") { } }"#,
+        )
+        .unwrap();
+        let alert = find_kind(&doc, "Alert").expect("Alert layer present");
+        assert_eq!(alert.props.get("title"), Some(&Value::Text("Delete?".into())));
+        assert_eq!(alert.props.get("bound_to"), Some(&Value::Text("showAlert".into())));
+        // Action buttons captured as children.
+        assert_eq!(alert.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_popover_is_bound_child_layer() {
+        let doc = parse(r#"Text("base").popover(isPresented: $pop) { Text("over") }"#).unwrap();
+        let pop = find_kind(&doc, "Popover").expect("Popover layer present");
+        assert_eq!(pop.props.get("bound_to"), Some(&Value::Text("pop".into())));
+        assert_eq!(pop.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_menu_overlay_layer() {
+        // `.overlay { View }` becomes a distinct "Overlay" child layer.
+        let doc = parse(r#"Text("base").overlay { Circle() }"#).unwrap();
+        let overlay = find_kind(&doc, "Overlay").expect("Overlay layer present");
+        assert_eq!(overlay.children.len(), 1);
+        // The base view still kept its own content.
+        let root = doc.get(doc.root().unwrap()).unwrap();
+        assert_eq!(root.props.get("content"), Some(&Value::Text("base".into())));
+    }
+
+    #[test]
+    fn parse_overlay_with_positional_view() {
+        // `.overlay(Badge())` positional-content form.
+        let doc = parse(r#"Image("photo").overlay(Badge())"#).unwrap();
+        let overlay = find_kind(&doc, "Overlay").expect("Overlay layer present");
+        assert_eq!(overlay.children.len(), 1);
+        assert_eq!(doc.get(overlay.children[0]).unwrap().kind, "Badge");
+    }
+
+    #[test]
+    fn parse_background_view_is_underlay_layer() {
+        // `.background(View)` is a distinct underlay *layer*, not a style prop.
+        let doc = parse(r#"Text("base").background(RoundedRectangle(cornerRadius: 8))"#).unwrap();
+        let under = find_kind(&doc, "Underlay").expect("Underlay layer present");
+        assert_eq!(under.children.len(), 1);
+        // No `background` style prop was set on the base view.
+        let root = doc.get(doc.root().unwrap()).unwrap();
+        assert!(!root.props.contains_key("background"));
+    }
+
+    #[test]
+    fn parse_background_closure_is_underlay_layer() {
+        // `.background { View }` (no parens) is also an underlay layer.
+        let doc = parse(r#"Text("base").background { Color.blue }"#).unwrap();
+        assert!(find_kind(&doc, "Underlay").is_some());
+    }
+
+    #[test]
+    fn parse_background_color_remains_a_style_prop() {
+        // Regression guard: `.background(Color.blue)` stays a style, NOT a layer.
+        let doc = parse(r#"Text("base").background(Color.blue)"#).unwrap();
+        assert!(find_kind(&doc, "Underlay").is_none());
+        let root = doc.get(doc.root().unwrap()).unwrap();
+        assert_eq!(root.props.get("background"), Some(&Value::Color(0x0000_FFFF)));
+    }
+
+    #[test]
+    fn unknown_presentation_like_modifier_still_reported() {
+        // A genuinely-unknown modifier is still surfaced (no silent eating).
+        let report = parse_with_report(r#"Text("Hi").presentationDetents([.medium])"#).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "modifier .presentationDetents"));
     }
 }

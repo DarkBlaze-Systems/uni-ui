@@ -110,12 +110,26 @@ fn scale_alpha(color: u32, factor: f32) -> u32 {
 ///
 /// `Form` / `Section` are vertical grouped containers (SwiftUI grouped-list
 /// look); `List` / `LazyVStack` are vertical scrolling containers that window
-/// their children to the visible range. All carry children, so they build a
-/// taffy subtree like the flex containers.
+/// their children to the visible range. `Overlay` / `Underlay` are layered view
+/// wrappers, and `Sheet` / `Alert` / `Popover` / `Menu` are presentation cards —
+/// all carry children, so they build a taffy subtree like the flex containers.
 fn is_container(kind: &str) -> bool {
     matches!(
         kind,
-        "Stack" | "Column" | "Row" | "Grid" | "Form" | "Section" | "List" | "LazyVStack"
+        "Stack"
+            | "Column"
+            | "Row"
+            | "Grid"
+            | "Form"
+            | "Section"
+            | "List"
+            | "LazyVStack"
+            | "Overlay"
+            | "Underlay"
+            | "Sheet"
+            | "Alert"
+            | "Popover"
+            | "Menu"
     )
 }
 
@@ -375,6 +389,13 @@ fn style_for(node: &Node, viewport: (f32, f32), is_root: bool) -> Style {
             // its visible children are placed absolutely at their scrolled y in
             // `build_subtree` / `build_cached`. Default to filling its parent's
             // cross axis so rows have a width to stretch into.
+            style.display = Display::Flex;
+            style.flex_direction = FlexDirection::Column;
+        }
+        "Overlay" | "Underlay" | "Sheet" | "Alert" | "Popover" | "Menu" => {
+            // Layered view wrappers and presentation cards stack their content
+            // vertically. Flow layout is unchanged by the layer role — only the
+            // paint z-order differs (handled in `paint_order`).
             style.display = Display::Flex;
             style.flex_direction = FlexDirection::Column;
         }
@@ -893,6 +914,195 @@ impl LayoutCache {
 }
 
 // ---------------------------------------------------------------------------
+// Presentation / overlay classification
+// ---------------------------------------------------------------------------
+
+/// The layering role a node plays *relative to its siblings*.
+///
+/// SwiftUI's `.overlay(view)` / `.background(view)` (and `ZStack`-style
+/// presentation) attach an extra view that paints *over* or *under* its host.
+/// We model that with either a dedicated node `kind` (`"Overlay"` / `"Underlay"`)
+/// or a `role` prop (`"overlay"` / `"underlay"`) on any node, so an authored
+/// child can be promoted above or demoted below its plain siblings without
+/// changing flow layout — only paint z-order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerRole {
+    /// Paints under its plain siblings (a `.background(view)` layer).
+    Underlay,
+    /// Paints in declared order among plain siblings.
+    Normal,
+    /// Paints over its plain siblings (an `.overlay(view)` layer).
+    Overlay,
+}
+
+/// Classify a node's layering role from its `kind` or explicit `role` prop.
+fn layer_role(node: &Node) -> LayerRole {
+    match node.kind.as_str() {
+        "Overlay" => return LayerRole::Overlay,
+        "Underlay" => return LayerRole::Underlay,
+        _ => {}
+    }
+    match str_of(node, "role") {
+        Some("overlay") => LayerRole::Overlay,
+        Some("underlay") => LayerRole::Underlay,
+        _ => LayerRole::Normal,
+    }
+}
+
+/// A top-of-everything presentation surface: a `Sheet`/`Alert`/`Popover`/`Menu`
+/// painted over the whole scene, gated by a `presented` (Bool) prop.
+fn is_presentation(kind: &str) -> bool {
+    matches!(kind, "Sheet" | "Alert" | "Popover" | "Menu")
+}
+
+/// Is a presentation surface currently shown? Absent `presented` ⇒ not shown,
+/// so an authored-but-dormant Sheet/Alert paints nothing until gated on.
+fn is_presented(node: &Node) -> bool {
+    bool_of(node, "presented") == Some(true)
+}
+
+/// Build the **paint order** over the nodes the layout actually produced.
+///
+/// Starts from `layout.order()` (taffy painter's order, parent-before-child,
+/// honoring windowed lists) and re-sorts it so that, *within each parent*:
+/// `underlay` children paint first, plain children in declared order, then
+/// `overlay` children last — while every presentation surface subtree
+/// (`Sheet`/`Alert`/`Popover`/`Menu`) is hoisted to the very end so it paints on
+/// top of everything. Subtrees stay contiguous (parent-before-child preserved),
+/// so descendants of an overlay/underlay/presentation node travel with it.
+fn paint_order(doc: &Document, layout: &Layout) -> Vec<NodeId> {
+    use std::collections::HashSet;
+
+    // Only nodes the layout produced a rect for participate (windowed lists drop
+    // off-screen rows). Group each laid-out node's *present* children, sorted by
+    // role, so we can re-emit subtrees in the right z-order.
+    let present: HashSet<NodeId> = layout.order().iter().copied().collect();
+
+    // Per node: its present children sorted [underlay.., normal.., overlay..],
+    // each bucket keeping declared order.
+    let sorted_children = |id: NodeId| -> Vec<NodeId> {
+        let Some(node) = doc.get(id) else {
+            return Vec::new();
+        };
+        let mut under = Vec::new();
+        let mut normal = Vec::new();
+        let mut over = Vec::new();
+        for &c in &node.children {
+            if !present.contains(&c) {
+                continue;
+            }
+            let Some(cn) = doc.get(c) else { continue };
+            match layer_role(cn) {
+                LayerRole::Underlay => under.push(c),
+                LayerRole::Normal => normal.push(c),
+                LayerRole::Overlay => over.push(c),
+            }
+        }
+        under.into_iter().chain(normal).chain(over).collect()
+    };
+
+    let mut base = Vec::new();
+    let mut deferred = Vec::new(); // presentation-surface subtree roots
+    let mut visited = HashSet::new();
+
+    // Iterative pre-order DFS using an explicit stack of (node, is_subtree_root).
+    fn push_subtree(
+        doc: &Document,
+        id: NodeId,
+        sorted: &dyn Fn(NodeId) -> Vec<NodeId>,
+        visited: &mut HashSet<NodeId>,
+        out: &mut Vec<NodeId>,
+        deferred: &mut Vec<NodeId>,
+        top_level: bool,
+    ) {
+        if visited.contains(&id) {
+            return;
+        }
+        // Hoist a presentation surface (and its subtree) to the deferred pass,
+        // unless we're already painting inside a deferred presentation subtree.
+        // Note: we DON'T mark it visited here, so the deferred pass can paint it.
+        if top_level {
+            if let Some(n) = doc.get(id) {
+                if is_presentation(&n.kind) {
+                    deferred.push(id);
+                    return;
+                }
+            }
+        }
+        visited.insert(id);
+        out.push(id);
+        for c in sorted(id) {
+            push_subtree(doc, c, sorted, visited, out, deferred, top_level);
+        }
+    }
+
+    if let Some(root) = doc.root() {
+        if present.contains(&root) {
+            push_subtree(doc, root, &sorted_children, &mut visited, &mut base, &mut deferred, true);
+        }
+    }
+
+    // Now append each deferred presentation subtree, painted top-most, in the
+    // order they were discovered. Inside a presentation subtree, role ordering
+    // still applies but nested presentation surfaces are NOT re-hoisted (they
+    // belong to their parent surface).
+    for root in deferred {
+        push_subtree(doc, root, &sorted_children, &mut visited, &mut base, &mut Vec::new(), false);
+    }
+
+    base
+}
+
+/// Paint the chrome of a *presented* presentation surface into `scene`.
+///
+/// `Sheet` / `Alert` lay a full-viewport dimmed **scrim** behind a centered (or
+/// laid-out) **card**, modal-style. `Popover` / `Menu` are anchored surfaces —
+/// no scrim, just the card at the node's laid-out rect (its anchor). The card's
+/// own children paint on top afterwards (the caller falls through to them).
+///
+/// Props honored: `scrim` (Color, overrides the default dim), `background`
+/// (Color, card fill), `corner_radius`/`radius` (card rounding).
+fn paint_presentation_surface(node: &Node, rect: ComputedRect, vw: f32, vh: f32, scene: &mut Scene) {
+    let kind = node.kind.as_str();
+    let modal = matches!(kind, "Sheet" | "Alert");
+
+    // 1) Scrim: a dim full-viewport veil under modal surfaces only.
+    if modal {
+        let scrim = color_of(node, "scrim").unwrap_or(0x00000099);
+        scene.push(DrawCmd::FilledRect {
+            x: 0.0,
+            y: 0.0,
+            w: vw,
+            h: vh,
+            color: scrim,
+            corner_radius: 0.0,
+        });
+    }
+
+    // 2) Card: the surface panel at its laid-out rect.
+    let default_fill = match kind {
+        // Menus/popovers read as a slightly lighter floating card.
+        "Menu" | "Popover" => 0x2a2a2aff,
+        _ => 0x1c1c1eff,
+    };
+    let fill = color_of(node, "background")
+        .or_else(|| color_of(node, "color"))
+        .unwrap_or(default_fill);
+    let default_radius = if modal { 14.0 } else { 10.0 };
+    let corner_radius = px_of(node, "corner_radius")
+        .or_else(|| px_of(node, "radius"))
+        .unwrap_or(default_radius);
+    scene.push(DrawCmd::FilledRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        color: fill,
+        corner_radius,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Paint pass
 // ---------------------------------------------------------------------------
 
@@ -900,6 +1110,12 @@ impl LayoutCache {
 ///
 /// Walks nodes in painter's order so a parent's `background` and a `Frost`
 /// panel both blur/cover exactly what was drawn before them.
+///
+/// Three paint-order refinements layer on top of taffy's parent-before-child
+/// order: `overlay`/`underlay` children are re-sorted within their parent (an
+/// overlay paints last/on-top, an underlay first/behind); presentation surfaces
+/// (`Sheet`/`Alert`/`Popover`/`Menu`) are hoisted to the very top of the scene
+/// and only paint when their `presented` prop is `true`.
 pub fn paint(doc: &Document, layout: &Layout) -> Scene {
     let mut scene: Scene = Vec::new();
     let (vw, vh) = layout.viewport;
@@ -909,7 +1125,12 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
     let mut hidden_subtree: std::collections::HashSet<NodeId> =
         std::collections::HashSet::new();
 
-    for (idx, &id) in layout.order().iter().enumerate() {
+    // Subtree of a non-presented presentation surface: paints nothing at all.
+    let mut dormant_subtree: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
+
+    let order = paint_order(doc, layout);
+    for (idx, &id) in order.iter().enumerate() {
         let Some(node) = doc.get(id) else {
             continue;
         };
@@ -929,6 +1150,31 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     stack.extend(node.children.iter().copied());
                 }
             }
+            continue;
+        }
+
+        // Presentation surface (`Sheet`/`Alert`/`Popover`/`Menu`): only paints
+        // when gated on by `presented == true`. A dormant (not-presented)
+        // surface — and its whole subtree — paints nothing.
+        if dormant_subtree.contains(&id) {
+            continue;
+        }
+        if is_presentation(&node.kind) {
+            if !is_presented(node) {
+                // Mark the subtree dormant so its descendants paint nothing.
+                let mut stack = vec![id];
+                while let Some(n) = stack.pop() {
+                    dormant_subtree.insert(n);
+                    if let Some(node) = doc.get(n) {
+                        stack.extend(node.children.iter().copied());
+                    }
+                }
+                continue;
+            }
+            // Presented: paint the surface chrome (scrim for Sheet/Alert, then a
+            // card) *before* its subtree, so the subtree paints on top of it.
+            paint_presentation_surface(node, rect, vw, vh, &mut scene);
+            // Fall through so the surface's own children paint over the chrome.
             continue;
         }
 
@@ -2094,5 +2340,251 @@ mod tests {
         let l1 = cache.compute(&doc, vp, &dirty);
         assert!(l1.rect(rows[100]).is_some(), "row 100 visible after scroll (cache)");
         assert!(l1.rect(rows[0]).is_none(), "row 0 windowed out after scroll (cache)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Presentation / overlay rendering
+    // -----------------------------------------------------------------------
+
+    /// Index in the scene of the first `FilledRect` whose fill matches `color`.
+    fn rect_idx(scene: &Scene, color: u32) -> Option<usize> {
+        scene
+            .iter()
+            .position(|c| matches!(c, DrawCmd::FilledRect { color: c2, .. } if *c2 == color))
+    }
+
+    /// An `overlay`-role child paints AFTER its plain sibling (on top), even
+    /// though it is declared first; an `underlay`-role child paints BEFORE.
+    #[test]
+    fn overlay_paints_after_base_underlay_before() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        // Declared order: overlay, base, underlay — deliberately scrambled so
+        // only the role (not declaration order) can produce the right z-order.
+        let over = node(&mut doc, "Rect");
+        prop(&mut doc, over, "role", Value::Text("overlay".into()));
+        prop(&mut doc, over, "width", Value::Px(40.0));
+        prop(&mut doc, over, "height", Value::Px(40.0));
+        prop(&mut doc, over, "color", Value::Color(0x00ff00ff));
+        child(&mut doc, root, over);
+
+        let base = node(&mut doc, "Rect");
+        prop(&mut doc, base, "width", Value::Px(40.0));
+        prop(&mut doc, base, "height", Value::Px(40.0));
+        prop(&mut doc, base, "color", Value::Color(0xff0000ff));
+        child(&mut doc, root, base);
+
+        let under = node(&mut doc, "Underlay"); // kind-based underlay wrapper
+        let under_rect = node(&mut doc, "Rect");
+        prop(&mut doc, under_rect, "width", Value::Px(40.0));
+        prop(&mut doc, under_rect, "height", Value::Px(40.0));
+        prop(&mut doc, under_rect, "color", Value::Color(0x0000ffff));
+        child(&mut doc, under, under_rect);
+        child(&mut doc, root, under);
+
+        let scene = lower(&doc, (400.0, 400.0));
+        let i_under = rect_idx(&scene, 0x0000ffff).expect("underlay painted");
+        let i_base = rect_idx(&scene, 0xff0000ff).expect("base painted");
+        let i_over = rect_idx(&scene, 0x00ff00ff).expect("overlay painted");
+
+        // Underlay (behind) < base < overlay (on top), regardless of declared order.
+        assert!(i_under < i_base, "underlay before base: {i_under} < {i_base}");
+        assert!(i_base < i_over, "overlay after base: {i_base} < {i_over}");
+    }
+
+    /// A kind `"Overlay"` wrapper paints its subtree on top of plain siblings.
+    #[test]
+    fn overlay_kind_layers_above_siblings() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        // Overlay declared FIRST but must paint last.
+        let ov = node(&mut doc, "Overlay");
+        let ov_child = node(&mut doc, "Rect");
+        prop(&mut doc, ov_child, "width", Value::Px(20.0));
+        prop(&mut doc, ov_child, "height", Value::Px(20.0));
+        prop(&mut doc, ov_child, "color", Value::Color(0xabcdefff));
+        child(&mut doc, ov, ov_child);
+        child(&mut doc, root, ov);
+
+        let base = node(&mut doc, "Rect");
+        prop(&mut doc, base, "width", Value::Px(20.0));
+        prop(&mut doc, base, "height", Value::Px(20.0));
+        prop(&mut doc, base, "color", Value::Color(0x123456ff));
+        child(&mut doc, root, base);
+
+        let scene = lower(&doc, (200.0, 200.0));
+        let i_base = rect_idx(&scene, 0x123456ff).unwrap();
+        let i_ov = rect_idx(&scene, 0xabcdefff).unwrap();
+        assert!(i_ov > i_base, "overlay subtree paints above base: {i_ov} > {i_base}");
+    }
+
+    /// A *presented* `Sheet` emits a full-viewport dimmed scrim plus a card;
+    /// a *non-presented* one emits nothing at all (neither chrome nor subtree).
+    #[test]
+    fn presented_sheet_emits_scrim_and_card_dormant_emits_nothing() {
+        // --- Presented sheet ---
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        prop(&mut doc, root, "background", Value::Color(0x101010ff));
+
+        let sheet = node(&mut doc, "Sheet");
+        prop(&mut doc, sheet, "presented", Value::Bool(true));
+        prop(&mut doc, sheet, "width", Value::Px(200.0));
+        prop(&mut doc, sheet, "height", Value::Px(120.0));
+        prop(&mut doc, sheet, "background", Value::Color(0x1c1c1eff));
+        child(&mut doc, root, sheet);
+        // The sheet's content paints on top of the card.
+        let content = node(&mut doc, "Rect");
+        prop(&mut doc, content, "width", Value::Px(50.0));
+        prop(&mut doc, content, "height", Value::Px(50.0));
+        prop(&mut doc, content, "color", Value::Color(0x778899ff));
+        child(&mut doc, sheet, content);
+
+        let (vw, vh) = (400.0, 400.0);
+        let scene = lower(&doc, (vw, vh));
+
+        // Scrim: a full-viewport FilledRect that is NOT the root clear color.
+        let scrim_idx = scene.iter().position(|c| matches!(
+            c,
+            DrawCmd::FilledRect { x: 0.0, y: 0.0, w, h, color, .. }
+                if (*w - vw).abs() < 0.5 && (*h - vh).abs() < 0.5 && *color != 0x101010ff
+        )).expect("scrim painted full-viewport over the scene");
+
+        // Card: the sheet's 200x120 panel.
+        let card_idx = scene.iter().position(|c| matches!(
+            c,
+            DrawCmd::FilledRect { w, h, color: 0x1c1c1eff, .. }
+                if (*w - 200.0).abs() < 0.5 && (*h - 120.0).abs() < 0.5
+        )).expect("sheet card painted");
+
+        // Content sits on top of the card.
+        let content_idx = rect_idx(&scene, 0x778899ff).expect("sheet content painted");
+
+        // The whole sheet (scrim, then card, then content) paints AFTER the
+        // root background — it is hoisted on top of everything.
+        let root_idx = rect_idx(&scene, 0x101010ff).expect("root background painted");
+        assert!(scrim_idx > root_idx, "scrim above base scene");
+        assert!(scrim_idx < card_idx, "scrim behind card");
+        assert!(card_idx < content_idx, "card behind its content");
+
+        // --- Non-presented sheet: nothing from the sheet subtree ---
+        let mut doc2 = Document::new();
+        let root2 = node(&mut doc2, "Stack");
+        set_root(&mut doc2, root2);
+        prop(&mut doc2, root2, "background", Value::Color(0x101010ff));
+
+        let sheet2 = node(&mut doc2, "Sheet");
+        // `presented` absent ⇒ dormant.
+        prop(&mut doc2, sheet2, "width", Value::Px(200.0));
+        prop(&mut doc2, sheet2, "height", Value::Px(120.0));
+        prop(&mut doc2, sheet2, "background", Value::Color(0x1c1c1eff));
+        child(&mut doc2, root2, sheet2);
+        let content2 = node(&mut doc2, "Rect");
+        prop(&mut doc2, content2, "width", Value::Px(50.0));
+        prop(&mut doc2, content2, "height", Value::Px(50.0));
+        prop(&mut doc2, content2, "color", Value::Color(0x778899ff));
+        child(&mut doc2, sheet2, content2);
+
+        let scene2 = lower(&doc2, (vw, vh));
+        // Only the root background — no scrim, no card, no content.
+        assert!(rect_idx(&scene2, 0x1c1c1eff).is_none(), "dormant sheet card not painted");
+        assert!(rect_idx(&scene2, 0x778899ff).is_none(), "dormant sheet content not painted");
+        // No full-viewport rect other than the root clear color.
+        assert!(
+            !scene2.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { w, h, color, .. }
+                    if (*w - vw).abs() < 0.5 && (*h - vh).abs() < 0.5 && *color != 0x101010ff
+            )),
+            "dormant sheet paints no scrim"
+        );
+    }
+
+    /// A presented `Popover` is an *anchored* surface: it paints a card at its
+    /// laid-out rect with NO dimming scrim (only modal Sheet/Alert dim).
+    #[test]
+    fn presented_popover_paints_card_without_scrim() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+
+        let pop = node(&mut doc, "Popover");
+        prop(&mut doc, pop, "presented", Value::Bool(true));
+        prop(&mut doc, pop, "width", Value::Px(160.0));
+        prop(&mut doc, pop, "height", Value::Px(90.0));
+        prop(&mut doc, pop, "background", Value::Color(0x2a2a2aff));
+        child(&mut doc, root, pop);
+
+        let (vw, vh) = (400.0, 400.0);
+        let scene = lower(&doc, (vw, vh));
+        // Card present.
+        assert!(
+            scene.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { w, h, color: 0x2a2a2aff, .. }
+                    if (*w - 160.0).abs() < 0.5 && (*h - 90.0).abs() < 0.5
+            )),
+            "popover card painted"
+        );
+        // No full-viewport scrim for an anchored popover.
+        assert!(
+            !scene.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { x: 0.0, y: 0.0, w, h, .. }
+                    if (*w - vw).abs() < 0.5 && (*h - vh).abs() < 0.5
+            )),
+            "popover paints no scrim"
+        );
+    }
+
+    /// A `Menu` is an anchored popover-style surface: a card holding a list of
+    /// items, painted on top of everything, gated by `presented`.
+    #[test]
+    fn presented_menu_paints_anchored_list() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        prop(&mut doc, root, "background", Value::Color(0x101010ff));
+
+        let menu = node(&mut doc, "Menu");
+        prop(&mut doc, menu, "presented", Value::Bool(true));
+        prop(&mut doc, menu, "width", Value::Px(180.0));
+        prop(&mut doc, menu, "background", Value::Color(0x2a2a2aff));
+        child(&mut doc, root, menu);
+
+        // Three menu items as rows in the card.
+        let mut items = Vec::new();
+        for i in 0..3 {
+            let it = node(&mut doc, "Rect");
+            prop(&mut doc, it, "height", Value::Px(24.0));
+            prop(&mut doc, it, "color", Value::Color(0x010000ff | ((i as u32) << 8)));
+            child(&mut doc, menu, it);
+            items.push(it);
+        }
+
+        let scene = lower(&doc, (400.0, 400.0));
+        let card_idx = rect_idx(&scene, 0x2a2a2aff).expect("menu card painted");
+        // No scrim (anchored, not modal).
+        assert!(
+            !scene.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { x: 0.0, y: 0.0, w, h, .. }
+                    if (*w - 400.0).abs() < 0.5 && (*h - 400.0).abs() < 0.5 && !matches!(c, DrawCmd::FilledRect { color: 0x101010ff, .. })
+            )),
+            "menu paints no scrim"
+        );
+        // Items stack vertically inside the card, non-overlapping.
+        let l = layout(&doc, (400.0, 400.0));
+        let r0 = l.rect(items[0]).unwrap();
+        let r1 = l.rect(items[1]).unwrap();
+        assert!(r1.y >= r0.y + r0.h, "menu items stack vertically");
+        // Items paint after (on top of) the menu card.
+        let i0 = rect_idx(&scene, 0x010000ff).expect("item 0 painted");
+        assert!(i0 > card_idx, "menu items paint over the card: {i0} > {card_idx}");
     }
 }
