@@ -8,6 +8,9 @@
 # `i-slint-*` code or Apple-private framework internals. Frontends are
 # reconstructed from public documentation only.
 #
+# Build note: build on the home filesystem (engine/target), NEVER /tmp
+# (a 3GB tmpfs that quota-fails on the GPU dependency tree).
+#
 # Architecture: ../research/engine/00-ENGINE-ARCHITECTURE.md
 # Dev plan:     ./DEV-PLAN.md
 
@@ -20,6 +23,9 @@ members = [
     "crates/uni-render",
     "crates/uni-dsl",
     "crates/uni-core",
+    "crates/uni-spring",
+    "crates/uni-env",
+    "crates/uni-simd",
 ]
 
 [workspace.package]
@@ -28,3 +34,12 @@ edition = "2021"
 authors = ["DarkBlaze"]
 publish = false
 # license: LicenseRef-DarkBlaze-Sanity (BSL 1.1 + no-compete grant) — to be finalized.
+
+# Release profile tuned for low-resource + fast: thin LTO, single codegen unit,
+# panic=abort for a smaller binary. (CPU target features via .cargo/config.toml.)
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
