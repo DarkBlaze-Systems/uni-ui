@@ -23,6 +23,8 @@
 mod color;
 pub use color::Rgba;
 
+mod blur;
+
 mod scene;
 pub use scene::{DrawCmd, Scene};
 
