@@ -1,8 +1,15 @@
 [package]
 name = "uni-core"
+description = "DarkBlaze Uni-UI — lowers a uni-ir Document into a uni-render Scene (layout + paint)."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+uni-ir = { path = "../uni-ir" }
+uni-render = { path = "../uni-render" }
+
+[dev-dependencies]
+uni-dsl = { path = "../uni-dsl" }
+winit = "0.30"
