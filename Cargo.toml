@@ -27,6 +27,11 @@ members = [
     "crates/uni-runtime",
     "crates/uni-widgets",
     "crates/uni-reactor",
+    "crates/uni-shells",
+    "crates/slint-import",
+    "crates/uni-synthesis",
+    "crates/flutter-import",
+    "crates/swiftui-import",
 ]
 
 [workspace.package]

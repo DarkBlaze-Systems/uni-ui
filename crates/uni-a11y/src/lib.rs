@@ -26,9 +26,9 @@
 //! | `Rect` / `Frost` / `FrostedRect`   | `GenericContainer` (decorative) |
 //! | anything else                      | `GenericContainer` |
 
-use accesskit::{
-    Action, Node as A11yNode, NodeId as A11yNodeId, Rect, Role, Tree, TreeId, TreeUpdate,
-};
+use accesskit::{Action, Node as A11yNode, NodeId as A11yNodeId, Rect, Role, Tree, TreeId};
+/// Re-export so downstream crates can name the return type without a direct accesskit dep.
+pub use accesskit::TreeUpdate;
 
 use uni_core::{ComputedRect, Layout};
 use uni_ir::{Document, NodeId, Value};
@@ -148,9 +148,13 @@ fn walk(
 /// off a single, stable root the platform can anchor to). Each node carries its
 /// role, bounds, name, and any interactive actions.
 ///
+/// When `focused` is `Some(id)`, the tree update's `focus` field is set to the
+/// accesskit id of that IR node (so the platform highlights it). When `None`,
+/// focus defaults to the synthetic [`ROOT_ID`] (no node focused).
+///
 /// Feed the returned update to an `accesskit` platform adapter
 /// (e.g. `accesskit_winit`) to expose the UI to assistive technology.
-pub fn build_tree(doc: &Document, layout: &Layout) -> TreeUpdate {
+pub fn build_tree(doc: &Document, layout: &Layout, focused: Option<NodeId>) -> TreeUpdate {
     let mut nodes: Vec<(A11yNodeId, A11yNode)> = Vec::new();
 
     // Synthetic window root: the document's root (if any, and if laid out) hangs
@@ -166,11 +170,16 @@ pub fn build_tree(doc: &Document, layout: &Layout) -> TreeUpdate {
 
     nodes.push((ROOT_ID, root));
 
+    let focus = match focused {
+        Some(id) => a11y_id(id),
+        None => ROOT_ID,
+    };
+
     TreeUpdate {
         nodes,
         tree: Some(Tree::new(ROOT_ID)),
         tree_id: TreeId::ROOT,
-        focus: ROOT_ID,
+        focus,
     }
 }
 
@@ -270,7 +279,7 @@ mod tests {
         child(&mut doc, root, btn);
 
         let layout = uni_core::layout(&doc, (800.0, 600.0));
-        let update = build_tree(&doc, &layout);
+        let update = build_tree(&doc, &layout, None);
 
         // ---- Text node: Label role, name "Hi", bounds matching the layout. ----
         let a_text = find(&update, text);
@@ -325,7 +334,7 @@ mod tests {
     fn empty_document_yields_just_a_window_root() {
         let doc = Document::new();
         let layout = uni_core::layout(&doc, (640.0, 480.0));
-        let update = build_tree(&doc, &layout);
+        let update = build_tree(&doc, &layout, None);
 
         assert_eq!(update.nodes.len(), 1);
         let (id, win) = &update.nodes[0];

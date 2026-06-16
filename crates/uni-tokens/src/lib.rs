@@ -45,6 +45,24 @@ pub enum Variant {
 }
 
 // =============================================================================
+// ThemeMode
+// =============================================================================
+
+/// Light or dark theme — controls which palette substrate/ink pair is used.
+///
+/// The engine is **dark-first**: dark mode uses a near-black substrate with
+/// white ink; light mode inverts them. The accent and accent-based depth
+/// signals (glow, shadow) adapt to stay legible in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ThemeMode {
+    /// Dark chrome — near-black substrate, white ink. Default.
+    #[default]
+    Dark,
+    /// Light chrome — white substrate, near-black ink.
+    Light,
+}
+
+// =============================================================================
 // Palette
 // =============================================================================
 
@@ -93,21 +111,52 @@ pub struct Palette {
 
 impl Palette {
     /// The monochrome chrome for `variant`. Only `accent` varies.
+    /// Equivalent to `for_mode(ThemeMode::Light, variant)` — kept for
+    /// backward compatibility with existing call sites.
     pub const fn for_variant(variant: Variant) -> Self {
         Palette {
-            substrate: SUBSTRATE,
+            substrate: SUBSTRATE,       // white
             ink: NEAR_BLACK,
-            // Soft / faint ink are near-black at reduced alpha so they read as
-            // the same hue, just quieter, over the white substrate.
             ink_soft: 0x0a0a0aaa,
             ink_faint: 0x0a0a0a66,
-            // Glow is white light; shadow is near-black at low alpha. Both are
-            // achromatic on purpose — depth is light, never color.
             glow: 0xffffff66,
             shadow: 0x0a0a0a40,
             accent: match variant {
                 Variant::Internal => ACCENT_VIOLET,
                 Variant::Public => ACCENT_LIME,
+            },
+        }
+    }
+
+    /// Select the palette for a given [`ThemeMode`] + [`Variant`].
+    ///
+    /// - **Dark** (default): near-black substrate, white ink, white glow on
+    ///   dark backgrounds — this is the engine's primary aesthetic.
+    /// - **Light**: white substrate, near-black ink — for contexts that need
+    ///   a classic light appearance.
+    pub const fn for_mode(mode: ThemeMode, variant: Variant) -> Self {
+        let accent = match variant {
+            Variant::Internal => ACCENT_VIOLET,
+            Variant::Public => ACCENT_LIME,
+        };
+        match mode {
+            ThemeMode::Dark => Palette {
+                substrate: NEAR_BLACK,      // 0x0a0a0aff — the dark canvas
+                ink: 0xffffffff,            // white text/icons
+                ink_soft: 0xffffffaa,
+                ink_faint: 0xffffff66,
+                glow: 0xffffff22,           // subtle white rim light
+                shadow: 0x00000066,         // deeper shadow on dark
+                accent,
+            },
+            ThemeMode::Light => Palette {
+                substrate: SUBSTRATE,       // 0xffffffff — white canvas
+                ink: NEAR_BLACK,
+                ink_soft: 0x0a0a0aaa,
+                ink_faint: 0x0a0a0a66,
+                glow: 0xffffff66,
+                shadow: 0x0a0a0a40,
+                accent,
             },
         }
     }

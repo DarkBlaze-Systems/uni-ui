@@ -4,3 +4,6 @@
 *.env
 mcp.env
 darkai_api-approved.md
+
+# agent worktrees (ephemeral)
+.claude/worktrees/

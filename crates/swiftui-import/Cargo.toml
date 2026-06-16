@@ -1,0 +1,10 @@
+[package]
+name = "swiftui-import"
+description = "DarkBlaze Uni-UI — clean-room SwiftUI view importer: lowers SwiftUI view trees to uni-ir."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-ir = { path = "../uni-ir" }

@@ -45,3 +45,9 @@ pub use winit_input::translate_window_event;
 
 mod wgpu_backend;
 pub use wgpu_backend::WgpuRenderer;
+
+// The canvas (software) backend has no platform deps — always compiled so
+// rust-analyzer can provide IDE services. The `canvas` feature gates nothing
+// here; it exists for downstream crates that want an explicit opt-in.
+pub mod canvas_backend;
+pub use canvas_backend::CanvasRenderer;

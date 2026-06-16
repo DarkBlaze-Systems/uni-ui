@@ -1,0 +1,10 @@
+[package]
+name = "slint-import"
+description = "DarkBlaze Uni-UI — clean-room Slint DSL importer: lowers .slint markup to uni-ir."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-ir = { path = "../uni-ir" }

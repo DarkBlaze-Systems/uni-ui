@@ -1,0 +1,10 @@
+[package]
+name = "flutter-import"
+description = "DarkBlaze Uni-UI — clean-room Flutter/Dart widget importer: lowers Flutter widget trees to uni-ir."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-ir = { path = "../uni-ir" }

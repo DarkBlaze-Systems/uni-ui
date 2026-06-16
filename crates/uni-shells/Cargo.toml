@@ -1,6 +1,6 @@
 [package]
-name = "uni-widgets"
-description = "DarkBlaze Uni-UI — widget library: styled, interactive uni-ir subtrees (Button, Label, Checkbox, Card, List)."
+name = "uni-shells"
+description = "DarkBlaze Uni-UI — adaptive shell widgets: Smart-Topbar and other OS-chrome surfaces that morph between stages via spring animation."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,5 +9,5 @@ publish.workspace = true
 [dependencies]
 uni-ir = { path = "../uni-ir" }
 uni-tokens = { path = "../uni-tokens" }
-uni-core = { path = "../uni-core" }
+uni-spring = { path = "../uni-spring" }
 uni-env = { path = "../uni-env" }

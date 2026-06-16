@@ -1,3 +1,6 @@
+[features]
+canvas = []
+
 [package]
 name = "uni-render"
 version.workspace = true
@@ -25,6 +28,9 @@ lyon = "1.0"
 # Text shaping/layout + GPU atlas drawing.
 cosmic-text = "0.12"
 glyphon = "0.6"
+
+# Runtime-detected SIMD for color-space math in the software canvas backend.
+uni-simd = { path = "../uni-simd" }
 
 [[example]]
 name = "hello"

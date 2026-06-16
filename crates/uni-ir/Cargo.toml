@@ -10,3 +10,12 @@ publish.workspace = true
 # mutation stream; everything else in the engine lowers into it or consumes
 # its mutations. Standard library only.
 [dependencies]
+
+# Dev-only: the three foreign-language importers, used by examples to prove
+# that Slint / Flutter / SwiftUI all converge onto this one IR vocabulary.
+# (These crates depend on uni-ir; the resulting dev-dependency cycle is
+# permitted by cargo because it only affects test/example builds.)
+[dev-dependencies]
+slint-import = { path = "../slint-import" }
+flutter-import = { path = "../flutter-import" }
+swiftui-import = { path = "../swiftui-import" }

@@ -47,6 +47,9 @@ pub enum Value {
     Text(String),
     Color(u32),
     Px(f32),
+    /// A heterogeneous list of values — used by `For` binding to carry per-item
+    /// data from the `Store` into the repeated subtree.
+    List(Vec<Value>),
 }
 
 /// A named action invoked when an event fires on a node (rung 3: interaction).

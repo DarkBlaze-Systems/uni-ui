@@ -21,13 +21,13 @@
 //! dotted path such as `"user.name"` — looked up verbatim in the [`Store`]).
 //! There is no expression grammar yet; richer evaluation is a later rung.
 //!
-//! ## `For` limitation (v0)
+//! ## `For` expansion
 //!
-//! `For` is **count-based** in v0: its `bindings["items"]` must resolve to a
-//! [`Value::Int(n)`], and the template children are repeated `n` times with
-//! fresh [`NodeId`]s. There is no per-item data binding — each instance is an
-//! identical structural copy. Real per-item iteration needs a `Value::List`
-//! variant in `uni-ir` (out of scope here); see the crate-level note.
+//! `For` supports two binding shapes. If `bindings["items"]` resolves to
+//! `Value::Int(n)`, the template children are repeated `n` times (count path).
+//! If it resolves to `Value::List(items)`, the template children are repeated
+//! once per item; each cloned root child receives an `item` prop (the item
+//! value) and an `index` prop (`Value::Int(i)`).
 
 use std::collections::BTreeMap;
 
@@ -110,6 +110,63 @@ impl Store {
 impl Default for Store {
     fn default() -> Self {
         Store::new()
+    }
+}
+
+impl Store {
+    /// Snapshot the current store to a simple key=value text format.
+    /// Format: one "key\ttype\tencoded_value\n" line per entry.
+    /// Only entries with a set value are included.
+    pub fn snapshot(&self) -> String {
+        let mut out = String::new();
+        for (k, sig) in &self.cells {
+            if let Some(v) = sig.get() {
+                let (ty, val) = encode_value(&v);
+                out.push_str(&format!("{k}\t{ty}\t{val}\n"));
+            }
+        }
+        out
+    }
+
+    /// Restore from a snapshot produced by [`Store::snapshot`].
+    /// Unknown keys are silently skipped. Returns the number of keys restored.
+    pub fn restore(&mut self, snapshot: &str) -> usize {
+        let mut count = 0;
+        for line in snapshot.lines() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            if let Some(v) = decode_value(parts[1], parts[2]) {
+                self.set(parts[0], v);
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+fn encode_value(v: &Value) -> (&'static str, String) {
+    match v {
+        Value::Bool(b) => ("bool", b.to_string()),
+        Value::Int(n) => ("int", n.to_string()),
+        Value::Float(f) => ("float", f.to_string()),
+        Value::Text(s) => ("text", s.replace('\n', "\\n").replace('\t', "\\t")),
+        Value::Color(c) => ("color", format!("{c:08X}")),
+        Value::Px(f) => ("px", f.to_string()),
+        Value::List(items) => ("list", items.len().to_string()), // shallow: count only
+    }
+}
+
+fn decode_value(ty: &str, val: &str) -> Option<Value> {
+    match ty {
+        "bool" => Some(Value::Bool(val == "true")),
+        "int" => val.parse().ok().map(Value::Int),
+        "float" => val.parse().ok().map(Value::Float),
+        "text" => Some(Value::Text(val.replace("\\n", "\n").replace("\\t", "\t"))),
+        "color" => u32::from_str_radix(val, 16).ok().map(Value::Color),
+        "px" => val.parse().ok().map(Value::Px),
+        _ => None,
     }
 }
 
@@ -210,17 +267,48 @@ fn resolve_into(
                 .bindings
                 .get("items")
                 .and_then(|b| eval_binding(b, store));
-            let count = match items {
-                Some(Value::Int(n)) if n > 0 => n as usize,
-                _ => 0,
-            };
-            // Repeat the template children `count` times, in place. Each pass
-            // re-resolves the template against the store with fresh ids.
             let mut emitted = Vec::new();
-            for _ in 0..count {
-                for &child in &node.children {
-                    emitted.extend(resolve_into(src, child, store, out));
+            match items {
+                Some(Value::List(list)) => {
+                    // Per-item expansion: one pass per item, injecting `item`
+                    // and `index` props onto each cloned root child.
+                    for (i, item_val) in list.iter().enumerate() {
+                        for &child in &node.children {
+                            let child_ids = resolve_into(src, child, store, out);
+                            for new_child in child_ids {
+                                // Inject `item` and `index` onto the cloned root child.
+                                out.apply_from(
+                                    Origin::System,
+                                    Mutation::SetProp {
+                                        id: new_child,
+                                        key: "item".into(),
+                                        value: item_val.clone(),
+                                    },
+                                )
+                                .expect("node just created");
+                                out.apply_from(
+                                    Origin::System,
+                                    Mutation::SetProp {
+                                        id: new_child,
+                                        key: "index".into(),
+                                        value: Value::Int(i as i64),
+                                    },
+                                )
+                                .expect("node just created");
+                                emitted.push(new_child);
+                            }
+                        }
+                    }
                 }
+                Some(Value::Int(n)) if n > 0 => {
+                    // Count-based expansion (v0 path): repeat template `n` times.
+                    for _ in 0..n as usize {
+                        for &child in &node.children {
+                            emitted.extend(resolve_into(src, child, store, out));
+                        }
+                    }
+                }
+                _ => {} // 0 or unset: emit nothing
             }
             emitted
         }
@@ -596,6 +684,123 @@ mod tests {
             r2.get(t2).unwrap().props.get("content"),
             Some(&Value::Text("second".into()))
         );
+    }
+
+    #[test]
+    fn for_expands_by_list_count() {
+        // A For node bound to a List of 3 items expands into 3 children,
+        // each carrying `item` and `index` props.
+        use uni_ir::{Binding, Document, Mutation, NodeId, Origin, Value};
+        use crate::Store;
+
+        let mut doc = Document::new();
+        // root Stack
+        let root = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id: root, kind: "Stack".into() }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: root }).unwrap();
+        // For node bound to "items"
+        let for_node = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id: for_node, kind: "For".into() }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetBinding {
+            id: for_node, key: "items".into(),
+            binding: Binding { expr: "items".into() },
+        }).unwrap();
+        doc.apply_from(Origin::System, Mutation::AppendChild { parent: root, child: for_node }).unwrap();
+        // Template child inside For: a Text node
+        let template = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id: template, kind: "Text".into() }).unwrap();
+        doc.apply_from(Origin::System, Mutation::AppendChild { parent: for_node, child: template }).unwrap();
+
+        let mut store = Store::new();
+        store.set("items", Value::List(vec![
+            Value::Text("apple".into()),
+            Value::Text("banana".into()),
+            Value::Text("cherry".into()),
+        ]));
+
+        let resolved = crate::resolve(&doc, &store);
+
+        // The For node should have been replaced by 3 children in the root.
+        let _root_node = resolved.get(resolved.root().unwrap()).unwrap();
+        // The For placeholder itself may or may not remain; what matters is
+        // that 3 expanded Text nodes exist in the tree.
+        let mut text_count = 0;
+        fn count_text(doc: &Document, id: NodeId, n: &mut usize) {
+            if let Some(node) = doc.get(id) {
+                if node.kind == "Text" { *n += 1; }
+                for &c in &node.children { count_text(doc, c, n); }
+            }
+        }
+        count_text(&resolved, resolved.root().unwrap(), &mut text_count);
+        assert_eq!(text_count, 3, "expected 3 Text nodes from list expansion");
+
+        // Also verify `item` and `index` props are set on each Text node.
+        let texts = find_kind(&resolved, "Text");
+        let expected_items = ["apple", "banana", "cherry"];
+        for (i, &tid) in texts.iter().enumerate() {
+            let node = resolved.get(tid).unwrap();
+            assert_eq!(
+                node.props.get("item"),
+                Some(&Value::Text(expected_items[i].into())),
+                "Text[{i}] should have item prop"
+            );
+            assert_eq!(
+                node.props.get("index"),
+                Some(&Value::Int(i as i64)),
+                "Text[{i}] should have index prop"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_and_restore_roundtrip() {
+        let mut store = Store::new();
+        store.set("flag", Value::Bool(true));
+        store.set("count", Value::Int(42));
+        store.set("ratio", Value::Float(3.14));
+        store.set("label", Value::Text("hello\nworld".into()));
+        store.set("accent", Value::Color(0x7D39_EBFF));
+        store.set("size", Value::Px(16.5));
+
+        let snap = store.snapshot();
+
+        let mut store2 = Store::new();
+        let restored = store2.restore(&snap);
+
+        assert_eq!(restored, 6, "all 6 keys should restore");
+        assert_eq!(store2.get("flag"), Some(Value::Bool(true)));
+        assert_eq!(store2.get("count"), Some(Value::Int(42)));
+        assert_eq!(store2.get("label"), Some(Value::Text("hello\nworld".into())));
+        assert_eq!(store2.get("accent"), Some(Value::Color(0x7D39_EBFF)));
+        assert_eq!(store2.get("size"), Some(Value::Px(16.5)));
+        // Float roundtrip — check approximate equality.
+        if let Some(Value::Float(f)) = store2.get("ratio") {
+            assert!((f - 3.14).abs() < 1e-9);
+        } else {
+            panic!("ratio should be a Float");
+        }
+    }
+
+    #[test]
+    fn restore_partial_snapshot() {
+        // A snapshot that only has some keys; other keys in the store are untouched.
+        let mut store = Store::new();
+        store.set("existing", Value::Int(99));
+
+        let partial = "newkey\tint\t7\n";
+        let restored = store.restore(partial);
+
+        assert_eq!(restored, 1);
+        assert_eq!(store.get("newkey"), Some(Value::Int(7)));
+        // Pre-existing key is untouched.
+        assert_eq!(store.get("existing"), Some(Value::Int(99)));
+    }
+
+    #[test]
+    fn snapshot_empty_store_is_empty_string() {
+        let store = Store::new();
+        let snap = store.snapshot();
+        assert!(snap.is_empty(), "empty store snapshots to empty string");
     }
 
     /// The resolved document is plain literal IR that `uni_core::layout` accepts.

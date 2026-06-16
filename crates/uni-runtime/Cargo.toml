@@ -6,6 +6,11 @@ edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# The browser/wasm canvas-host leaf (software CanvasRenderer). Native-testable;
+# the wasm-bindgen JS glue is additive and target-gated.
+web = []
+
 [dependencies]
 uni-ir = { path = "../uni-ir" }
 uni-core = { path = "../uni-core" }
@@ -14,7 +19,12 @@ uni-react = { path = "../uni-react" }
 uni-reactor = { path = "../uni-reactor" }
 uni-widgets = { path = "../uni-widgets" }
 uni-dsl = { path = "../uni-dsl" }
+uni-env = { path = "../uni-env" }
+uni-spring = { path = "../uni-spring" }
+uni-a11y = { path = "../uni-a11y" }
 winit = "0.30"
+accesskit = "0.24"
+accesskit_winit = "0.33"
 
 [dev-dependencies]
 uni-tokens = { path = "../uni-tokens" }

@@ -59,16 +59,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use uni_a11y::build_tree;
 use uni_core::{hit_test, layout, paint, Layout};
+use uni_env::Env;
 use uni_ir::{Action, Document, Mutation, NodeId, Origin};
 use uni_reactor::Store;
 use uni_render::{
     translate_window_event, InputEvent, PointerButton, RenderError, Renderer, Scene, WgpuRenderer,
 };
-use winit::application::ApplicationHandler;
+use uni_spring::{Spring, SpringState};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::window::Window;
 
 /// A handler bound to an [`Action`] name (rung 4: state-driven).
 ///
@@ -84,6 +86,14 @@ use winit::window::{Window, WindowId};
 /// the very next repaint. Handlers are `FnMut` so they can carry mutable state
 /// (e.g. a counter), though the canonical place for app state is the [`Store`].
 pub type Handler = Box<dyn FnMut(&mut Store, Origin)>;
+
+/// A single active spring animation: drives one named prop on one node per-frame.
+struct AnimationEntry {
+    id: NodeId,
+    prop: String,
+    spring: Spring,
+    state: SpringState,
+}
 
 /// The interactive runtime: the live document, its layout/viewport, the handler
 /// registry, and (optionally) a window + GPU renderer.
@@ -111,12 +121,19 @@ pub struct Runtime {
     /// The window + renderer. `None` when running headless.
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
+    /// The current environment derived from the viewport.
+    env: Env,
+    /// Active spring animations: each entry drives one prop on one node per-frame.
+    animations: Vec<AnimationEntry>,
+    /// Currently focused node (Tab/arrow-key navigation target).
+    focused: Option<NodeId>,
 }
 
 impl Runtime {
     /// Build a runtime around an existing [`Document`] for the given logical
     /// `viewport`. No window is created — this is the headless/testable form.
     pub fn new(doc: Document, viewport: (f32, f32)) -> Self {
+        let env = Env::for_window(viewport.0, viewport.1);
         let mut rt = Runtime {
             doc,
             store: Store::new(),
@@ -126,6 +143,9 @@ impl Runtime {
             cursor: (0.0, 0.0),
             window: None,
             renderer: None,
+            env,
+            animations: Vec::new(),
+            focused: None,
         };
         // Push any state already present into the bound props, then lay out, so
         // the very first frame reflects the store (not just literal defaults).
@@ -162,6 +182,57 @@ impl Runtime {
     /// push the values into the bound props.
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
+    }
+
+    /// The current [`Env`] (viewport-derived: size class, accent, input mode).
+    pub fn env(&self) -> Env {
+        self.env
+    }
+
+    /// Mutable access — override input_mode, build_variant, etc. before running.
+    pub fn env_mut(&mut self) -> &mut Env {
+        &mut self.env
+    }
+
+    /// Start (or replace) a spring animation driving `prop` on `id` from
+    /// `from` toward `target`. The animation runs until settled.
+    pub fn animate(&mut self, id: NodeId, prop: &str, from: f32, target: f32, spring: Spring) {
+        self.animations.retain(|a| !(a.id == id && a.prop == prop));
+        self.animations.push(AnimationEntry {
+            id,
+            prop: prop.to_string(),
+            spring,
+            state: SpringState::new(from, target),
+        });
+    }
+
+    /// True when all animations have settled.
+    pub fn animations_settled(&self) -> bool {
+        self.animations.is_empty()
+    }
+
+    /// Step all active spring animations by `dt` seconds, apply the resulting
+    /// `Px` prop values to the document (Origin::System), remove settled ones,
+    /// and re-layout if anything moved. Returns `true` when animations remain.
+    pub fn tick_animations(&mut self, dt: f32) -> bool {
+        const EPS: f32 = 0.5; // pixel-level settle threshold
+        if self.animations.is_empty() {
+            return false;
+        }
+        let mut updates: Vec<(NodeId, String, f32)> = Vec::new();
+        for entry in &mut self.animations {
+            entry.state.step(&entry.spring, dt);
+            updates.push((entry.id, entry.prop.clone(), entry.state.value));
+        }
+        self.animations.retain(|a| !a.state.is_settled(EPS));
+        for (id, prop, value) in updates {
+            let _ = self.doc.apply_from(
+                Origin::System,
+                Mutation::SetProp { id, key: prop, value: uni_ir::Value::Px(value) },
+            );
+        }
+        self.relayout();
+        !self.animations.is_empty()
     }
 
     /// **Push live state into the literal props of bound nodes — id-stable.**
@@ -225,6 +296,7 @@ impl Runtime {
     /// Set the viewport and recompute the layout.
     pub fn set_viewport(&mut self, viewport: (f32, f32)) {
         self.viewport = viewport;
+        self.env = Env::for_window(viewport.0, viewport.1);
         self.relayout();
     }
 
@@ -290,8 +362,9 @@ impl Runtime {
 
     /// Feed one renderer-agnostic [`InputEvent`] in. On a left `PointerDown`,
     /// hit-test + bubble to a `"click"` handler and fire it as [`Origin::Human`].
+    /// `Tab` moves keyboard focus forward; `Enter`/`Space` activate the focused node.
     ///
-    /// Returns `true` if a click was handled (so a caller without a window can
+    /// Returns `true` if the event was handled (so a caller without a window can
     /// tell something happened; the windowed loop uses it to request a redraw).
     pub fn on_input(&mut self, input: &InputEvent) -> bool {
         match input {
@@ -305,10 +378,19 @@ impl Runtime {
                 button: PointerButton::Left,
             } => {
                 self.cursor = (*x, *y);
-                match self.bubble_to_handler((*x, *y), "click") {
-                    Some(target) => self.dispatch(target, "click", Origin::Human),
-                    None => false,
+                // If the hit node is focusable, move keyboard focus to it.
+                if let Some(hit) = self.bubble_to_handler((*x, *y), "click") {
+                    self.focused = Some(hit);
+                    self.dispatch(hit, "click", Origin::Human)
+                } else {
+                    false
                 }
+            }
+            InputEvent::KeyDown { key } if key == "Tab" => {
+                self.move_focus(true)
+            }
+            InputEvent::KeyDown { key } if key == "Enter" || key == " " => {
+                self.activate_focused()
             }
             _ => false,
         }
@@ -330,9 +412,16 @@ impl Runtime {
     /// initial logical size becomes the viewport. Press a window's close button
     /// to exit; the audit log is printed on exit.
     pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let event_loop = EventLoop::new()?;
+        let event_loop = winit::event_loop::EventLoop::<accesskit_winit::Event>::with_user_event()
+            .build()?;
         event_loop.set_control_flow(ControlFlow::Wait);
-        let mut app = WindowedApp { rt: self };
+        let proxy = event_loop.create_proxy();
+        let mut app = WindowedApp {
+            rt: self,
+            a11y: None,
+            proxy,
+            last_frame: None,
+        };
         event_loop.run_app(&mut app)?;
         Ok(())
     }
@@ -363,15 +452,113 @@ impl Runtime {
         }
         (human, ai)
     }
+
+    /// Return the currently focused node id, if any.
+    pub fn focused(&self) -> Option<NodeId> {
+        self.focused
+    }
+
+    /// Move focus to the next/previous focusable node in tree order.
+    ///
+    /// Focusable nodes are those with a `"click"` callback. Returns `true` if
+    /// there is at least one focusable node (focus moved); `false` otherwise.
+    pub fn move_focus(&mut self, forward: bool) -> bool {
+        let focusable = self.focusable_nodes();
+        if focusable.is_empty() {
+            return false;
+        }
+        let next = match self.focused {
+            None => {
+                if forward {
+                    0
+                } else {
+                    focusable.len() - 1
+                }
+            }
+            Some(cur) => {
+                let pos = focusable.iter().position(|&id| id == cur).unwrap_or(0);
+                if forward {
+                    (pos + 1) % focusable.len()
+                } else {
+                    (pos + focusable.len() - 1) % focusable.len()
+                }
+            }
+        };
+        self.focused = Some(focusable[next]);
+        true
+    }
+
+    /// All nodes that have a `"click"` callback, in layout order.
+    fn focusable_nodes(&self) -> Vec<NodeId> {
+        self.layout
+            .order()
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.doc
+                    .get(id)
+                    .map(|n| n.callbacks.contains_key("click"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Activate (fire `"click"`) on the currently focused node.
+    ///
+    /// Returns `true` if a handler ran (same semantics as [`Runtime::dispatch`]).
+    pub fn activate_focused(&mut self) -> bool {
+        match self.focused {
+            Some(id) => self.dispatch(id, "click", Origin::Human),
+            None => false,
+        }
+    }
+
+    /// Get the current a11y tree update reflecting the current focus state.
+    pub fn a11y_update(&self) -> uni_a11y::TreeUpdate {
+        uni_a11y::build_tree(&self.doc, &self.layout, self.focused)
+    }
 }
 
 /// The winit `ApplicationHandler` wrapper that drives a [`Runtime`] against a
 /// live window + GPU renderer.
 struct WindowedApp {
     rt: Runtime,
+    a11y: Option<accesskit_winit::Adapter>,
+    proxy: winit::event_loop::EventLoopProxy<accesskit_winit::Event>,
+    last_frame: Option<std::time::Instant>,
 }
 
-impl ApplicationHandler for WindowedApp {
+impl winit::application::ApplicationHandler<accesskit_winit::Event> for WindowedApp {
+    fn user_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        event: accesskit_winit::Event,
+    ) {
+        match event.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => {
+                // The a11y platform needs the initial tree now. Push the full tree.
+                if let Some(a11y) = &mut self.a11y {
+                    let doc = &self.rt.doc;
+                    let layout = &self.rt.layout;
+                    let focused = self.rt.focused;
+                    a11y.update_if_active(|| build_tree(doc, layout, focused));
+                }
+            }
+            accesskit_winit::WindowEvent::ActionRequested(req) => {
+                use accesskit::Action;
+                if req.action == Action::Click {
+                    let ir_id = NodeId(req.target_node.0.wrapping_sub(1));
+                    if self.rt.dispatch(ir_id, "click", Origin::Human) {
+                        if let Some(w) = self.rt.window.clone() {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            }
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.rt.window.is_some() {
             return;
@@ -379,7 +566,8 @@ impl ApplicationHandler for WindowedApp {
         let (vw, vh) = self.rt.viewport;
         let attrs = Window::default_attributes()
             .with_title("Uni-UI — interactive runtime")
-            .with_inner_size(winit::dpi::LogicalSize::new(vw as f64, vh as f64));
+            .with_inner_size(winit::dpi::LogicalSize::new(vw as f64, vh as f64))
+            .with_visible(false); // Must be invisible before creating a11y adapter
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -391,44 +579,76 @@ impl ApplicationHandler for WindowedApp {
         match WgpuRenderer::new(window.clone()) {
             Ok(r) => {
                 self.rt.renderer = Some(r);
-                self.rt.window = Some(window);
-                eprintln!(
-                    "uni-runtime: click the button (Human fire) or press 'A' (AI fire). \
-                     Close the window to print the audit log."
-                );
             }
             Err(e) => {
                 eprintln!("renderer init failed: {e}");
                 event_loop.exit();
+                return;
             }
         }
+        // Create accessibility adapter BEFORE making the window visible.
+        let adapter = accesskit_winit::Adapter::with_event_loop_proxy(
+            event_loop,
+            window.as_ref(),
+            self.proxy.clone(),
+        );
+        self.a11y = Some(adapter);
+        // Now show the window.
+        window.set_visible(true);
+        self.rt.window = Some(window);
+        self.last_frame = Some(std::time::Instant::now());
+        // Push the initial a11y tree now that activation will have been triggered.
+        if let Some(a11y) = &mut self.a11y {
+            let doc = &self.rt.doc;
+            let layout = &self.rt.layout;
+            let focused = self.rt.focused;
+            a11y.update_if_active(|| build_tree(doc, layout, focused));
+        }
+        eprintln!(
+            "uni-runtime: click the button (Human fire) or press 'A' (AI fire). \
+             Close the window to print the audit log."
+        );
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
         let Some(window) = self.rt.window.clone() else {
             return;
         };
 
-        // Translate the window event into our renderer-agnostic InputEvent and
-        // feed it through the audited input path. A handled click requests a
-        // repaint. We also special-case the 'A' key to demonstrate ai_fire on
-        // the same surface.
+        if let Some(a11y) = &mut self.a11y {
+            a11y.process_event(window.as_ref(), &event);
+        }
+
         if let Some(input) =
             translate_window_event(&event, window.scale_factor(), &mut self.rt.cursor)
         {
             match &input {
                 InputEvent::KeyDown { key } if key.eq_ignore_ascii_case("a") => {
-                    // Cowork proof, live: the AI fires "click" on whatever node
-                    // would handle a click under the current cursor (falling
-                    // back to any node that has a click handler).
                     if let Some(target) = self.rt.ai_click_target() {
                         if self.rt.ai_fire(target, "click") {
+                            if let Some(a11y) = &mut self.a11y {
+                                let doc = &self.rt.doc;
+                                let layout = &self.rt.layout;
+                                let focused = self.rt.focused;
+                                a11y.update_if_active(|| build_tree(doc, layout, focused));
+                            }
                             window.request_redraw();
                         }
                     }
                 }
                 _ => {
                     if self.rt.on_input(&input) {
+                        if let Some(a11y) = &mut self.a11y {
+                            let doc = &self.rt.doc;
+                            let layout = &self.rt.layout;
+                            let focused = self.rt.focused;
+                            a11y.update_if_active(|| build_tree(doc, layout, focused));
+                        }
                         window.request_redraw();
                     }
                 }
@@ -447,6 +667,12 @@ impl ApplicationHandler for WindowedApp {
                 let scale = window.scale_factor() as f32;
                 self.rt
                     .set_viewport((size.width as f32 / scale, size.height as f32 / scale));
+                if let Some(a11y) = &mut self.a11y {
+                    let doc = &self.rt.doc;
+                    let layout = &self.rt.layout;
+                    let focused = self.rt.focused;
+                    a11y.update_if_active(|| build_tree(doc, layout, focused));
+                }
                 window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -456,6 +682,23 @@ impl ApplicationHandler for WindowedApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let dt = self
+                    .last_frame
+                    .map(|t| {
+                        let now = std::time::Instant::now();
+                        now.duration_since(t).as_secs_f32()
+                    })
+                    .unwrap_or(1.0 / 60.0);
+                self.last_frame = Some(std::time::Instant::now());
+
+                let animating = self.rt.tick_animations(dt);
+                if animating {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                    window.request_redraw();
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
+
                 let scene = self.rt.scene();
                 if let Some(r) = self.rt.renderer.as_mut() {
                     match r.render(&scene) {
@@ -492,6 +735,121 @@ impl Runtime {
                     .map(|n| n.callbacks.contains_key("click"))
                     .unwrap_or(false)
             })
+    }
+}
+
+// ============================================================================
+// Web / wasm canvas-host leaf (THE FLOW: a swappable Platform+Renderer leaf)
+// ============================================================================
+
+/// The browser/wasm canvas host.
+///
+/// On the web there is no winit window or GPU surface to own up-front, so this
+/// leaf pairs a [`Runtime`] (the audited fire→handler→state→sync→spring core,
+/// unchanged) with a software [`uni_render::CanvasRenderer`] that paints into an
+/// in-memory RGBA buffer. A browser copies that buffer into a `<canvas>` (or it
+/// is asserted in a headless test). The same `Document`, `Store`, `Origin`
+/// audit path, springs, and adaptive `Env` drive it — only the platform seam
+/// (windowing + rasterizer) is swapped, exactly as THE FLOW intends.
+///
+/// The wasm-bindgen JS entry points are additive and target-gated
+/// (`#[cfg(target_arch = "wasm32")]`); this core is pure and native-testable.
+#[cfg(feature = "web")]
+pub mod web {
+    use super::Runtime;
+    use uni_ir::{Document, NodeId};
+    use uni_render::{CanvasRenderer, InputEvent, PointerButton, Renderer};
+
+    /// A canvas-backed UI host for the wasm/WebGPU target.
+    pub struct CanvasHost {
+        rt: Runtime,
+        renderer: CanvasRenderer,
+        width: u32,
+        height: u32,
+    }
+
+    impl CanvasHost {
+        /// Build a host around an existing [`Document`] at the given pixel size.
+        pub fn new(doc: Document, width: u32, height: u32) -> Self {
+            let rt = Runtime::new(doc, (width as f32, height as f32));
+            let renderer = CanvasRenderer::new(width, height);
+            let mut host = Self { rt, renderer, width, height };
+            host.render();
+            host
+        }
+
+        /// Parse `.uni` source and build a host at the given size.
+        pub fn from_uni(
+            src: &str,
+            width: u32,
+            height: u32,
+        ) -> Result<Self, uni_dsl::ParseError> {
+            Ok(Self::new(uni_dsl::parse(src)?, width, height))
+        }
+
+        /// Borrow the inner runtime (audit log, store, doc).
+        pub fn runtime(&self) -> &Runtime {
+            &self.rt
+        }
+
+        /// Mutable runtime access (register handlers, seed state, `ai_fire`).
+        pub fn runtime_mut(&mut self) -> &mut Runtime {
+            &mut self.rt
+        }
+
+        /// Advance spring animations by `dt` seconds and repaint. Returns `true`
+        /// while animations are still running (the browser should keep its
+        /// `requestAnimationFrame` loop alive).
+        pub fn tick(&mut self, dt: f32) -> bool {
+            let animating = self.rt.tick_animations(dt);
+            self.render();
+            animating
+        }
+
+        /// Feed a left pointer-down at `(x, y)` logical px (the audited Human
+        /// path). Repaints and returns `true` if a click was handled.
+        pub fn pointer_down(&mut self, x: f32, y: f32) -> bool {
+            let handled = self.rt.on_input(&InputEvent::PointerDown {
+                x,
+                y,
+                button: PointerButton::Left,
+            });
+            if handled {
+                self.render();
+            }
+            handled
+        }
+
+        /// Fire `event` on `target` as the AI — the same audited surface, proving
+        /// cowork on the web target too.
+        pub fn ai_fire(&mut self, target: NodeId, event: &str) -> bool {
+            let fired = self.rt.ai_fire(target, event);
+            if fired {
+                self.render();
+            }
+            fired
+        }
+
+        /// Resize the canvas + viewport and repaint.
+        pub fn resize(&mut self, width: u32, height: u32) {
+            self.width = width;
+            self.height = height;
+            self.renderer.resize(width, height, 1.0);
+            self.rt.set_viewport((width as f32, height as f32));
+            self.render();
+        }
+
+        /// The current RGBA pixel buffer (row-major, top-down) for blitting into
+        /// a browser `<canvas>` via `putImageData`.
+        pub fn pixels(&self) -> &[u8] {
+            &self.renderer.pixels
+        }
+
+        /// Paint the current scene into the canvas buffer.
+        pub fn render(&mut self) {
+            let scene = self.rt.scene();
+            let _ = self.renderer.render(&scene);
+        }
     }
 }
 
@@ -739,5 +1097,212 @@ mod tests {
         assert_eq!(rt.store().get("count"), None);
         let (human, ai) = rt.invoke_counts();
         assert_eq!((human, ai), (0, 0));
+    }
+
+    #[test]
+    fn env_tracks_viewport_size_class() {
+        use uni_env::WidthClass;
+        // Compact (< 600)
+        let rt = Runtime::new(Document::new(), (400.0, 800.0));
+        assert_eq!(rt.env().width_class(), WidthClass::Compact);
+
+        // Expanded (>= 840) after resize
+        let mut rt2 = Runtime::new(Document::new(), (400.0, 800.0));
+        rt2.set_viewport((1024.0, 768.0));
+        assert_eq!(rt2.env().width_class(), WidthClass::Expanded);
+    }
+
+    #[test]
+    fn animate_drives_prop_toward_target() {
+        let mut doc = Document::new();
+        let id = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id, kind: "Rect".into() }).unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id }).unwrap();
+
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+        rt.animate(id, "width", 0.0, 200.0, uni_spring::Spring::spatial());
+
+        assert!(!rt.animations_settled(), "animation should be running");
+
+        // Tick enough frames to settle (spatial spring, target=200).
+        let mut settled = false;
+        for _ in 0..10_000 {
+            if !rt.tick_animations(1.0 / 60.0) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "spring should settle in finite steps");
+        // The prop should now be close to 200.
+        let val = rt.doc().get(id).unwrap().props.get("width").cloned();
+        match val {
+            Some(uni_ir::Value::Px(v)) => assert!((v - 200.0).abs() < 1.0, "width={v}"),
+            other => panic!("expected Px, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_tree_built_headless() {
+        let rt = Runtime::from_uni(
+            r#"Stack { Text { content: "Hello"; } }"#,
+            (800.0, 600.0),
+        )
+        .unwrap();
+        let update = uni_a11y::build_tree(rt.doc(), rt.layout(), None);
+        // Should have at least 3 entries: window root + Stack + Text.
+        assert!(update.nodes.len() >= 3, "expected window+Stack+Text in a11y tree");
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyboard navigation tests (Task B / Task E)
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a Document with a root Row containing `count` Button nodes,
+    /// each carrying a "click" callback that fires the action "hit_{i}".
+    fn focusable_doc(count: usize) -> (Document, Vec<NodeId>) {
+        let mut doc = Document::new();
+        let row = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id: row, kind: "Row".into() })
+            .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: row }).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let btn = doc.fresh_id();
+            doc.apply_from(
+                Origin::System,
+                Mutation::CreateNode { id: btn, kind: "Stack".into() },
+            )
+            .unwrap();
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp { id: btn, key: "width".into(), value: Value::Px(60.0) },
+            )
+            .unwrap();
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp { id: btn, key: "height".into(), value: Value::Px(40.0) },
+            )
+            .unwrap();
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetCallback {
+                    id: btn,
+                    event: "click".into(),
+                    action: uni_ir::Action { name: format!("hit_{i}"), args: vec![] },
+                },
+            )
+            .unwrap();
+            doc.apply_from(
+                Origin::System,
+                Mutation::AppendChild { parent: row, child: btn },
+            )
+            .unwrap();
+            ids.push(btn);
+        }
+        (doc, ids)
+    }
+
+    #[test]
+    fn tab_moves_focus_to_focusable_node() {
+        let (doc, btns) = focusable_doc(3);
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        // Initially no focus.
+        assert_eq!(rt.focused(), None);
+
+        // First Tab: should focus the first focusable node.
+        let moved = rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
+        assert!(moved, "Tab should return true when focusable nodes exist");
+        assert_eq!(rt.focused(), Some(btns[0]), "first Tab focuses first node");
+
+        // Second Tab: moves to the next.
+        rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
+        assert_eq!(rt.focused(), Some(btns[1]), "second Tab focuses second node");
+
+        // Third Tab: moves to the third.
+        rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
+        assert_eq!(rt.focused(), Some(btns[2]), "third Tab focuses third node");
+    }
+
+    #[test]
+    fn enter_activates_focused_node() {
+        let (doc, btns) = focusable_doc(2);
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        // Register handlers for both buttons.
+        let hit0 = Rc::new(RefCell::new(0i64));
+        let hit1 = Rc::new(RefCell::new(0i64));
+        {
+            let h0 = hit0.clone();
+            rt.register("hit_0", Box::new(move |_s: &mut Store, _o: Origin| { *h0.borrow_mut() += 1; }));
+            let h1 = hit1.clone();
+            rt.register("hit_1", Box::new(move |_s: &mut Store, _o: Origin| { *h1.borrow_mut() += 1; }));
+        }
+
+        // Tab to the first button, then activate with Enter.
+        rt.on_input(&InputEvent::KeyDown { key: "Tab".into() });
+        assert_eq!(rt.focused(), Some(btns[0]));
+
+        let activated = rt.on_input(&InputEvent::KeyDown { key: "Enter".into() });
+        assert!(activated, "Enter on a focused node should return true");
+        assert_eq!(*hit0.borrow(), 1, "hit_0 handler should have fired once");
+        assert_eq!(*hit1.borrow(), 0, "hit_1 should not have fired");
+    }
+
+    #[test]
+    fn focus_wraps_around() {
+        let (doc, btns) = focusable_doc(3);
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+
+        // Tab three times to reach the last button.
+        rt.move_focus(true);
+        rt.move_focus(true);
+        rt.move_focus(true);
+        assert_eq!(rt.focused(), Some(btns[2]), "should be at last node");
+
+        // One more Tab should wrap to the first.
+        rt.move_focus(true);
+        assert_eq!(rt.focused(), Some(btns[0]), "Tab past last should wrap to first");
+
+        // Backward from first should wrap to last.
+        rt.move_focus(false);
+        assert_eq!(rt.focused(), Some(btns[2]), "backward from first should wrap to last");
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod web_tests {
+    use super::web::CanvasHost;
+
+    const UI: &str = r#"
+        Stack { padding: 12px; background: #101010;
+          Button { width: 120px; height: 40px; color: #7d39eb; corner_radius: 8px;
+                   on click: noop(); }
+        }
+    "#;
+
+    #[test]
+    fn canvas_host_renders_nonempty_pixels() {
+        let host = CanvasHost::from_uni(UI, 320, 200).expect("ui parses");
+        let px = host.pixels();
+        assert_eq!(px.len(), 320 * 200 * 4);
+        // The dark background fill makes at least some pixels non-zero.
+        assert!(px.iter().any(|&b| b != 0), "expected painted pixels");
+    }
+
+    #[test]
+    fn canvas_host_resize_changes_buffer_len() {
+        let mut host = CanvasHost::from_uni(UI, 100, 100).unwrap();
+        assert_eq!(host.pixels().len(), 100 * 100 * 4);
+        host.resize(200, 150);
+        assert_eq!(host.pixels().len(), 200 * 150 * 4);
+    }
+
+    #[test]
+    fn canvas_host_tick_settles() {
+        let mut host = CanvasHost::from_uni(UI, 64, 64).unwrap();
+        // With no active animation, tick reports not-animating immediately.
+        assert!(!host.tick(1.0 / 60.0));
     }
 }

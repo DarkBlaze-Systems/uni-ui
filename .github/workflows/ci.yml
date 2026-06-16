@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test (native)
+        working-directory: engine
+        run: cargo test --workspace
+      - name: Test canvas backend
+        working-directory: engine
+        run: cargo test -p uni-render --features canvas
+      - name: Wasm compile-check (pure crates)
+        working-directory: engine
+        run: |
+          cargo build -p uni-ir -p uni-tokens -p uni-spring -p uni-env \
+                      -p uni-dsl -p uni-reactor -p uni-shells -p slint-import \
+                      --target wasm32-unknown-unknown
