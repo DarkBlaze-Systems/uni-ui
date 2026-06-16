@@ -21,7 +21,9 @@
 //! |---------------------------|-----------------------------------------------|
 //! | `Stack` / `Column`        | flex, `flex_direction: Column`                |
 //! | `Row`                     | flex, `flex_direction: Row`                   |
-//! | `Grid`                    | CSS grid (`columns` prop → N equal columns)   |
+//! | `Grid`                    | CSS grid (`columns` prop → N equal `1fr` cols)|
+//! | `Form` / `Section`        | flex column, inset grouped-card background    |
+//! | `List` / `LazyVStack`     | windowed column (only visible rows are built) |
 //! | `Text`                    | leaf, intrinsic size measured from content    |
 //! | `Rect`                    | leaf (`width`/`height` or auto)               |
 //! | `Frost` / `FrostedRect`   | leaf (`width`/`height` or auto)               |
@@ -105,8 +107,21 @@ fn scale_alpha(color: u32, factor: f32) -> u32 {
 }
 
 /// Is this a flex/grid container kind (as opposed to a drawing leaf)?
+///
+/// `Form` / `Section` are vertical grouped containers (SwiftUI grouped-list
+/// look); `List` / `LazyVStack` are vertical scrolling containers that window
+/// their children to the visible range. All carry children, so they build a
+/// taffy subtree like the flex containers.
 fn is_container(kind: &str) -> bool {
-    matches!(kind, "Stack" | "Column" | "Row" | "Grid")
+    matches!(
+        kind,
+        "Stack" | "Column" | "Row" | "Grid" | "Form" | "Section" | "List" | "LazyVStack"
+    )
+}
+
+/// A vertically-scrolling, windowed list container (real virtualization).
+fn is_list(kind: &str) -> bool {
+    matches!(kind, "List" | "LazyVStack")
 }
 
 // ---------------------------------------------------------------------------
@@ -338,18 +353,42 @@ fn style_for(node: &Node, viewport: (f32, f32), is_root: bool) -> Style {
             style.flex_direction = FlexDirection::Row;
         }
         "Grid" => {
-            // v0 grid: flex row-wrap fallback (the task explicitly allows this
-            // — simpler and robust until full CSS-grid track sizing is wired).
-            // `columns` is read so children wrap after that many per row when a
-            // child width is set; the flex algorithm handles the rest.
+            // Real CSS grid: `columns` (Int) → N equal `1fr` tracks, so children
+            // flow into a fixed number of equal-width columns and auto-generated
+            // rows. `gap`/`spacing` (handled below for all containers) become the
+            // grid row/column gap. With no/invalid `columns` we fall back to a
+            // single 1fr column (graceful default — still a valid grid).
+            style.display = Display::Grid;
+            let cols = int_of(node, "columns").filter(|&c| c > 0).unwrap_or(1) as usize;
+            style.grid_template_columns =
+                std::iter::repeat_with(|| fr(1.0)).take(cols).collect();
+        }
+        "Form" | "Section" => {
+            // Grouped container: a vertical flex stack. `paint` draws the inset
+            // grouped-list background; here we just stack rows with section
+            // spacing. Default a comfortable inter-row gap if none is given.
             style.display = Display::Flex;
-            style.flex_direction = FlexDirection::Row;
-            style.flex_wrap = FlexWrap::Wrap;
-            let _ = int_of(node, "columns");
+            style.flex_direction = FlexDirection::Column;
+        }
+        "List" | "LazyVStack" => {
+            // Windowed scrolling list. The container is a positioning context;
+            // its visible children are placed absolutely at their scrolled y in
+            // `build_subtree` / `build_cached`. Default to filling its parent's
+            // cross axis so rows have a width to stretch into.
+            style.display = Display::Flex;
+            style.flex_direction = FlexDirection::Column;
         }
         _ => {
             // Leaf — no display override (stays Flex default, with no children).
         }
+    }
+
+    // Grouped containers default to a section-spacing gap when unset.
+    if matches!(node.kind.as_str(), "Form" | "Section")
+        && px_of(node, "gap").is_none()
+        && px_of(node, "spacing").is_none()
+    {
+        style.gap = Size::length(8.0);
     }
 
     if is_container(&node.kind) {
@@ -395,6 +434,51 @@ fn justify_of(s: &str) -> Option<JustifyContent> {
     }
 }
 
+/// Compute the **visible window** of a `List` / `LazyVStack`: which child
+/// indices actually need to exist this frame, and the absolute y each occupies
+/// inside the list (top-left origin, before the list's own position is added).
+///
+/// Real virtualization: given a uniform `item_height` (Px, required for
+/// windowing — without it we degrade to showing every child), the `gap` between
+/// rows, the `scroll_offset` (Px, how far the content has scrolled up), and the
+/// list's viewport height, we keep only the rows intersecting
+/// `[scroll_offset, scroll_offset + viewport_h]` plus a small overscan. Every
+/// other child is *never built into the taffy tree* — it costs nothing in
+/// layout or paint. Returns `(item_height, stride, visible)` where `visible`
+/// is `(child_index, content_y)` pairs in order, or `None` to mean "not
+/// windowed, build all children normally".
+/// `(window_top_y, total_content_height, [(row_index, content_y), …])`.
+type ListWindow = (f32, f32, Vec<(usize, f32)>);
+
+fn list_window(node: &Node, viewport_h: f32) -> Option<ListWindow> {
+    let item_h = px_of(node, "item_height").or_else(|| px_of(node, "row_height"))?;
+    if item_h <= 0.0 {
+        return None;
+    }
+    let gap = px_of(node, "gap").or_else(|| px_of(node, "spacing")).unwrap_or(0.0);
+    let stride = item_h + gap;
+    let scroll = px_of(node, "scroll_offset").unwrap_or(0.0).max(0.0);
+    // Overscan: render a little above/below the viewport so a fast scroll never
+    // flashes blank rows. One row, capped, is plenty.
+    let overscan = px_of(node, "overscan").unwrap_or(item_h.min(64.0)).max(0.0);
+
+    let count = node.children.len();
+    if count == 0 || stride <= 0.0 {
+        return Some((item_h, stride, Vec::new()));
+    }
+
+    let top = (scroll - overscan).max(0.0);
+    let bottom = scroll + viewport_h + overscan;
+    let first = (top / stride).floor() as usize;
+    // Last index whose row top is above `bottom` (exclusive upper bound).
+    let last = ((bottom / stride).ceil() as usize).min(count);
+
+    let visible = (first..last)
+        .map(|i| (i, i as f32 * stride))
+        .collect();
+    Some((item_h, stride, visible))
+}
+
 /// Recursively build the taffy subtree for `id`, recording the IR↔taffy id
 /// mapping. Leaves carry their IR id as node context so the measure function
 /// can give `Text` an intrinsic size.
@@ -409,7 +493,39 @@ fn build_subtree(
     let node = doc.get(id)?;
     let style = style_for(node, viewport, is_root);
 
-    let taffy_id = if is_container(&node.kind) {
+    let taffy_id = if is_list(&node.kind) {
+        if let Some((item_h, _stride, visible)) = list_window(node, viewport.1) {
+            // Windowed: build ONLY the visible children, each absolutely placed
+            // at its scrolled y. Off-screen children never enter the tree.
+            let scroll = px_of(node, "scroll_offset").unwrap_or(0.0).max(0.0);
+            let children: Vec<taffy::NodeId> = visible
+                .iter()
+                .filter_map(|&(ci, content_y)| {
+                    let child = *node.children.get(ci)?;
+                    let t = build_subtree(doc, child, viewport, false, tree, map)?;
+                    // Pin the row at its scrolled position, with the uniform height.
+                    if let Ok(mut s) = tree.style(t).cloned() {
+                        s.position = Position::Absolute;
+                        s.inset.left = length(0.0);
+                        s.inset.top = length(content_y - scroll);
+                        if s.size.height == Dimension::auto() {
+                            s.size.height = length(item_h);
+                        }
+                        let _ = tree.set_style(t, s);
+                    }
+                    Some(t)
+                })
+                .collect();
+            tree.new_with_children(style, &children).ok()?
+        } else {
+            let children: Vec<taffy::NodeId> = node
+                .children
+                .iter()
+                .filter_map(|&c| build_subtree(doc, c, viewport, false, tree, map))
+                .collect();
+            tree.new_with_children(style, &children).ok()?
+        }
+    } else if is_container(&node.kind) {
         let children: Vec<taffy::NodeId> = node
             .children
             .iter()
@@ -649,6 +765,12 @@ impl LayoutCache {
             return true;
         }
         let reachable = reachable_set(doc);
+        // Windowed lists only build their *visible* children into the tree, so
+        // the cache's node set is intentionally a subset of the reachable set
+        // and a scroll must re-window. Rebuild whenever a list is present.
+        if reachable.iter().any(|id| doc.get(*id).is_some_and(|n| is_list(&n.kind))) {
+            return true;
+        }
         if reachable.len() != self.fwd.len() {
             return true;
         }
@@ -685,7 +807,36 @@ impl LayoutCache {
     ) -> Option<taffy::NodeId> {
         let node = doc.get(id)?;
         let style = style_for(node, viewport, is_root);
-        let taffy_id = if is_container(&node.kind) {
+        let taffy_id = if is_list(&node.kind) {
+            if let Some((item_h, _stride, visible)) = list_window(node, viewport.1) {
+                let scroll = px_of(node, "scroll_offset").unwrap_or(0.0).max(0.0);
+                let children: Vec<taffy::NodeId> = visible
+                    .iter()
+                    .filter_map(|&(ci, content_y)| {
+                        let child = *node.children.get(ci)?;
+                        let t = self.build_cached(doc, child, viewport, false)?;
+                        if let Ok(mut s) = self.tree.style(t).cloned() {
+                            s.position = Position::Absolute;
+                            s.inset.left = length(0.0);
+                            s.inset.top = length(content_y - scroll);
+                            if s.size.height == Dimension::auto() {
+                                s.size.height = length(item_h);
+                            }
+                            let _ = self.tree.set_style(t, s);
+                        }
+                        Some(t)
+                    })
+                    .collect();
+                self.tree.new_with_children(style, &children).ok()?
+            } else {
+                let children: Vec<taffy::NodeId> = node
+                    .children
+                    .iter()
+                    .filter_map(|&c| self.build_cached(doc, c, viewport, false))
+                    .collect();
+                self.tree.new_with_children(style, &children).ok()?
+            }
+        } else if is_container(&node.kind) {
             let children: Vec<taffy::NodeId> = node
                 .children
                 .iter()
@@ -870,7 +1021,25 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
                     corner_radius,
                 });
             }
-            "Stack" | "Column" | "Row" | "Grid" => {
+            "Form" | "Section" => {
+                // Grouped-list look: an inset rounded card painted behind the
+                // section's rows. `background` overrides the default subtle fill;
+                // `corner_radius`/`radius` the rounding (default 10px, SwiftUI's
+                // inset grouped style). Always painted (the group is the visual).
+                let color = color_of(node, "background").unwrap_or(0xffffff0d);
+                let corner_radius = px_of(node, "corner_radius")
+                    .or_else(|| px_of(node, "radius"))
+                    .unwrap_or(10.0);
+                scene.push(DrawCmd::FilledRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    color: scale_alpha(color, opacity),
+                    corner_radius,
+                });
+            }
+            "Stack" | "Column" | "Row" | "Grid" | "List" | "LazyVStack" => {
                 // Container background, painted behind its children.
                 if let Some(color) = color_of(node, "background") {
                     let corner_radius = px_of(node, "corner_radius")
@@ -1672,5 +1841,258 @@ mod tests {
         let (w, h) = m.measure("Hello", 24.0);
         assert!(w > 0.0, "width should be positive, got {w}");
         assert!(h > 0.0, "height should be positive, got {h}");
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiftUI container parity: Grid, List windowing, Form/Section
+    // -----------------------------------------------------------------------
+
+    /// A `Grid` with `columns: 3` lays children into 3 equal columns: the row's
+    /// width is split into thirds (real CSS-grid track sizing, not flex-wrap),
+    /// and the 4th child wraps to a second row directly below the 1st.
+    #[test]
+    fn grid_columns_make_equal_tracks_and_wrap() {
+        let mut doc = Document::new();
+        let g = node(&mut doc, "Grid");
+        set_root(&mut doc, g);
+        prop(&mut doc, g, "columns", Value::Int(3));
+
+        // Four auto-sized cells (no explicit width → each fills its track).
+        let mut cells = Vec::new();
+        for _ in 0..4 {
+            let c = node(&mut doc, "Rect");
+            prop(&mut doc, c, "height", Value::Px(20.0));
+            child(&mut doc, g, c);
+            cells.push(c);
+        }
+
+        // 300px-wide viewport → three 100px columns.
+        let l = layout(&doc, (300.0, 300.0));
+        let r0 = l.rect(cells[0]).unwrap();
+        let r1 = l.rect(cells[1]).unwrap();
+        let r2 = l.rect(cells[2]).unwrap();
+        let r3 = l.rect(cells[3]).unwrap();
+
+        // Equal column widths.
+        assert!((r0.w - 100.0).abs() < 0.5, "col0 width {}", r0.w);
+        assert!((r1.w - 100.0).abs() < 0.5, "col1 width {}", r1.w);
+        assert!((r2.w - 100.0).abs() < 0.5, "col2 width {}", r2.w);
+        // Columns advance across the row.
+        assert!((r0.x - 0.0).abs() < 0.5, "col0 x {}", r0.x);
+        assert!((r1.x - 100.0).abs() < 0.5, "col1 x {}", r1.x);
+        assert!((r2.x - 200.0).abs() < 0.5, "col2 x {}", r2.x);
+        // First three share a row; the 4th wraps under the 1st (new row).
+        assert!((r0.y - r1.y).abs() < 0.5, "first three on one row");
+        assert!((r0.y - r2.y).abs() < 0.5, "first three on one row");
+        assert!(r3.y > r0.y + 0.5, "4th cell wrapped to row 2 (y {})", r3.y);
+        assert!((r3.x - 0.0).abs() < 0.5, "4th cell back in column 0");
+    }
+
+    /// `Grid` honors `gap` between tracks: with one 10px gap between two
+    /// columns in a 210px viewport, each column is 100px and the second starts
+    /// at 110px.
+    #[test]
+    fn grid_honors_gap_between_columns() {
+        let mut doc = Document::new();
+        let g = node(&mut doc, "Grid");
+        set_root(&mut doc, g);
+        prop(&mut doc, g, "columns", Value::Int(2));
+        prop(&mut doc, g, "gap", Value::Px(10.0));
+
+        let a = node(&mut doc, "Rect");
+        prop(&mut doc, a, "height", Value::Px(20.0));
+        child(&mut doc, g, a);
+        let b = node(&mut doc, "Rect");
+        prop(&mut doc, b, "height", Value::Px(20.0));
+        child(&mut doc, g, b);
+
+        let l = layout(&doc, (210.0, 200.0));
+        let ra = l.rect(a).unwrap();
+        let rb = l.rect(b).unwrap();
+        // (210 - 10 gap) / 2 = 100 each.
+        assert!((ra.w - 100.0).abs() < 0.5, "col0 width {}", ra.w);
+        assert!((rb.w - 100.0).abs() < 0.5, "col1 width {}", rb.w);
+        // Second column offset past first + gap.
+        assert!((rb.x - 110.0).abs() < 0.5, "col1 x {}", rb.x);
+    }
+
+    /// Real virtualization: a `List` of 1000 fixed-height rows, scrolled deep,
+    /// builds and paints ONLY the rows in (and just around) the viewport — every
+    /// off-screen row is absent from the Layout AND the Scene.
+    #[test]
+    fn list_windows_to_visible_rows_only() {
+        let mut doc = Document::new();
+        let list = node(&mut doc, "List");
+        set_root(&mut doc, list);
+        prop(&mut doc, list, "item_height", Value::Px(50.0));
+        // No gap → row i occupies y = i*50.
+        prop(&mut doc, list, "overscan", Value::Px(0.0));
+        // Scroll so the first visible row is #20 (offset 1000 / 50).
+        prop(&mut doc, list, "scroll_offset", Value::Px(1000.0));
+
+        let mut rows = Vec::new();
+        for i in 0..1000 {
+            let r = node(&mut doc, "Rect");
+            prop(&mut doc, r, "height", Value::Px(50.0));
+            // Tag each row's color with its index so we can find it in the scene.
+            prop(&mut doc, r, "color", Value::Color(0x01000000 | i as u32));
+            child(&mut doc, list, r);
+            rows.push(r);
+        }
+
+        // Viewport 50 wide, 200 tall → 4 rows fit (200/50): indices 20..24.
+        let vp = (50.0, 200.0);
+        let l = layout(&doc, vp);
+
+        // On-screen rows present in the Layout.
+        for (k, &row) in rows[20..24].iter().enumerate() {
+            let i = 20 + k;
+            assert!(l.rect(row).is_some(), "visible row {i} laid out");
+        }
+        // Off-screen rows absent from the Layout (never built).
+        assert!(l.rect(rows[0]).is_none(), "row 0 (far above) skipped");
+        assert!(l.rect(rows[10]).is_none(), "row 10 (above) skipped");
+        assert!(l.rect(rows[500]).is_none(), "row 500 (far below) skipped");
+        assert!(l.rect(rows[999]).is_none(), "last row skipped");
+
+        // Only a small window is laid out, not all 1000 rows (+1 for the list).
+        assert!(l.len() < 20, "only a windowed subset laid out, got {}", l.len());
+
+        // Visible rows land at their scrolled screen position: row 20 at y=0.
+        let r20 = l.rect(rows[20]).unwrap();
+        assert!((r20.y - 0.0).abs() < 0.5, "row 20 at viewport top, y {}", r20.y);
+        let r21 = l.rect(rows[21]).unwrap();
+        assert!((r21.y - 50.0).abs() < 0.5, "row 21 below row 20, y {}", r21.y);
+
+        // Scene parity: off-screen rows emit no draw command, on-screen do.
+        let scene = paint(&doc, &l);
+        let painted = |idx: usize| {
+            let want = 0x01000000 | idx as u32;
+            scene
+                .iter()
+                .any(|c| matches!(c, DrawCmd::FilledRect { color, .. } if *color == want))
+        };
+        assert!(painted(20), "row 20 painted");
+        assert!(painted(23), "row 23 painted");
+        assert!(!painted(0), "row 0 not painted");
+        assert!(!painted(500), "row 500 not painted");
+        assert!(!painted(999), "row 999 not painted");
+    }
+
+    /// Scrolling the list shifts the visible window: different rows become live.
+    #[test]
+    fn list_window_follows_scroll_offset() {
+        let mut doc = Document::new();
+        let list = node(&mut doc, "List");
+        set_root(&mut doc, list);
+        prop(&mut doc, list, "item_height", Value::Px(40.0));
+        prop(&mut doc, list, "overscan", Value::Px(0.0));
+        prop(&mut doc, list, "scroll_offset", Value::Px(0.0));
+
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            let r = node(&mut doc, "Rect");
+            prop(&mut doc, r, "height", Value::Px(40.0));
+            child(&mut doc, list, r);
+            rows.push(r);
+        }
+
+        let vp = (50.0, 160.0); // 4 rows tall.
+        // At offset 0: rows 0..4 visible, row 50 not.
+        let l0 = layout(&doc, vp);
+        assert!(l0.rect(rows[0]).is_some(), "row 0 visible at top");
+        assert!(l0.rect(rows[50]).is_none(), "row 50 not visible at top");
+
+        // Scroll down to row 50.
+        prop(&mut doc, list, "scroll_offset", Value::Px(2000.0)); // 50 * 40
+        let l1 = layout(&doc, vp);
+        assert!(l1.rect(rows[50]).is_some(), "row 50 visible after scroll");
+        assert!(l1.rect(rows[0]).is_none(), "row 0 no longer visible");
+    }
+
+    /// `Form` and `Section` are styled grouped containers: each paints an inset
+    /// rounded card behind its rows, and stacks its rows vertically with a
+    /// default section spacing.
+    #[test]
+    fn form_and_section_paint_grouped_card() {
+        let mut doc = Document::new();
+        let form = node(&mut doc, "Form");
+        set_root(&mut doc, form);
+
+        let section = node(&mut doc, "Section");
+        prop(&mut doc, section, "background", Value::Color(0x222222ff));
+        child(&mut doc, form, section);
+
+        let a = node(&mut doc, "Rect");
+        prop(&mut doc, a, "width", Value::Px(120.0));
+        prop(&mut doc, a, "height", Value::Px(30.0));
+        child(&mut doc, section, a);
+        let b = node(&mut doc, "Rect");
+        prop(&mut doc, b, "width", Value::Px(120.0));
+        prop(&mut doc, b, "height", Value::Px(30.0));
+        child(&mut doc, section, b);
+
+        let l = layout(&doc, (300.0, 400.0));
+        let ra = l.rect(a).unwrap();
+        let rb = l.rect(b).unwrap();
+        // Rows stack vertically, separated by the default 8px section gap.
+        assert!(rb.y >= ra.y + ra.h, "rows do not overlap");
+        assert!((rb.y - (ra.y + ra.h + 8.0)).abs() < 0.5, "default section gap, got {}", rb.y - (ra.y + ra.h));
+
+        let scene = paint(&doc, &l);
+        // Section's explicit grouped-card background is painted.
+        assert!(
+            scene.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { color: 0x222222ff, corner_radius, .. } if *corner_radius > 0.0
+            )),
+            "section paints a rounded grouped card"
+        );
+        // Form (no explicit background) still paints its default inset card.
+        let form_rect = l.rect(form).unwrap();
+        assert!(
+            scene.iter().any(|c| matches!(
+                c,
+                DrawCmd::FilledRect { w, h, corner_radius, .. }
+                    if (*w - form_rect.w).abs() < 0.5 && (*h - form_rect.h).abs() < 0.5 && *corner_radius > 0.0
+            )),
+            "form paints a default grouped card"
+        );
+    }
+
+    /// The windowed `List` also works through the incremental `LayoutCache`:
+    /// a scroll re-windows to the new visible rows.
+    #[test]
+    fn list_windowing_through_layout_cache() {
+        use std::collections::BTreeSet;
+
+        let mut doc = Document::new();
+        let list = node(&mut doc, "List");
+        set_root(&mut doc, list);
+        prop(&mut doc, list, "item_height", Value::Px(50.0));
+        prop(&mut doc, list, "overscan", Value::Px(0.0));
+        prop(&mut doc, list, "scroll_offset", Value::Px(0.0));
+
+        let mut rows = Vec::new();
+        for _ in 0..300 {
+            let r = node(&mut doc, "Rect");
+            prop(&mut doc, r, "height", Value::Px(50.0));
+            child(&mut doc, list, r);
+            rows.push(r);
+        }
+
+        let vp = (50.0, 200.0); // 4 rows.
+        let mut cache = LayoutCache::new();
+        let l0 = cache.compute(&doc, vp, &BTreeSet::new());
+        assert!(l0.rect(rows[0]).is_some(), "row 0 visible at top (cache)");
+        assert!(l0.rect(rows[100]).is_none(), "row 100 windowed out (cache)");
+
+        // Scroll to row 100 (5000 / 50) and recompute.
+        prop(&mut doc, list, "scroll_offset", Value::Px(5000.0));
+        let mut dirty = BTreeSet::new();
+        dirty.insert(list);
+        let l1 = cache.compute(&doc, vp, &dirty);
+        assert!(l1.rect(rows[100]).is_some(), "row 100 visible after scroll (cache)");
+        assert!(l1.rect(rows[0]).is_none(), "row 0 windowed out after scroll (cache)");
     }
 }

@@ -8,6 +8,9 @@
 //! - `ViewName("literal")` or `ViewName(param: value)` — inline args
 //! - `.modifier(args)` — chained modifiers applied as props
 //! - `Button("label") { }` — trailing closure becomes a "click" callback
+//! - Containers: `List`/`List(data)`, `LazyVStack`/`LazyHStack` (lazy `List`/`Row`),
+//!   `Grid`/`GridRow`, `Form`, `Section(header:)`, `Picker(selection:)`, `Stepper(value:)`
+//! - `@State var name` declarations and `$binding` call-site uses (bound names recorded)
 //! - Line comments (`//`)
 
 use uni_ir::{Action, Document, Mutation, NodeId, Origin, Value};
@@ -62,6 +65,13 @@ pub struct Unsupported {
 pub struct ImportReport {
     pub document: Document,
     pub unsupported: Vec<Unsupported>,
+    /// Names of `@State`-declared variables seen at top level, in source order.
+    ///
+    /// SwiftUI's state graph cannot be resolved in a clean-room importer, but a
+    /// `@State var count = 0` declaration tells us `count` is a piece of mutable
+    /// view state. Recording the names lets the AI companion (and a later
+    /// reactive layer) reconnect `$count` bindings at call sites to their source.
+    pub state_vars: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────── AST ─────
@@ -217,6 +227,16 @@ fn map_kind(swiftui: &str) -> &str {
         "HStack" => "Row",
         "ZStack" | "Group" => "Stack",
         "ScrollView" => "Stack",
+        // Containers that collect their children into a scrollable list.
+        // `List`, `Form`, `Grid`, `Section`, `Picker`, `Stepper` keep their
+        // SwiftUI name as the IR kind — they *are* their own container element.
+        "List" | "LazyVStack" => "List",
+        "LazyHStack" => "Row",
+        "Grid" | "GridRow" => "Grid",
+        "Form" => "Form",
+        "Section" => "Section",
+        "Picker" => "Picker",
+        "Stepper" => "Stepper",
         "RoundedRectangle" | "Rectangle" => "Rect",
         "Spacer" => "Rect",
         // Leaf views keep their SwiftUI name as the IR kind — these have no
@@ -361,6 +381,11 @@ fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, Swift
                     lex.skip_ws();
                     let val = parse_value(lex)?;
                     view.props.push((key, val));
+                } else {
+                    // A bare positional identifier — `List(items)`, `ForEach(rows)`.
+                    // It names the data collection the container iterates; carry
+                    // it as a `data` prop so the binding survives the lower.
+                    view.props.push(("data".into(), SwiftValue::Ident(key)));
                 }
             }
             lex.skip_ws();
@@ -470,6 +495,29 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
                 "true" => Ok(SwiftValue::Bool(true)),
                 "false" => Ok(SwiftValue::Bool(false)),
                 "Color" => parse_color_arg(lex),
+                // A view-valued argument such as `Section(header: Text("Settings"))`
+                // or `Picker(... ) { }` with a `Text(...)` label. Pull the inner
+                // string literal out as the value; if there is none, fall back to
+                // the view's own name. Either way the nested parens are consumed.
+                _ if lex.peek() == Some(b'(') => {
+                    lex.advance(); // (
+                    let mut inner: Option<String> = None;
+                    loop {
+                        lex.skip_ws();
+                        match lex.peek() {
+                            Some(b')') => {
+                                lex.advance();
+                                break;
+                            }
+                            Some(b'"') => inner = Some(lex.read_string()?),
+                            None => break,
+                            _ => {
+                                lex.advance();
+                            }
+                        }
+                    }
+                    Ok(SwiftValue::Str(inner.unwrap_or(id)))
+                }
                 _ => Ok(SwiftValue::Ident(id)),
             }
         }
@@ -664,22 +712,54 @@ fn apply_modifiers(
     Ok(view)
 }
 
-fn parse_file(lex: &mut Lexer<'_>) -> Result<Vec<SwiftView>, SwiftUIImportError> {
+struct ParsedFile {
+    views: Vec<SwiftView>,
+    state_vars: Vec<String>,
+}
+
+fn parse_file(lex: &mut Lexer<'_>) -> Result<ParsedFile, SwiftUIImportError> {
     let mut views = Vec::new();
+    let mut state_vars = Vec::new();
     loop {
         lex.skip_ws();
-        if lex.peek().is_none() {
-            break;
-        }
-        if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
-            let kind = lex.read_ident();
-            let view = parse_view_body(lex, kind)?;
-            views.push(view);
-        } else {
-            lex.advance();
+        match lex.peek() {
+            None => break,
+            // A property-wrapper attribute. `@State var name = …` declares a
+            // piece of view state; capture `name`. Other attributes (`@Binding`,
+            // `@Environment`, …) read the same shape, so we record any
+            // `@Attr var name` declaration here.
+            Some(b'@') => {
+                lex.advance(); // @
+                let attr = lex.read_ident();
+                lex.skip_ws();
+                // Expect `var <name>` (or `let <name>`). Read the binding keyword
+                // then the declared identifier.
+                let kw = lex.read_ident();
+                if attr == "State" && (kw == "var" || kw == "let") {
+                    lex.skip_ws();
+                    let name = lex.read_ident();
+                    if !name.is_empty() {
+                        state_vars.push(name);
+                    }
+                }
+                // Consume the rest of the declaration line (type annotation and
+                // `= initializer`) so a string initializer like `= "Ada"` is not
+                // mis-read as a view kind by the top-level scanner.
+                while lex.peek().map(|c| c != b'\n').unwrap_or(false) {
+                    lex.advance();
+                }
+            }
+            Some(c) if c.is_ascii_uppercase() => {
+                let kind = lex.read_ident();
+                let view = parse_view_body(lex, kind)?;
+                views.push(view);
+            }
+            _ => {
+                lex.advance();
+            }
         }
     }
-    Ok(views)
+    Ok(ParsedFile { views, state_vars })
 }
 
 // ──────────────────────────────────────────────────── lowering to IR ─────────
@@ -710,13 +790,49 @@ fn lower_view(
     doc.apply_from(Origin::System, Mutation::CreateNode { id, kind })
         .ok()?;
 
-    // Label → content prop
+    // Container-shape markers that the IR kind alone cannot carry:
+    //  - `LazyVStack`/`LazyHStack` lower to `List`/`Row` but are *lazy* — mark it.
+    //  - `GridRow` shares the `Grid` kind with its parent `Grid`; tag the row so
+    //    a consumer can tell the container from one of its rows.
+    match view.kind.as_str() {
+        "LazyVStack" | "LazyHStack" => {
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "lazy".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .ok();
+        }
+        "GridRow" => {
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "grid_row".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .ok();
+        }
+        _ => {}
+    }
+
+    // Label → content prop. A `Section`'s positional string is its *header*,
+    // not generic content, so it lands under `header` instead.
     if let Some(label) = &view.label {
+        let label_key = if view.kind == "Section" {
+            "header"
+        } else {
+            "content"
+        };
         doc.apply_from(
             Origin::System,
             Mutation::SetProp {
                 id,
-                key: "content".into(),
+                key: label_key.into(),
                 value: Value::Text(label.clone()),
             },
         )
@@ -822,11 +938,11 @@ pub fn parse(src: &str) -> Result<Document, SwiftUIImportError> {
 /// its source line.
 pub fn parse_with_report(src: &str) -> Result<ImportReport, SwiftUIImportError> {
     let mut lex = Lexer::new(src);
-    let views = parse_file(&mut lex)?;
+    let parsed = parse_file(&mut lex)?;
     let mut doc = Document::new();
     let mut unsupported = Vec::new();
     let mut root_set = false;
-    for view in &views {
+    for view in &parsed.views {
         if let Some(id) = lower_view(view, &mut doc, &mut unsupported) {
             if !root_set {
                 doc.apply_from(Origin::System, Mutation::SetRoot { id })
@@ -838,6 +954,7 @@ pub fn parse_with_report(src: &str) -> Result<ImportReport, SwiftUIImportError> 
     Ok(ImportReport {
         document: doc,
         unsupported,
+        state_vars: parsed.state_vars,
     })
 }
 
@@ -1166,5 +1283,158 @@ mod tests {
             .unsupported
             .iter()
             .any(|u| u.text == "modifier .redacted"));
+    }
+
+    // ── G1: collection containers & controls ─────────────────────────────────
+
+    #[test]
+    fn parse_list_block_becomes_list() {
+        let doc = parse(r#"List { Text("a") Text("b") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "List");
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn parse_list_with_data_carries_data_prop() {
+        // `List(items) { … }` — the positional collection lands as `data`.
+        let doc = parse(r#"List(items) { Text("row") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "List");
+        assert_eq!(node.props.get("data"), Some(&Value::Text("items".into())));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_lazy_vstack_is_lazy_list() {
+        let doc = parse(r#"LazyVStack { Text("a") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "List");
+        assert_eq!(node.props.get("lazy"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_lazy_hstack_is_lazy_row() {
+        let doc = parse(r#"LazyHStack { Text("a") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Row");
+        assert_eq!(node.props.get("lazy"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn parse_grid_and_grid_row() {
+        let doc = parse(r#"Grid { GridRow { Text("a") Text("b") } }"#).unwrap();
+        let root = doc.root().unwrap();
+        let grid = doc.get(root).unwrap();
+        assert_eq!(grid.kind, "Grid");
+        // The Grid is not itself a row.
+        assert!(!grid.props.contains_key("grid_row"));
+        let row_id = grid.children[0];
+        let row = doc.get(row_id).unwrap();
+        assert_eq!(row.kind, "Grid");
+        assert_eq!(row.props.get("grid_row"), Some(&Value::Bool(true)));
+        assert_eq!(row.children.len(), 2);
+    }
+
+    #[test]
+    fn parse_form_becomes_form() {
+        let doc = parse(r#"Form { Toggle("Wi-Fi", isOn: $wifi) }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Form");
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_section_string_header() {
+        // `Section("Title") { … }` — the positional string is the header.
+        let doc = parse(r#"Section("General") { Text("a") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Section");
+        assert_eq!(node.props.get("header"), Some(&Value::Text("General".into())));
+        assert!(!node.props.contains_key("content"));
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_section_header_view_arg() {
+        // `Section(header: Text("Settings")) { … }` — the inner Text's string is
+        // pulled out as the header value, nested parens consumed cleanly.
+        let doc = parse(r#"Section(header: Text("Settings")) { Text("a") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Section");
+        assert_eq!(
+            node.props.get("header"),
+            Some(&Value::Text("Settings".into()))
+        );
+        assert_eq!(node.children.len(), 1);
+    }
+
+    #[test]
+    fn parse_picker_with_bound_selection() {
+        let doc = parse(r#"Picker("Flavor", selection: $choice) { Text("a") Text("b") }"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Picker");
+        assert_eq!(node.props.get("content"), Some(&Value::Text("Flavor".into())));
+        // `$choice` binding → bound state name "choice".
+        assert_eq!(
+            node.props.get("selection"),
+            Some(&Value::Text("choice".into()))
+        );
+        assert_eq!(node.children.len(), 2);
+    }
+
+    #[test]
+    fn parse_stepper_with_bound_value() {
+        let doc = parse(r#"Stepper(value: $count)"#).unwrap();
+        let root = doc.root().unwrap();
+        let node = doc.get(root).unwrap();
+        assert_eq!(node.kind, "Stepper");
+        assert_eq!(node.props.get("value"), Some(&Value::Text("count".into())));
+    }
+
+    // ── G1: @State recognition & binding capture ─────────────────────────────
+
+    #[test]
+    fn state_var_declarations_are_recorded() {
+        let src = r#"
+            @State var count = 0
+            @State var name = "Ada"
+            VStack { Text("hi") }
+        "#;
+        let report = parse_with_report(src).unwrap();
+        assert_eq!(report.state_vars, vec!["count".to_string(), "name".to_string()]);
+        // The view after the declarations still lowered.
+        let root = report.document.root().unwrap();
+        assert_eq!(report.document.get(root).unwrap().kind, "Column");
+    }
+
+    #[test]
+    fn state_and_binding_round_trip() {
+        // A `@State var` declaration and the matching `$binding` at the call site
+        // are both captured: the declared name in `state_vars`, the bound name on
+        // the control prop. This is the binding test.
+        let src = r#"
+            @State var isOn = false
+            Toggle("Wi-Fi", isOn: $isOn)
+        "#;
+        let report = parse_with_report(src).unwrap();
+        assert_eq!(report.state_vars, vec!["isOn".to_string()]);
+        let root = report.document.root().unwrap();
+        let node = report.document.get(root).unwrap();
+        assert_eq!(node.props.get("isOn"), Some(&Value::Text("isOn".into())));
+    }
+
+    #[test]
+    fn no_state_vars_when_none_declared() {
+        let report = parse_with_report(r#"Text("Hi")"#).unwrap();
+        assert!(report.state_vars.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 //! # uni-reactor — reactive evaluation (rung 4: the DSL goes *live*)
 //!
-//! `uni-ir` carries dynamic [`Binding`]s (`bindings["content"] = "title"`) and
+//! `uni-ir` carries dynamic [`IrBinding`]s (`bindings["content"] = "title"`) and
 //! structural nodes (`If`, `For`) alongside literal props, but it deliberately
 //! does *not* resolve them — that's this crate's job. The reactor takes a
 //! *source* [`Document`] (the authored tree, bindings and all) plus a [`Store`]
@@ -17,7 +17,7 @@
 //!
 //! ## Binding expressions
 //!
-//! A [`Binding::expr`] is parsed into a tiny [`Expr`] AST and evaluated against
+//! An [`IrBinding::expr`] is parsed into a tiny [`Expr`] AST and evaluated against
 //! the [`Store`]. The grammar is deliberately small — keys, literals, the four
 //! arithmetic operators, the comparisons (`>`, `<`, `==`), and the unary `!`/`-`
 //! — enough to express "is the cart non-empty", "price * qty", or "count + 1"
@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use uni_ir::{Binding, Document, Mutation, NodeId, Origin, Value};
+use uni_ir::{Binding as IrBinding, Document, Mutation, NodeId, Origin, Value};
 use uni_react::{Runtime, Signal};
 
 // ---------------------------------------------------------------------------
@@ -178,6 +178,253 @@ fn decode_value(ty: &str, val: &str) -> Option<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// SwiftUI-style state handles: SharedStore, State<T>, Binding<T>
+// ---------------------------------------------------------------------------
+
+/// A [`Store`] shared by reference, so several typed handles (and a [`Reactor`])
+/// can read and write the *same* state.
+///
+/// [`Store::set`] takes `&mut self` (it may create a key's signal on first
+/// write), so a [`State`]/[`Binding`] handle keeps the store behind
+/// `Rc<RefCell<..>>`. The store itself is still backed by `uni-react` signals,
+/// so a dependent [`Reactor`] built over the same shared store observes every
+/// write — these handles are a thin typed *façade*, not a new reactive engine.
+pub type SharedStore = std::rc::Rc<std::cell::RefCell<Store>>;
+
+/// Wrap a [`Store`] so it can be shared by [`State`]/[`Binding`] handles and a
+/// [`Reactor`]. Equivalent to `Rc::new(RefCell::new(store))`.
+pub fn shared(store: Store) -> SharedStore {
+    std::rc::Rc::new(std::cell::RefCell::new(store))
+}
+
+/// A type that a [`Store`] [`Value`] can be read back into.
+///
+/// Kept deliberately small and total: every conversion is fallible (`Option`),
+/// so a type mismatch (e.g. reading an `Int` key as `String`) yields `None`
+/// rather than panicking. Numeric reads coerce across `Int`/`Float`/`Px` so a
+/// `State<f64>` over an `Int`-typed key still resolves.
+pub trait FromValue: Sized {
+    /// Try to read `self` out of a store [`Value`].
+    fn from_value(v: &Value) -> Option<Self>;
+}
+
+/// A type that can be stored into a [`Store`] as a [`Value`].
+pub trait IntoValue {
+    /// Convert `self` into the [`Value`] written to the store.
+    fn into_value(self) -> Value;
+}
+
+impl FromValue for bool {
+    fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+}
+impl IntoValue for bool {
+    fn into_value(self) -> Value {
+        Value::Bool(self)
+    }
+}
+
+impl FromValue for i64 {
+    fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Int(n) => Some(*n),
+            Value::Float(f) => Some(*f as i64),
+            Value::Px(p) => Some(*p as i64),
+            _ => None,
+        }
+    }
+}
+impl IntoValue for i64 {
+    fn into_value(self) -> Value {
+        Value::Int(self)
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(v: &Value) -> Option<Self> {
+        as_num(v)
+    }
+}
+impl IntoValue for f64 {
+    fn into_value(self) -> Value {
+        Value::Float(self)
+    }
+}
+
+impl FromValue for String {
+    fn from_value(v: &Value) -> Option<Self> {
+        match v {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+}
+impl IntoValue for String {
+    fn into_value(self) -> Value {
+        Value::Text(self)
+    }
+}
+impl IntoValue for &str {
+    fn into_value(self) -> Value {
+        Value::Text(self.to_string())
+    }
+}
+
+/// A [`Value`] round-trips through itself (handy for `State<Value>` / `List`).
+impl FromValue for Value {
+    fn from_value(v: &Value) -> Option<Self> {
+        Some(v.clone())
+    }
+}
+impl IntoValue for Value {
+    fn into_value(self) -> Value {
+        self
+    }
+}
+
+/// A SwiftUI-style `@State` handle: the source of truth for one named store key,
+/// typed as `T`.
+///
+/// Thin over a [`SharedStore`] — [`get`](State::get) reads the key (recording a
+/// reactive dependency), [`set`](State::set) writes it (bumping the store's
+/// change tick), and [`with`](State::with) does a read-modify-write. A
+/// [`Binding`] into the *same* key is handed out by [`binding`](State::binding),
+/// giving SwiftUI's `$value` two-way reference.
+#[derive(Clone)]
+pub struct State<T> {
+    store: SharedStore,
+    key: String,
+    _ty: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> State<T>
+where
+    T: FromValue + IntoValue + Clone,
+{
+    /// Create a `State` handle over `key` in `store`. Does not write — the key
+    /// stays unset until the first [`set`](State::set) (or an initial via
+    /// [`with_default`](State::with_default)).
+    pub fn new(store: &SharedStore, key: impl Into<String>) -> Self {
+        State {
+            store: store.clone(),
+            key: key.into(),
+            _ty: std::marker::PhantomData,
+        }
+    }
+
+    /// Create a `State` over `key`, seeding it with `initial` if (and only if)
+    /// the key is currently unset — SwiftUI's `@State var x = initial`.
+    pub fn with_default(store: &SharedStore, key: impl Into<String>, initial: T) -> Self {
+        let s = State::new(store, key);
+        if s.store.borrow().get(&s.key).is_none() {
+            s.set(initial);
+        }
+        s
+    }
+
+    /// The store key this handle drives.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Read the current typed value, or `None` if the key is unset or holds an
+    /// incompatible [`Value`]. Records a reactive dependency on the key.
+    pub fn get(&self) -> Option<T> {
+        self.store.borrow().get(&self.key).as_ref().and_then(T::from_value)
+    }
+
+    /// Write `value` to the key, notifying observers (and any [`Reactor`]).
+    pub fn set(&self, value: T) {
+        self.store.borrow_mut().set(self.key.clone(), value.into_value());
+    }
+
+    /// Read-modify-write: apply `f` to the current value (if present and typed)
+    /// and store the result. A no-op if the key is unset/mistyped.
+    pub fn with<F: FnOnce(&mut T)>(&self, f: F) {
+        if let Some(mut v) = self.get() {
+            f(&mut v);
+            self.set(v);
+        }
+    }
+
+    /// Hand out a two-way [`Binding`] to the same key — SwiftUI's `$value`.
+    pub fn binding(&self) -> Binding<T> {
+        Binding {
+            store: self.store.clone(),
+            key: self.key.clone(),
+            _ty: std::marker::PhantomData,
+        }
+    }
+
+    /// The shared store this handle is bound to (to build sibling handles or a
+    /// [`Reactor`] over the same state).
+    pub fn store(&self) -> &SharedStore {
+        &self.store
+    }
+}
+
+/// A SwiftUI-style `Binding<T>`: a two-way reference to a named store key.
+///
+/// Unlike [`State`] (which *owns* a key as a source of truth), a `Binding` is a
+/// *pass-through* reference: reading and writing it read/write the underlying
+/// store key, so a `Binding` handed to a child mutates the parent's state in
+/// place. Get it from [`State::binding`], or build one directly with
+/// [`Binding::new`].
+#[derive(Clone)]
+pub struct Binding<T> {
+    store: SharedStore,
+    key: String,
+    _ty: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Binding<T>
+where
+    T: FromValue + IntoValue + Clone,
+{
+    /// Build a `Binding` directly over `key` in `store`.
+    pub fn new(store: &SharedStore, key: impl Into<String>) -> Self {
+        Binding {
+            store: store.clone(),
+            key: key.into(),
+            _ty: std::marker::PhantomData,
+        }
+    }
+
+    /// The store key this binding references.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Read the referenced value (the *current* store value — a binding never
+    /// caches), or `None` if unset/mistyped.
+    pub fn get(&self) -> Option<T> {
+        self.store.borrow().get(&self.key).as_ref().and_then(T::from_value)
+    }
+
+    /// Write through to the referenced key, mutating the shared state.
+    pub fn set(&self, value: T) {
+        self.store.borrow_mut().set(self.key.clone(), value.into_value());
+    }
+
+    /// Read-modify-write through the binding.
+    pub fn with<F: FnOnce(&mut T)>(&self, f: F) {
+        if let Some(mut v) = self.get() {
+            f(&mut v);
+            self.set(v);
+        }
+    }
+
+    /// The shared store behind this binding.
+    pub fn store(&self) -> &SharedStore {
+        &self.store
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Expr — the tiny binding-expression AST
 // ---------------------------------------------------------------------------
 
@@ -202,7 +449,7 @@ pub enum UnOp {
     Neg,
 }
 
-/// The parsed form of a [`Binding::expr`].
+/// The parsed form of an [`IrBinding::expr`].
 ///
 /// Deliberately minimal: a state-key lookup, an inline literal, the four
 /// arithmetic ops, three comparisons, and two unary ops. A bare key parses to
@@ -587,11 +834,11 @@ impl<'a> Parser<'a> {
 // resolve
 // ---------------------------------------------------------------------------
 
-/// Evaluate one [`Binding`] against the [`Store`].
+/// Evaluate one [`IrBinding`] against the [`Store`].
 ///
 /// `expr` is parsed into an [`Expr`] AST and evaluated. A bare key parses to
 /// [`Expr::Key`] and is looked up verbatim — the original v0 behavior.
-fn eval_binding(b: &Binding, store: &Store) -> Option<Value> {
+fn eval_binding(b: &IrBinding, store: &Store) -> Option<Value> {
     Expr::parse(b.expr.as_str()).eval(store)
 }
 
@@ -878,6 +1125,66 @@ impl Reactor {
     pub fn resolved(&self) -> Document {
         self.dirty.set(false);
         resolve(&self.src, &self.store)
+    }
+}
+
+/// A [`Reactor`] over a [`SharedStore`] — the companion to [`State`]/[`Binding`].
+///
+/// Where [`Reactor`] *owns* its [`Store`], a `SharedReactor` resolves against the
+/// *same* store that [`State`]/[`Binding`] handles write to, so a write through a
+/// handle is observed here: the shared store's change tick marks this dirty, and
+/// [`resolved`](SharedReactor::resolved) reads the live store. Still thin — it
+/// reuses the same [`resolve`] pass, no new reactive engine.
+pub struct SharedReactor {
+    src: Document,
+    store: SharedStore,
+    dirty: std::rc::Rc<std::cell::Cell<bool>>,
+    _watch: uni_react::Effect,
+}
+
+impl SharedReactor {
+    /// Build a reactor over `src` and a [`SharedStore`]. Installs an effect on
+    /// the store's change tick so any write (through a [`State`]/[`Binding`] or
+    /// the store directly) flips the dirty flag.
+    pub fn new(src: Document, store: &SharedStore) -> Self {
+        let dirty = std::rc::Rc::new(std::cell::Cell::new(true));
+        let d = dirty.clone();
+        let (tick, rt) = {
+            let s = store.borrow();
+            (s.change_tick(), s.runtime().clone())
+        };
+        let watch = rt.effect(move |_| {
+            let _ = tick.get();
+            d.set(true);
+        });
+        SharedReactor {
+            src,
+            store: store.clone(),
+            dirty,
+            _watch: watch,
+        }
+    }
+
+    /// The shared store this reactor reads from.
+    pub fn store(&self) -> &SharedStore {
+        &self.store
+    }
+
+    /// Replace the source document, forcing a re-resolve on next pull.
+    pub fn set_source(&mut self, src: Document) {
+        self.src = src;
+        self.dirty.set(true);
+    }
+
+    /// Has the store changed since the last [`resolved`](SharedReactor::resolved)?
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    /// Produce the resolved render document against the live shared store.
+    pub fn resolved(&self) -> Document {
+        self.dirty.set(false);
+        resolve(&self.src, &self.store.borrow())
     }
 }
 
@@ -1422,5 +1729,95 @@ mod tests {
         let l = uni_core::layout(&resolved, (400.0, 400.0));
         // root + 2 rects laid out.
         assert_eq!(l.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiftUI-style State<T> / Binding<T> handles
+    // -----------------------------------------------------------------------
+
+    /// A `State<T>` drives a named key: get/set/with read and write the store,
+    /// with `with_default` seeding only when unset.
+    #[test]
+    fn state_drives_a_key() {
+        let store = shared(Store::new());
+
+        // `@State var count = 0` — seeds the key since it is unset.
+        let count = State::<i64>::with_default(&store, "count", 0);
+        assert_eq!(count.get(), Some(0));
+        // The seed is visible directly in the underlying store as an Int.
+        assert_eq!(store.borrow().get("count"), Some(Value::Int(0)));
+
+        // set() writes through.
+        count.set(5);
+        assert_eq!(count.get(), Some(5));
+
+        // with() is a read-modify-write.
+        count.with(|n| *n += 3);
+        assert_eq!(count.get(), Some(8));
+        assert_eq!(store.borrow().get("count"), Some(Value::Int(8)));
+
+        // with_default does NOT clobber an already-set key.
+        let count2 = State::<i64>::with_default(&store, "count", 999);
+        assert_eq!(count2.get(), Some(8));
+
+        // A typed mismatch reads back as None rather than panicking.
+        let as_text = State::<String>::new(&store, "count");
+        assert_eq!(as_text.get(), None);
+    }
+
+    /// A `Binding<T>` is a two-way reference: it reads and writes the *same* key
+    /// as the `State` it came from, and a dependent reactor recomputes after a
+    /// write through the binding.
+    #[test]
+    fn binding_reads_writes_same_key_and_reactor_recomputes() {
+        let store = shared(Store::new());
+
+        // Source of truth: @State var title = "first".
+        let title = State::<String>::with_default(&store, "title", "first".to_string());
+
+        // $title — a two-way Binding to the same key.
+        let title_binding: crate::Binding<String> = title.binding();
+        assert_eq!(title_binding.key(), title.key());
+
+        // The binding reads the current value...
+        assert_eq!(title_binding.get(), Some("first".to_string()));
+
+        // A dependent reactor renders a Text node bound to "title".
+        let mut src = Document::new();
+        let root = node(&mut src, "Stack");
+        set_root(&mut src, root);
+        let label = node(&mut src, "Text");
+        bind(&mut src, label, "content", "title");
+        child(&mut src, root, label);
+
+        let reactor = SharedReactor::new(src, &store);
+        assert!(reactor.is_dirty());
+
+        let r1 = reactor.resolved();
+        let t1 = find_kind(&r1, "Text")[0];
+        assert_eq!(
+            r1.get(t1).unwrap().props.get("content"),
+            Some(&Value::Text("first".into()))
+        );
+        assert!(!reactor.is_dirty());
+
+        // ...and the binding WRITES the same key, mutating the shared state.
+        title_binding.set("second".to_string());
+        // The State sees the binding's write (same key, same store).
+        assert_eq!(title.get(), Some("second".to_string()));
+        // The write marked the dependent reactor dirty (shared change tick).
+        assert!(reactor.is_dirty());
+
+        // The reactor recomputes against the live store.
+        let r2 = reactor.resolved();
+        let t2 = find_kind(&r2, "Text")[0];
+        assert_eq!(
+            r2.get(t2).unwrap().props.get("content"),
+            Some(&Value::Text("second".into()))
+        );
+
+        // with() through the binding also flows back to the State.
+        title_binding.with(|s| s.push('!'));
+        assert_eq!(title.get(), Some("second!".to_string()));
     }
 }

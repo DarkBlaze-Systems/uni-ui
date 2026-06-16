@@ -1303,6 +1303,419 @@ pub fn progress_view(doc: &mut Document, tokens: &Tokens, value_key: &str) -> No
     track
 }
 
+// ---------------------------------------------------------------------------
+// picker — SwiftUI `Picker`
+// ---------------------------------------------------------------------------
+
+/// A labelled segmented/menu-style selector bound to `selection_key`.
+///
+/// Mirrors SwiftUI's `Picker`: presented as a `Row` **container** holding a
+/// caption beside a segmented control. The segmented control is itself a `Row`
+/// (role `"segmented"`) whose current choice is bound to `selection_key`; one
+/// segment `Stack` is emitted per entry in `options`, each a rounded, padded
+/// cell carrying its option `Text` and a `"select"` callback firing
+/// `pick(selection_key, i)` (0-indexed). Returns the outer `Row` id.
+pub fn picker(
+    doc: &mut Document,
+    tokens: &Tokens,
+    label_text: &str,
+    options: &[&str],
+    selection_key: &str,
+) -> NodeId {
+    let row = create(doc, "Row");
+    prop(doc, row, "gap", Value::Px(tokens.space.snug));
+    prop(doc, row, "align", Value::Text("center".into()));
+    prop(doc, row, "justify", Value::Text("between".into()));
+
+    // The caption leads (SwiftUI label-leading layout).
+    let caption = label(doc, tokens, label_text, false);
+    append(doc, row, caption);
+
+    // The segmented control: a Row whose current choice is bound.
+    let segmented = create(doc, "Row");
+    prop(doc, segmented, "role", Value::Text("segmented".into()));
+    prop(doc, segmented, "gap", Value::Px(tokens.space.tight));
+    prop(
+        doc,
+        segmented,
+        "background",
+        Value::Color(tokens.palette.ink_faint),
+    );
+    prop(
+        doc,
+        segmented,
+        "corner_radius",
+        Value::Px(tokens.shape.small),
+    );
+    prop(doc, segmented, "padding", Value::Px(tokens.space.tight));
+    binding(doc, segmented, "selection", selection_key);
+
+    for (i, opt) in options.iter().enumerate() {
+        // Each segment is a rounded, padded Stack cell carrying its label.
+        let seg = create(doc, "Stack");
+        prop(doc, seg, "padding", Value::Px(tokens.space.snug));
+        prop(doc, seg, "corner_radius", Value::Px(tokens.shape.small));
+        prop(doc, seg, "align", Value::Text("center".into()));
+        prop(doc, seg, "justify", Value::Text("center".into()));
+        // Selected-state index so the runtime can highlight the active cell.
+        prop(doc, seg, "index", Value::Int(i as i64));
+        callback(
+            doc,
+            seg,
+            "select",
+            Action {
+                name: "pick".into(),
+                args: vec![Value::Text(selection_key.into()), Value::Int(i as i64)],
+            },
+        );
+
+        let text = create(doc, "Text");
+        prop(doc, text, "content", Value::Text((*opt).into()));
+        prop(
+            doc,
+            text,
+            "size",
+            Value::Px(tokens.r#type.scaled(tokens.r#type.body.base.size)),
+        );
+        prop(doc, text, "color", Value::Color(tokens.palette.ink));
+        append(doc, seg, text);
+
+        append(doc, segmented, seg);
+    }
+
+    append(doc, row, segmented);
+    row
+}
+
+// ---------------------------------------------------------------------------
+// stepper — SwiftUI `Stepper`
+// ---------------------------------------------------------------------------
+
+/// A labelled `-` / value / `+` stepper bound to `value_key`.
+///
+/// Mirrors SwiftUI's `Stepper`: presented as a `Row` **container** holding a
+/// caption beside a `-` button, the live value, and a `+` button. The decrement
+/// and increment cells are rounded, padded `Stack`s firing
+/// `step(value_key, -step)` and `step(value_key, +step)` on `"click"`; the
+/// middle `Text` binds its `content` to `value_key` so the reactor shows the
+/// current value. The `step` magnitude is recorded on the row as a prop.
+/// Returns the outer `Row` id.
+pub fn stepper(doc: &mut Document, tokens: &Tokens, label_text: &str, value_key: &str, step: f32) -> NodeId {
+    let row = create(doc, "Row");
+    prop(doc, row, "gap", Value::Px(tokens.space.snug));
+    prop(doc, row, "align", Value::Text("center".into()));
+    prop(doc, row, "justify", Value::Text("between".into()));
+    prop(doc, row, "role", Value::Text("stepper".into()));
+    prop(doc, row, "step", Value::Px(step));
+
+    // The caption leads.
+    let caption = label(doc, tokens, label_text, false);
+    append(doc, row, caption);
+
+    // The control cluster: [-] value [+].
+    let cluster = create(doc, "Row");
+    prop(doc, cluster, "gap", Value::Px(tokens.space.snug));
+    prop(doc, cluster, "align", Value::Text("center".into()));
+
+    // Shared cell builder for the - / + buttons.
+    let make_cell = |doc: &mut Document, glyph: &str, delta: f32| -> NodeId {
+        let cell = create(doc, "Stack");
+        prop(doc, cell, "padding", Value::Px(tokens.space.snug));
+        prop(doc, cell, "corner_radius", Value::Px(tokens.shape.small));
+        prop(doc, cell, "background", Value::Color(tokens.palette.ink_faint));
+        prop(doc, cell, "align", Value::Text("center".into()));
+        prop(doc, cell, "justify", Value::Text("center".into()));
+        callback(
+            doc,
+            cell,
+            "click",
+            Action {
+                name: "step".into(),
+                args: vec![Value::Text(value_key.into()), Value::Float(delta as f64)],
+            },
+        );
+        let g = create(doc, "Text");
+        prop(doc, g, "content", Value::Text(glyph.into()));
+        prop(
+            doc,
+            g,
+            "size",
+            Value::Px(tokens.r#type.scaled(tokens.r#type.body.emphasized.size)),
+        );
+        prop(
+            doc,
+            g,
+            "weight",
+            Value::Int(tokens.r#type.body.emphasized.weight as i64),
+        );
+        prop(doc, g, "color", Value::Color(tokens.palette.ink));
+        append(doc, cell, g);
+        cell
+    };
+
+    // Decrement.
+    let minus = make_cell(doc, "−", -step);
+    append(doc, cluster, minus);
+
+    // The live value: a Text whose content is bound to the value key.
+    let value = create(doc, "Text");
+    binding(doc, value, "content", value_key);
+    prop(
+        doc,
+        value,
+        "size",
+        Value::Px(tokens.r#type.scaled(tokens.r#type.body.base.size)),
+    );
+    prop(doc, value, "color", Value::Color(tokens.palette.ink));
+    append(doc, cluster, value);
+
+    // Increment.
+    let plus = make_cell(doc, "+", step);
+    append(doc, cluster, plus);
+
+    append(doc, row, cluster);
+    row
+}
+
+// ---------------------------------------------------------------------------
+// form — SwiftUI `Form`
+// ---------------------------------------------------------------------------
+
+/// A grouped container for settings-style content (kind `"Form"`).
+///
+/// Mirrors SwiftUI's `Form`: a `Column` **container** stamped with
+/// `role: "Form"`, painted in substrate with `loose` row spacing and `comfy`
+/// padding so grouped rows breathe. The caller appends [`section`]s (or rows)
+/// to the returned id; those children lay out top-to-bottom. Returns the
+/// `Column` id.
+pub fn form(doc: &mut Document, tokens: &Tokens) -> NodeId {
+    let root = create(doc, "Column");
+    prop(doc, root, "role", Value::Text("Form".into()));
+    prop(
+        doc,
+        root,
+        "background",
+        Value::Color(tokens.palette.substrate),
+    );
+    prop(doc, root, "gap", Value::Px(tokens.space.loose));
+    prop(doc, root, "padding", Value::Px(tokens.space.comfy));
+    root
+}
+
+// ---------------------------------------------------------------------------
+// section — SwiftUI `Section`
+// ---------------------------------------------------------------------------
+
+/// A grouped, captioned sub-container within a [`form`] (kind `"Section"`).
+///
+/// Mirrors SwiftUI's `Section`: a `Column` **container** stamped with
+/// `role: "Section"` whose first child is a faint, emphasized `header` label.
+/// The caller appends rows beneath the header to the returned id; they lay out
+/// in the column flow with `snug` spacing. Returns the `Column` id.
+pub fn section(doc: &mut Document, tokens: &Tokens, header: &str) -> NodeId {
+    let root = create(doc, "Column");
+    prop(doc, root, "role", Value::Text("Section".into()));
+    prop(doc, root, "gap", Value::Px(tokens.space.snug));
+
+    // Section header: an emphasized, soft-ink caption sitting first.
+    let head = create(doc, "Text");
+    prop(doc, head, "content", Value::Text(header.into()));
+    prop(
+        doc,
+        head,
+        "size",
+        Value::Px(tokens.r#type.scaled(tokens.r#type.caption.emphasized.size)),
+    );
+    prop(
+        doc,
+        head,
+        "weight",
+        Value::Int(tokens.r#type.caption.emphasized.weight as i64),
+    );
+    prop(doc, head, "color", Value::Color(tokens.palette.ink_soft));
+    append(doc, root, head);
+
+    root
+}
+
+#[cfg(test)]
+mod grouped_control_tests {
+    use super::*;
+    use uni_tokens::{Tokens, Variant};
+
+    fn toks() -> Tokens {
+        Tokens::for_variant(Variant::Internal)
+    }
+
+    fn is_container_kind(kind: &str) -> bool {
+        matches!(kind, "Stack" | "Column" | "Row" | "Grid")
+    }
+
+    #[test]
+    fn picker_is_a_segmented_selector_bound_to_selection_key() {
+        let mut doc = Document::new();
+        let t = toks();
+        let opts = ["Day", "Week", "Month"];
+        let p = picker(&mut doc, &t, "View", &opts, "calendar.span");
+
+        let row = doc.get(p).unwrap();
+        assert_eq!(row.kind, "Row");
+        assert!(is_container_kind(&row.kind));
+
+        // Caption leads, segmented control trails.
+        assert_eq!(row.children.len(), 2);
+        let caption = doc.get(row.children[0]).unwrap();
+        assert_eq!(caption.kind, "Text");
+        assert_eq!(
+            caption.props.get("content"),
+            Some(&Value::Text("View".into()))
+        );
+
+        // The segmented control: role + selection binding + one segment per option.
+        let segmented = doc.get(row.children[1]).unwrap();
+        assert_eq!(segmented.kind, "Row");
+        assert_eq!(
+            segmented.props.get("role"),
+            Some(&Value::Text("segmented".into()))
+        );
+        assert_eq!(
+            segmented.bindings.get("selection"),
+            Some(&Binding {
+                expr: "calendar.span".into()
+            })
+        );
+        assert_eq!(segmented.children.len(), opts.len());
+
+        // Each segment is a Stack carrying its option text + a pick callback.
+        for (i, &seg_id) in segmented.children.iter().enumerate() {
+            let seg = doc.get(seg_id).unwrap();
+            assert_eq!(seg.kind, "Stack");
+            assert_eq!(seg.props.get("index"), Some(&Value::Int(i as i64)));
+            let sel = seg.callbacks.get("select").expect("select callback");
+            assert_eq!(sel.name, "pick");
+            assert_eq!(
+                sel.args,
+                vec![Value::Text("calendar.span".into()), Value::Int(i as i64)]
+            );
+            let txt = doc.get(seg.children[0]).unwrap();
+            assert_eq!(txt.kind, "Text");
+            assert_eq!(
+                txt.props.get("content"),
+                Some(&Value::Text(opts[i].into()))
+            );
+        }
+    }
+
+    #[test]
+    fn stepper_has_minus_value_and_plus_bound_to_value_key() {
+        let mut doc = Document::new();
+        let t = toks();
+        let s = stepper(&mut doc, &t, "Quantity", "cart.qty", 1.0);
+
+        let row = doc.get(s).unwrap();
+        assert_eq!(row.kind, "Row");
+        assert!(is_container_kind(&row.kind));
+        assert_eq!(row.props.get("role"), Some(&Value::Text("stepper".into())));
+        assert_eq!(row.props.get("step"), Some(&Value::Px(1.0)));
+
+        // Caption leads, control cluster trails.
+        assert_eq!(row.children.len(), 2);
+        let caption = doc.get(row.children[0]).unwrap();
+        assert_eq!(
+            caption.props.get("content"),
+            Some(&Value::Text("Quantity".into()))
+        );
+
+        // Cluster is [-] value [+].
+        let cluster = doc.get(row.children[1]).unwrap();
+        assert_eq!(cluster.kind, "Row");
+        assert_eq!(cluster.children.len(), 3);
+
+        // Minus cell fires step(value_key, -step).
+        let minus = doc.get(cluster.children[0]).unwrap();
+        assert_eq!(minus.kind, "Stack");
+        let dec = minus.callbacks.get("click").expect("minus click");
+        assert_eq!(dec.name, "step");
+        assert_eq!(
+            dec.args,
+            vec![Value::Text("cart.qty".into()), Value::Float(-1.0)]
+        );
+
+        // Middle value Text binds content to value_key.
+        let value = doc.get(cluster.children[1]).unwrap();
+        assert_eq!(value.kind, "Text");
+        assert_eq!(
+            value.bindings.get("content"),
+            Some(&Binding {
+                expr: "cart.qty".into()
+            })
+        );
+
+        // Plus cell fires step(value_key, +step).
+        let plus = doc.get(cluster.children[2]).unwrap();
+        let inc = plus.callbacks.get("click").expect("plus click");
+        assert_eq!(inc.name, "step");
+        assert_eq!(
+            inc.args,
+            vec![Value::Text("cart.qty".into()), Value::Float(1.0)]
+        );
+    }
+
+    #[test]
+    fn form_is_a_grouped_container_ready_for_sections() {
+        let mut doc = Document::new();
+        let t = toks();
+        let f = form(&mut doc, &t);
+
+        let node = doc.get(f).unwrap();
+        assert_eq!(node.kind, "Column");
+        assert!(is_container_kind(&node.kind));
+        assert_eq!(node.props.get("role"), Some(&Value::Text("Form".into())));
+        assert!(node.props.contains_key("padding"));
+        assert!(node.props.contains_key("gap"));
+
+        // Caller can append a section; it nests under the form.
+        let sec = section(&mut doc, &t, "General");
+        append(&mut doc, f, sec);
+        assert!(doc.get(f).unwrap().children.contains(&sec));
+        assert_eq!(doc.get(sec).unwrap().parent, Some(f));
+    }
+
+    #[test]
+    fn section_is_a_captioned_container() {
+        let mut doc = Document::new();
+        let t = toks();
+        let sec = section(&mut doc, &t, "Privacy");
+
+        let node = doc.get(sec).unwrap();
+        assert_eq!(node.kind, "Column");
+        assert!(is_container_kind(&node.kind));
+        assert_eq!(
+            node.props.get("role"),
+            Some(&Value::Text("Section".into()))
+        );
+
+        // First child is the header Text.
+        let head = doc.get(node.children[0]).unwrap();
+        assert_eq!(head.kind, "Text");
+        assert_eq!(
+            head.props.get("content"),
+            Some(&Value::Text("Privacy".into()))
+        );
+        assert_eq!(
+            head.props.get("color"),
+            Some(&Value::Color(t.palette.ink_soft))
+        );
+
+        // Caller appends rows beneath the header.
+        let toggle_row = toggle(&mut doc, &t, "Location", "privacy.loc");
+        append(&mut doc, sec, toggle_row);
+        let refreshed = doc.get(sec).unwrap();
+        assert_eq!(refreshed.children.len(), 2);
+        assert_eq!(refreshed.children[1], toggle_row);
+    }
+}
+
 #[cfg(test)]
 mod swiftui_control_tests {
     use super::*;
