@@ -33,3 +33,7 @@ path = "examples/hello.rs"
 [[example]]
 name = "frost"
 path = "examples/frost.rs"
+
+[[example]]
+name = "input"
+path = "examples/input.rs"

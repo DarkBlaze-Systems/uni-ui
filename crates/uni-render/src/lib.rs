@@ -15,6 +15,12 @@
 //!    `cosmic-text` (shaping/layout) + `glyphon` (atlas + draw into the wgpu
 //!    render pass).
 //!
+//! Input flows the same way, in reverse: [`InputEvent`] / [`PointerButton`]
+//! (in [`input`]) are a renderer-agnostic input vocabulary in logical pixels
+//! that `uni-core` can hit-test against a [`Scene`] without touching winit. The
+//! winit-using helper [`translate_window_event`] lowers a concrete
+//! `winit::event::WindowEvent` into an [`InputEvent`].
+//!
 //! Coordinates are **logical pixels**, origin top-left, y-down. The backend
 //! sets up an orthographic projection that maps `(0,0)..(width,height)` to
 //! clip space, so a `DrawCmd` placed at `(x, y)` lands at that logical pixel
@@ -30,6 +36,12 @@ pub use scene::{DrawCmd, Scene};
 
 mod renderer;
 pub use renderer::{RenderError, Renderer};
+
+mod input;
+pub use input::{InputEvent, PointerButton};
+
+mod winit_input;
+pub use winit_input::translate_window_event;
 
 mod wgpu_backend;
 pub use wgpu_backend::WgpuRenderer;
