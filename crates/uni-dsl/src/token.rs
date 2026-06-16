@@ -20,14 +20,36 @@ pub enum Token {
     LBrace,
     #[token("}")]
     RBrace,
+    #[token("(")]
+    LParen,
+    #[token(")")]
+    RParen,
     #[token(":")]
     Colon,
     #[token(";")]
     Semicolon,
+    #[token(",")]
+    Comma,
+
+    // Structural keywords (recognized before the generic Ident rule). These
+    // introduce control-flow elements (`if (..) { .. }`, `for (..) { .. }`)
+    // and event handlers (`on click: ..;`).
+    #[token("if")]
+    If,
+    #[token("for")]
+    For,
+    #[token("on")]
+    On,
 
     #[token("true", |_| true)]
     #[token("false", |_| false)]
     Bool(bool),
+
+    // A bound expression / state-key: a `$`-prefixed dotted path, e.g.
+    // `$w`, `$theme.accent`. The leading `$` is stripped; the dotted path
+    // string is kept verbatim as the binding expression.
+    #[regex(r"\$[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*)*", |lex| lex.slice()[1..].to_owned())]
+    Binding(String),
 
     // Color: `#RRGGBB` or `#RRGGBBAA`.
     #[regex(r"#[0-9a-fA-F]{8}", |lex| lex.slice().to_owned())]

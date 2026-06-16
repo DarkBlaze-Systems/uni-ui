@@ -20,14 +20,45 @@
 //!
 //! - An **element** is `Kind { ... }`; `Kind` is an identifier and becomes the
 //!   node's `kind`.
-//! - A **body** holds `prop: value;` entries and nested child elements, freely
-//!   interleaved.
+//! - A **body** holds `prop: value;` entries, `on <event>: ..;` handlers,
+//!   `if`/`for` blocks, and nested child elements — freely interleaved.
 //! - **Values**: string `"..."` → [`Value::Text`]; integer → [`Value::Int`];
 //!   decimal → [`Value::Float`]; `true`/`false` → [`Value::Bool`]; color
 //!   `#RRGGBB` / `#RRGGBBAA` → [`Value::Color`] packed `0xRRGGBBAA` (`#RRGGBB`
 //!   expands to alpha `0xFF`); length `Npx` → [`Value::Px`].
 //! - There is exactly **one root** element.
 //! - `//` line comments are ignored.
+//!
+//! ## Additive constructs (rungs 3–5)
+//!
+//! ```text
+//! Stack {
+//!     width: $w;                       // bound prop → SetBinding
+//!     color: $theme.accent;            // dotted-path binding
+//!     padding: 16px;                   // literal still → SetProp
+//!     on click: submit("form");        // callback → SetCallback
+//!     on hover: toggle();              // zero-arg callback
+//!     if ($visible) {                  // → CreateNode{kind:"If"} + SetBinding{cond}
+//!         Text { content: "shown"; }
+//!     }
+//!     for ($items) {                   // → CreateNode{kind:"For"} + SetBinding{items}
+//!         Rect { width: 10px; }        //   children are the template
+//!     }
+//! }
+//! ```
+//!
+//! - A **bound prop** `key: $path;` strips the `$` and lowers to
+//!   [`Mutation::SetBinding`] with `Binding { expr: "path" }`. Literal props on
+//!   *other* keys still lower to [`Mutation::SetProp`]; both can sit on one node.
+//! - A **callback** `on <event>: <name>(<args>);` lowers to
+//!   [`Mutation::SetCallback`] with an [`Action`] whose `args` are literal
+//!   [`Value`]s.
+//! - **`if`/`for`** lower *structurally only*: a synthetic node of kind `"If"`
+//!   / `"For"` carrying the parenthesized expression as a `cond` / `items`
+//!   binding, with the block's children appended. The reactive layer expands
+//!   them later — this crate does no evaluation.
+//! - `if`, `for`, and `on` are reserved keywords (not usable as element kinds
+//!   or prop names).
 
 mod ast;
 mod parser;
@@ -35,9 +66,9 @@ mod token;
 
 use logos::Logos;
 
-use ast::{Element, Literal};
+use ast::{Element, Literal, PropValue};
 use token::Token;
-use uni_ir::{Document, Mutation, Origin, Value};
+use uni_ir::{Action, Binding, Document, Mutation, Origin, Value};
 
 /// A failure to turn `.uni` source into a [`Document`].
 ///
@@ -125,13 +156,49 @@ fn lower_element(doc: &mut Document, el: &Element) -> Result<uni_ir::NodeId, Par
     )
     .map_err(lower_err)?;
 
-    for prop in &el.props {
+    // Element-level synthetic bindings (e.g. an `If`'s `cond`, a `For`'s
+    // `items`) attach directly to this node.
+    for (key, expr) in &el.element_bindings {
         doc.apply_from(
             Origin::System,
-            Mutation::SetProp {
+            Mutation::SetBinding {
+                id,
+                key: key.clone(),
+                binding: Binding { expr: expr.clone() },
+            },
+        )
+        .map_err(lower_err)?;
+    }
+
+    // A prop is either a literal (→ SetProp) or a dynamic binding (→
+    // SetBinding). Literals and bindings on different keys coexist on a node.
+    for prop in &el.props {
+        let mutation = match &prop.value {
+            PropValue::Literal(lit) => Mutation::SetProp {
                 id,
                 key: prop.key.clone(),
-                value: lower_value(&prop.value),
+                value: lower_value(lit),
+            },
+            PropValue::Binding(expr) => Mutation::SetBinding {
+                id,
+                key: prop.key.clone(),
+                binding: Binding { expr: expr.clone() },
+            },
+        };
+        doc.apply_from(Origin::System, mutation).map_err(lower_err)?;
+    }
+
+    // Event handlers → SetCallback with a literal-arg Action.
+    for cb in &el.callbacks {
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetCallback {
+                id,
+                event: cb.event.clone(),
+                action: Action {
+                    name: cb.action.clone(),
+                    args: cb.args.iter().map(lower_value).collect(),
+                },
             },
         )
         .map_err(lower_err)?;
@@ -253,6 +320,121 @@ mod tests {
         assert!(
             matches!(err, ParseError::Lex { .. }),
             "expected a Lex error, got {err:?}"
+        );
+    }
+
+    /// `$`-prefixed values lower to bindings; literal values on other keys
+    /// still lower to props. A node can carry both.
+    #[test]
+    fn bound_props_lower_to_bindings_alongside_literals() {
+        let doc = parse(r#"Rect { width: $w; color: $theme.accent; height: 80px; }"#)
+            .expect("bindings should parse");
+        let root = doc.get(doc.root().unwrap()).unwrap();
+
+        // Bindings: `$` stripped, dotted path kept.
+        assert_eq!(
+            root.bindings.get("width"),
+            Some(&uni_ir::Binding { expr: "w".into() })
+        );
+        assert_eq!(
+            root.bindings.get("color"),
+            Some(&uni_ir::Binding { expr: "theme.accent".into() })
+        );
+        // The literal sibling still lowered to a prop.
+        assert_eq!(root.props.get("height"), Some(&Value::Px(80.0)));
+        // No literal prop was created for a bound key.
+        assert_eq!(root.props.get("width"), None);
+    }
+
+    /// `on <event>: <name>(<args>);` lowers to a SetCallback with a literal-arg
+    /// Action; a zero-arg handler is also valid.
+    #[test]
+    fn callbacks_lower_to_actions() {
+        let doc = parse(r#"Button { on click: submit("form"); on hover: toggle(); }"#)
+            .expect("callbacks should parse");
+        let root = doc.get(doc.root().unwrap()).unwrap();
+
+        assert_eq!(
+            root.callbacks.get("click"),
+            Some(&uni_ir::Action {
+                name: "submit".into(),
+                args: vec![Value::Text("form".into())],
+            })
+        );
+        assert_eq!(
+            root.callbacks.get("hover"),
+            Some(&uni_ir::Action {
+                name: "toggle".into(),
+                args: vec![],
+            })
+        );
+    }
+
+    /// Callback args carry mixed literal kinds faithfully.
+    #[test]
+    fn callback_args_preserve_literal_kinds() {
+        let doc = parse(r#"Box { on tap: act("s", 3, 1.5, true, #ff0000, 8px); }"#).unwrap();
+        let root = doc.get(doc.root().unwrap()).unwrap();
+        assert_eq!(
+            root.callbacks.get("tap").unwrap().args,
+            vec![
+                Value::Text("s".into()),
+                Value::Int(3),
+                Value::Float(1.5),
+                Value::Bool(true),
+                Value::Color(0xff0000ff),
+                Value::Px(8.0),
+            ]
+        );
+    }
+
+    /// `if`/`for` lower to structural `If`/`For` nodes carrying their
+    /// expression as a binding, with the block's children appended.
+    #[test]
+    fn if_and_for_lower_to_structural_nodes() {
+        let src = r#"
+            Stack {
+                if ($visible) {
+                    Text { content: "shown"; }
+                }
+                for ($items) {
+                    Rect { width: 10px; }
+                }
+            }
+        "#;
+        let doc = parse(src).expect("if/for should parse");
+        let root = doc.get(doc.root().unwrap()).unwrap();
+        assert_eq!(root.children.len(), 2);
+
+        // First child: an `If` node with a `cond` binding and one Text child.
+        let if_node = doc.get(root.children[0]).unwrap();
+        assert_eq!(if_node.kind, "If");
+        assert_eq!(
+            if_node.bindings.get("cond"),
+            Some(&uni_ir::Binding { expr: "visible".into() })
+        );
+        assert_eq!(if_node.children.len(), 1);
+        assert_eq!(doc.get(if_node.children[0]).unwrap().kind, "Text");
+
+        // Second child: a `For` node with an `items` binding and a template.
+        let for_node = doc.get(root.children[1]).unwrap();
+        assert_eq!(for_node.kind, "For");
+        assert_eq!(
+            for_node.bindings.get("items"),
+            Some(&uni_ir::Binding { expr: "items".into() })
+        );
+        assert_eq!(for_node.children.len(), 1);
+        assert_eq!(doc.get(for_node.children[0]).unwrap().kind, "Rect");
+    }
+
+    /// A malformed binding/callback is a parse error, not a panic.
+    #[test]
+    fn malformed_callback_is_a_parse_error() {
+        // `on click` with no `: name(...)`.
+        let err = parse(r#"Button { on click; }"#).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Parse { .. }),
+            "expected a Parse error, got {err:?}"
         );
     }
 }
