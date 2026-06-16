@@ -1,113 +1,261 @@
-DarkBlaze Sanity License, Version 1.0 (Interim)
-================================================
+DarkBlaze Sanity License, Version 1.0
 
-A source-available, time-limited-exclusivity license in the spirit of the
-Business Source License 1.1. This Version 1.0 (Interim) is the operative
-license until a counsel-reviewed Version 1.1 replaces it; Version 1.1 may only
-broaden the rights granted here, never narrow them retroactively for a given
-release.
+Copyright (c) 2026 T. Billy Ekkerd, trading as DarkBlaze Systems.
 
-Preamble
---------
-DarkBlaze Systems publishes the Licensed Work so that anyone may read, study,
-learn from, and use it. The single purpose of this license is stewardship, not
-lock-in: it permits broad use while reserving, for a limited time, the right to
-commercialize the Licensed Work as a competing hosted or packaged UI engine. On
-the Change Date the Licensed Work becomes fully open source under the Change
-License below.
+                             == PARAMETERS ==
 
+Licensor:             T. Billy Ekkerd, trading as DarkBlaze Systems.
+Licensed Work:        "DarkBlaze Uni-UI" (a Rust UI engine: compiler,
+                      intermediate representation, runtime, and DSL), and any
+                      future versions released under this license.
+Additional Use Grant: You may use, copy, modify, and create derivative works
+                      of the Licensed Work for any purpose EXCEPT offering it
+                      (or a derivative) to third parties as a hosted, managed,
+                      or commercial UI engine / UI-as-a-service that competes
+                      with the Licensor. Internal use, evaluation, research,
+                      education, and non-competing production use are
+                      permitted.
+Change Date:          2030-06-16
+Change License:       Apache License, Version 2.0
 
-Parameters
-----------
-Licensor:              T. Billy Ekkerd, trading as DarkBlaze Systems.
-Licensed Work:         "DarkBlaze Uni-UI" — the Rust UI engine in this
-                       repository (its compiler, intermediate representation,
-                       runtime, DSL, and supporting crates), together with any
-                       future version the Licensor releases under this license.
-Additional Use Grant:  You may use, copy, modify, and create derivative works
-                       of the Licensed Work for any purpose EXCEPT offering the
-                       Licensed Work or a derivative to third parties as a
-                       hosted, managed, or commercial UI engine or
-                       UI-as-a-service that competes with the Licensor.
-                       Internal use, evaluation, research, education, and
-                       non-competing production use are permitted.
-Change Date:           2030-06-16.
-Change License:        Apache License, Version 2.0.
+                             == PREAMBLE ==
 
+DarkBlaze Systems stewards the Licensed Work to keep it open, readable, and
+usable. The intent is source openness, stewardship, and not lock-in. You are
+free to read, study, adapt, and run this software; the only constraint is that
+you may not offer the Licensed Work or a derivative as a competing commercial
+UI engine or UI-as-a-service to third parties.
 
-Terms
------
-1. Grant. Subject to the restriction in Section 2, the Licensor grants you a
-   worldwide, royalty-free, non-exclusive license to use, copy, modify, create
-   derivative works of, and redistribute the Licensed Work.
+                           == DEFINITIONS ==
 
-2. Restriction. Until the Change Date, you may not use the Licensed Work in a
-   way that falls outside the Additional Use Grant above. Any use beyond that
-   Grant requires a separate commercial license from the Licensor.
+"Licensed Work" means the work of authorship identified in the Parameters
+above, as made available under this License, including any updates or
+supplemental releases designated by the Licensor.
 
-3. Change Date conversion. On the Change Date, the restriction in Section 2
-   ends for the then-current and all prior versions of the Licensed Work, and
-   that code is thereafter governed by the Change License (Apache-2.0). Each
-   version's Change Date is the date stated in the Parameters of the license
-   accompanying that version.
+"Additional Use Grant" means the permissions described in the Parameters,
+subject to the restrictions and terms of this License.
 
-4. Redistribution. You must retain this license text, the NOTICE file, and all
-   copyright and attribution notices in any copy or derivative you distribute.
+"Change Date" means the date specified in the Parameters.
 
-5. Trademarks. This license grants no rights in the names, logos, or marks of
-   the Licensor, including "DarkBlaze", "Uni-UI", and "Sanity License". The
-   names "Slint", "Flutter", and "SwiftUI" are referenced solely to describe
-   the source dialects this engine can import (nominative use); they are the
-   property of their respective owners, who do not endorse this work.
+"Change License" means the license specified in the Parameters.
 
-6. Clean-room statement. The Licensed Work is an independent, clean-room
-   implementation and incorporates no source from copyleft-licensed projects.
-   Third-party dependencies are licensed permissively and retain their own
-   licenses.
+"You" means any natural person or legal entity exercising the rights granted
+by this License.
 
-7. Warranty disclaimer. To the maximum extent permitted by applicable law, the
-   Licensed Work is provided "AS IS", without warranty of any kind, express or
-   implied, including warranties of merchantability, fitness for a particular
-   purpose, and non-infringement.
+"Affiliate" means any entity that directly or indirectly controls, is
+controlled by, or is under common control with a party, where "control" means
+ownership of more than fifty percent (50%) of the voting securities or
+equivalent voting interest.
 
-8. Limitation of liability. To the maximum extent permitted by applicable law,
-   the Licensor is not liable for any indirect, incidental, special, or
-   consequential damages arising from the Licensed Work. Nothing in this
-   license limits liability that applicable mandatory law does not allow to be
-   limited — including, where they apply, liability for willful misconduct or
-   gross negligence (dolo o colpa grave / dolo), and any liability or consumer
-   right that the mandatory law of the user's jurisdiction renders
-   non-excludable.
+                      == ADDITIONAL USE GRANT ==
 
-9. Author's moral rights. Where applicable mandatory law confers inalienable
-   moral rights on the author (as under the law of Italy and Argentina, among
-   others), those rights are expressly preserved and are not waived by this
-   license.
+Subject to the terms of this License, Licensor hereby grants You a worldwide,
+royalty-free, non-exclusive license to use, copy, modify, and create
+derivative works of the Licensed Work. This grant is subject to the
+limitation that You may not exercise these rights to offer the Licensed Work
+or any derivative work to third parties as a hosted, managed, or commercial
+UI engine / UI-as-a-service that competes with the Licensor. All other uses,
+including internal use, evaluation, research, education, and non-competing
+production use, are permitted.
 
-10. Governing law and local mandatory rules. This license is governed by its
-    plain terms and is intended to be valid and enforceable wherever the
-    Licensed Work is used, including South Africa, Italy, and Argentina. Where
-    any term conflicts with the mandatory law of a jurisdiction in which the
-    Licensed Work is used — including consumer-protection law (e.g. South
-    Africa's Consumer Protection Act 68 of 2008) and author-protection law
-    (e.g. Italian Civil Code provisions on moral rights and clausole
-    vessatorie; Argentina's Ley 11.723) — that term applies only to the maximum
-    extent that jurisdiction permits, and the remainder of this license
-    continues in force.
+                    == CHANGE DATE AND CHANGE LICENSE ==
 
-11. Severability. If any provision is held unenforceable, it is read down to
-    the minimum extent necessary to be valid, and the remaining provisions
-    remain in effect.
+On the Change Date, the Licensed Work shall be made available by the Licensor
+under the Change License. From the Change Date through perpetuity, You may
+use, copy, modify, and create derivative works of the Licensed Work under the
+terms of the Change License.
 
-12. Language. The controlling version of this license is English, except where
-    a jurisdiction's mandatory law requires an official local-language version,
-    in which case the local-language version controls in that jurisdiction to
-    the extent of any conflict.
+                        == TRADEMARKS ==
 
+This License does not grant any rights in the trademarks, service marks, logos,
+or trade names of the Licensor or its Affiliates. The names "DarkBlaze",
+"Uni-UI", and "Sanity License" are not licensed hereunder. Reference to
+third-party products "Slint", "Flutter", and "SwiftUI" is permitted solely
+for nominative or interoperability use, and no endorsement by the Licensor
+of any third-party product is implied or granted by this License.
 
-NOTE (non-binding): This Interim Version 1.0 is a good-faith, source-available
-license, not legal advice. A qualified attorney in each target jurisdiction
-(South Africa, Italy, Argentina) should review and confirm enforceability
-before this is relied upon commercially. The license terminology draws on the
-Business Source License 1.1 concept; "Business Source License" is a trademark
-of MariaDB Corporation Ab, which does not endorse this work.
+                         == TERMINATION ==
+
+If You violate any term of this License, Your rights under this License shall
+terminate automatically and without notice. Upon termination, You must
+immediately cease all use, copying, modification, and distribution of the
+Licensed Work. The surviving provisions (Trademarks, Warranty Disclaimer,
+Limitation of Liability, Governing Law and Venue, Moral Rights, Vexatious
+Clauses, Severability, Language and Translations, and General) shall survive
+termination.
+
+                 == WARRANTY DISCLAIMER ==
+
+THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE
+MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR EXPRESSLY DISCLAIMS
+ALL WARRANTIES AND CONDITIONS, WHETHER EXPRESS, IMPLIED, STATUTORY, OR
+OTHERWISE, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THIS DISCLAIMER DOES
+NOT EXCLUDE OR LIMIT LIABILITY THAT, UNDER MANDATORY APPLICABLE LAW, CANNOT
+BE EXCLUDED OR LIMITED, INCLUDING DAMAGES ARISING FROM GROSS NEGLIGENCE
+(COLPA GRAVE), WILLFUL MISCONDUCT (DOLO), DEATH, OR PERSONAL INJURY.
+
+             == LIMITATION OF LIABILITY ==
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR OR ITS AFFILIATES BE LIABLE FOR ANY SPECIAL, INCIDENTAL, INDIRECT,
+PUNITIVE, OR CONSEQUENTIAL DAMAGES, OR FOR ANY LOST PROFITS, DATA, OR
+GOODWILL, ARISING OUT OF OR IN CONNECTION WITH THIS LICENSE OR THE USE OF THE
+LICENSED WORK, EVEN IF THE LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES. NOTWITHSTANDING THE FOREGOING, THIS LIMITATION SHALL NOT APPLY
+TO LIABILITY THAT, UNDER MANDATORY LAW OF THE JURISDICTION OF THE USER, CANNOT
+BE EXCLUDED OR LIMITED, INCLUDING BUT NOT LIMITED TO LIABILITY FOR GROSS
+NEGLIGENCE (COLPA GRAVE), WILLFUL MISCONDUCT (DOLO), OR DAMAGES CAUSED BY
+DEATH OR PERSONAL INJURY.
+
+              == GOVERNING LAW AND VENUE ==
+
+This License shall be governed by and construed in accordance with the laws
+of the Republic of South Africa, without regard to its conflict of law
+principles. The parties irrevocably submit to the exclusive jurisdiction of
+the High Court of South Africa, sitting in Johannesburg, for any dispute
+arising out of or in connection with this License. Nothing in this Section
+shall be interpreted to defeat or override mandatory consumer-protection,
+author-rights, or other non-waivable protections granted under the laws of
+South Africa, Italy, Argentina, the European Union, the European Economic
+Area, or any other applicable jurisdiction. The parties agree that this
+License is intended to be enforceable in each of the foregoing
+jurisdictions, and where a term of this License conflicts with any mandatory
+local law, that term is modified to the minimum extent necessary to be valid
+in that jurisdiction, preserving the Licensor's core intent as stated in the
+Preamble.
+
+                         == MORAL RIGHTS ==
+
+The Licensor acknowledges and agrees that, to the extent the Licensed Work
+contains original authorship, the Licensor holds and retains all moral rights
+(including, where applicable, the moral rights recognized under Italian Civil
+Code (diritti morali), Argentine Ley 11.723, and any analogous statutes).
+Nothing in this License constitutes a waiver, assignment, or transfer of any
+inalienable moral right. The Licensor hereby grants You, and You accept, a
+limited, non-exclusive license to exercise such economic rights as are
+necessary to use, copy, modify, and create derivative works of the Licensed
+Work in accordance with the Additional Use Grant, but no moral right is
+abandoned or transferred, to the fullest extent permitted by applicable law.
+
+                 == VEXATIOUS CLAUSES ==
+
+The parties acknowledge that certain provisions of this License (including
+the warranty disclaimer, limitation of liability, and competition restriction)
+may be considered one-sided or adverse to one party. If You are a natural
+person acting for purposes unrelated to trade, business, or profession, or if
+mandatory law requires specific written approval of onerous clauses (such as
+Italian Civil Code Articles 1341 and 1342 or equivalent rules), You must
+expressly approve such clauses in writing before this License becomes
+effective as to You. In the event of conflict between this Section and
+mandatory local law, the mandatory law shall prevail, and the clause in
+question shall be read down to the minimum extent necessary to satisfy such
+law.
+
+                     == SEVERABILITY ==
+
+If any provision of this License is held to be invalid, illegal, or
+unenforceable by a court of competent jurisdiction, such provision shall be
+judicially modified to the minimum extent necessary to make it valid and
+enforceable, preserving the original economic intent. If judicial
+modification is not possible, the provision shall be severed from this
+License without affecting the validity, legality, or enforceability of the
+remaining terms. The parties shall negotiate in good faith to replace any
+invalid or unenforceable provision with a valid and enforceable provision
+that achieves the Licensor's core intent as described in the Preamble.
+
+                 == LANGUAGE AND TRANSLATIONS ==
+
+This License is executed in English. In jurisdictions where a local-language
+version is required by mandatory law for judicial or administrative
+enforcement (for example, Italian or Spanish), an official translation may
+be prepared for procedural purposes only. In the event of any conflict,
+discrepancy, or variance between the English text and any translation, the
+English text controls unless applicable law expressly and mandatorily
+requires otherwise.
+
+                        == GENERAL ==
+
+This License constitutes the entire agreement between the parties concerning
+the subject matter hereof and supersedes all prior agreements or
+understandings. No amendment or modification of this License shall be valid
+or binding unless in writing and signed by the Licensor. No waiver by the
+Licensor of any covenant or right herein shall be deemed a waiver of any
+other covenant or right. The headings in this License are for convenience
+only and shall not affect its interpretation.
+
+                 == TRADEMARK NOTICE ==
+
+"Business Source License" is a trademark of MariaDB Corporation Ab. The DarkBlaze
+Sanity License is a variant thereof. By using the Business Source License
+text as a basis, the Licensor acknowledges that the BSL text is provided "as
+is" and disclaims any representation that this variant carries the endorsement
+of MariaDB Corporation Ab.
+
+== DRAFTING NOTES (NON-BINDING) ==
+
+Assumptions made during drafting:
+- Change Date was set to four years from rough first-publication estimate
+  (2030-06-16) as requested.
+- License is based on Business Source License 1.1 (BSL 1.1) structure and
+  operative terms. The standard BSL attribution regarding the MariaDB
+  trademark is included.
+- Governing law is set to South Africa for contractual predictability, with
+  extensive carve-outs to preserve mandatory rights under Italian, Argentine,
+  and EU law.
+- English is the controlling language; translations are noted where
+  enforcement practice may require them.
+
+Points for a qualified attorney in each jurisdiction to review before
+reliance:
+
+SOUTH AFRICA:
+- Review against the Consumer Protection Act 68 of 2008: confirm the warranty
+  disclaimer and limitation of liability do not attempt to exclude liability
+  that the CPA renders non-excludable (e.g., gross negligence, death, or
+  personal injury). The current disclaimer reads down exclusions where
+  mandatory law applies, but a specific analysis of classification (consumer
+  vs. business) may be needed.
+- Review against the Electronic Communications and Transactions Act 25 of 2002
+  (ECTA): confirm electronic record, signature, and notice requirements are
+  satisfied.
+- Verify that the severability clause achieves the "read down, not voided
+  wholesale" intent under South African contract law and that the High Court
+  venue clause is enforceable.
+
+ITALY / EU:
+- Review the moral-rights clause under Italian Civil Code (Arts. 2575 et seq.)
+  and EU law: confirm it appropriately preserves diritti morali and does not
+  constitute an impermissible waiver.
+- Identify which clauses may be "vexatious" (clausole vessatorie) under Arts.
+  1341-1342 of the Italian Civil Code or counterpart EU consumer-protection
+  directives. Determine whether specific written approval (approvazione
+  specifica) from consumers is required for enforceability.
+- Confirm that the liability carve-out for dolo and colpa grave satisfies
+  Italian mandatory rules and that the governing-law clause does not defeat
+  imperative consumer or author-protection norms.
+
+ARGENTINA:
+- Review under the Código Civil y Comercial de la Nación and Ley 11.723:
+  confirm that inalienable moral rights are preserved and that the license
+  does not purport to waive them.
+- Verify that the limitation-of-liability clause complies with the
+  prohibition on waiving liability for dolo and with any local consumer-
+  protection or unfair-contract rules.
+- Confirm that the South-African governing-law clause does not extinguish
+  Argentine mandatory protections for local users.
+
+GENERAL / COMMON LAW:
+- Evaluate whether the competition restriction (offering the Licensed Work or
+  a derivative as a competing UI engine / UI-as-a-service) is sufficiently
+  certain to be enforceable and whether it raises antitrust or competition
+  concerns in any relevant market.
+- Verify that the automatic change-of-license mechanic (conversion to
+  Apache-2.0 on the Change Date) is an enforceable obligation and does not
+  constitute an illusory grant.
+- Confirm the trademark clause adequately protects the marks "DarkBlaze",
+  "Uni-UI", and "Sanity License" in key commercial markets and does not
+  overreach vis-a-vis third-party marks.
+- Determine whether a certified Italian or Spanish translation is required
+  for enforceability in specific jurisdictions and, if so, the precise
+  language the English text must be reconciled against.
