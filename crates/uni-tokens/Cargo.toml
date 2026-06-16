@@ -5,4 +5,9 @@ edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# uni-tokens is the design-token layer: pure data + functions, std-only.
+# It deliberately carries NO heavy dependencies. Colors are packed `u32`
+# `0xRRGGBBAA`, matching uni-ir's `Value::Color(u32)`, so tokens drop
+# straight into the IR without conversion.
+
 [dependencies]
