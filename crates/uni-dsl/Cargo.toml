@@ -1,8 +1,12 @@
 [package]
 name = "uni-dsl"
+description = "DarkBlaze Uni-UI — lexer + parser for the native `.uni` declarative UI language; lowers to a uni-ir Document."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+uni-ir = { path = "../uni-ir" }
+logos = "0.14"
+chumsky = "0.9"
