@@ -32,6 +32,21 @@
 //!   `.scaleEffect(s)` → `scale`; `.animation(.curve(duration:), value:)` → an
 //!   `animation` descriptor prop (`"<curve>:<duration>"`); `.transition(.opacity
 //!   /.slide/.scale)` → `transition`; `withAnimation { … }` wrappers recognized
+//! - Drawing & text lowering:
+//!   `Rectangle`/`RoundedRectangle`/`Circle`/`Ellipse`/`Capsule` carry a `shape`
+//!   prop (`rect`/`rounded_rect`/`circle`/`ellipse`/`capsule`);
+//!   `RoundedRectangle(cornerRadius:)` surfaces `corner_radius`. `Path { … }`
+//!   lowers to a `Path` node whose `move`/`addLine`/`closeSubpath`/curve ops are
+//!   captured into a `path_ops` descriptor (and `path_op_count`); `Path(arg)`
+//!   records a `path_source`. `Canvas { … }` lowers to a `Canvas` node (its draw
+//!   closure is skipped). `LinearGradient`/`RadialGradient`/`AngularGradient`
+//!   (via `colors:`/`gradient:`/`stops:` + `startPoint:`/`endPoint:`/`center:`)
+//!   used in `.fill(...)` / `.background(...)` / `.foregroundStyle(...)` lower to
+//!   a `<prop>` = `"gradient:<kind>"` plus `<prop>_stops` / `<prop>_start` /
+//!   `<prop>_end`. `.fill(Color)` on a shape stays a color `background`.
+//!   `Text("key")` is treated as a `LocalizedStringKey`: the node gains
+//!   `localizable=true` and an `l10n_key`. `.dynamicTypeSize(.large)` →
+//!   `type_scale`; the clamp-range form → `type_scale_min`/`type_scale_max`.
 //! - Line comments (`//`)
 
 use uni_ir::{Action, Document, Mutation, NodeId, Origin, Value};
@@ -107,6 +122,28 @@ enum SwiftValue {
     Ident(String),
     /// A closed range `lo...hi` (SwiftUI `Slider(in:)`). Lowered as two props.
     Range(f64, f64),
+    /// A `LinearGradient`/`RadialGradient`/`AngularGradient` fill. Carries the
+    /// gradient kind (`"linear"`/`"radial"`/`"angular"`), its color stops, and a
+    /// `start`/`end` (or center) direction descriptor. Lowered into a family of
+    /// `gradient*` props rather than a single scalar.
+    Gradient(GradientSpec),
+}
+
+/// A parsed SwiftUI gradient fill. Clean-room: built from the published shapes
+/// `LinearGradient(colors:startPoint:endPoint:)`,
+/// `LinearGradient(gradient:startPoint:endPoint:)`, and
+/// `RadialGradient(colors:center:startRadius:endRadius:)`.
+#[derive(Debug, Clone)]
+struct GradientSpec {
+    /// `"linear"`, `"radial"`, or `"angular"`.
+    kind: String,
+    /// The gradient's color stops, in source order (RGBA-packed).
+    stops: Vec<u32>,
+    /// For a linear gradient, the named `startPoint` (e.g. `"top"`); for a
+    /// radial/angular gradient, the named `center`. `None` if unspecified.
+    start: Option<String>,
+    /// For a linear gradient, the named `endPoint`. `None` otherwise.
+    end: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +303,14 @@ fn map_kind(swiftui: &str) -> &str {
         "Menu" => "Menu",
         "RoundedRectangle" | "Rectangle" => "Rect",
         "Spacer" => "Rect",
+        // Drawing primitives keep a distinct IR kind so a renderer can pick the
+        // right path. `Circle`/`Ellipse`/`Capsule` have no box analogue; `Path`
+        // and `Canvas` are free-form drawing surfaces.
+        "Circle" => "Circle",
+        "Ellipse" => "Ellipse",
+        "Capsule" => "Capsule",
+        "Path" => "Path",
+        "Canvas" => "Canvas",
         // Leaf views keep their SwiftUI name as the IR kind — these have no
         // layout-container analogue, they *are* their own element.
         "Image" => "Image",
@@ -275,6 +320,20 @@ fn map_kind(swiftui: &str) -> &str {
         "ProgressView" => "ProgressView",
         _ => swiftui,
     }
+}
+
+/// The canonical `shape` prop value for a SwiftUI drawing primitive, or `None`
+/// if the kind names no shape. Recorded on the lowered node so a renderer can
+/// dispatch the right drawing path independent of the IR `kind`.
+fn shape_name(swiftui: &str) -> Option<&'static str> {
+    Some(match swiftui {
+        "Rectangle" => "rect",
+        "RoundedRectangle" => "rounded_rect",
+        "Circle" => "circle",
+        "Ellipse" => "ellipse",
+        "Capsule" => "capsule",
+        _ => return None,
+    })
 }
 
 // ─────────────────────────────────────────── color helpers ───────────────────
@@ -366,6 +425,197 @@ fn parse_color_arg(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError
     }
 }
 
+/// Parse a single color token for a gradient stop: `.red` / `Color.red` /
+/// `Color(red:…,green:…,blue:…)`. Returns the packed RGBA, or `None` for a
+/// gradient stop we cannot resolve to a concrete color (e.g. a named asset).
+fn parse_gradient_color(lex: &mut Lexer<'_>) -> Result<Option<u32>, SwiftUIImportError> {
+    lex.skip_ws();
+    match lex.peek() {
+        Some(b'.') => {
+            lex.advance(); // .
+            let name = lex.read_ident();
+            Ok(named_dot_color(&name))
+        }
+        Some(c) if c.is_ascii_uppercase() => {
+            let ident = lex.read_ident();
+            if ident == "Color" {
+                match parse_color_arg(lex)? {
+                    SwiftValue::Color(c) => Ok(Some(c)),
+                    _ => Ok(None),
+                }
+            } else {
+                // Unknown color-producing identifier; skip a trailing `(…)`.
+                lex.skip_ws();
+                if lex.peek() == Some(b'(') {
+                    lex.advance();
+                    lex.skip_balanced(b'(', b')');
+                }
+                Ok(None)
+            }
+        }
+        _ => {
+            // Skip an unrecognized token up to the next separator.
+            lex.read_ident();
+            Ok(None)
+        }
+    }
+}
+
+/// Read a bracketed `[ stop, stop, … ]` color list into packed RGBA stops.
+/// Assumes `lex` is positioned at the opening `[`; consumes the closing `]`.
+fn parse_gradient_stops(lex: &mut Lexer<'_>) -> Result<Vec<u32>, SwiftUIImportError> {
+    let mut stops = Vec::new();
+    lex.advance(); // [
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b']') => {
+                lex.advance();
+                break;
+            }
+            None => break,
+            Some(b',') => {
+                lex.advance();
+            }
+            _ => {
+                // A `.stop(color:.red, location:0.0)` form carries a nested color;
+                // handle the common bare-color form, and also reach into a `Gradient
+                // .Stop(...)`-style call for its color.
+                if let Some(c) = parse_gradient_color(lex)? {
+                    stops.push(c);
+                } else {
+                    // nothing resolved — keep scanning
+                }
+            }
+        }
+    }
+    Ok(stops)
+}
+
+/// Parse a `LinearGradient(...)` / `RadialGradient(...)` / `AngularGradient(...)`
+/// argument list into a [`GradientSpec`]. `kind` is the lowercase gradient kind
+/// (`"linear"`/`"radial"`/`"angular"`). Assumes the gradient identifier has been
+/// read; this reads the parenthesized args and consumes the matching `)`.
+fn parse_gradient_args(
+    lex: &mut Lexer<'_>,
+    kind: &str,
+) -> Result<GradientSpec, SwiftUIImportError> {
+    let mut spec = GradientSpec {
+        kind: kind.to_string(),
+        stops: Vec::new(),
+        start: None,
+        end: None,
+    };
+    lex.skip_ws();
+    if lex.peek() != Some(b'(') {
+        return Ok(spec);
+    }
+    lex.advance(); // (
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') => {
+                lex.advance();
+                break;
+            }
+            None => break,
+            Some(b',') => {
+                lex.advance();
+            }
+            Some(c) if c.is_ascii_alphabetic() => {
+                let key = lex.read_ident();
+                lex.skip_ws();
+                if lex.peek() == Some(b':') {
+                    lex.advance();
+                    lex.skip_ws();
+                }
+                match key.as_str() {
+                    // `colors: [...]` — the inline stop list.
+                    "colors" => {
+                        if lex.peek() == Some(b'[') {
+                            spec.stops = parse_gradient_stops(lex)?;
+                        }
+                    }
+                    // `gradient: Gradient(colors: [...])` / `Gradient(stops: [...])`
+                    // — unwrap one level to find the stop list.
+                    "gradient" => {
+                        // Skip the `Gradient` identifier, then dig for `[...]`.
+                        if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                            lex.read_ident();
+                        }
+                        lex.skip_ws();
+                        if lex.peek() == Some(b'(') {
+                            lex.advance(); // (
+                            // Find the bracketed stop list inside, then drain to `)`.
+                            loop {
+                                lex.skip_ws();
+                                match lex.peek() {
+                                    Some(b')') => {
+                                        lex.advance();
+                                        break;
+                                    }
+                                    None => break,
+                                    Some(b'[') => {
+                                        spec.stops = parse_gradient_stops(lex)?;
+                                    }
+                                    _ => {
+                                        lex.advance();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `stops: [...]` form (used directly, rare) — also a stop list.
+                    "stops" => {
+                        if lex.peek() == Some(b'[') {
+                            spec.stops = parse_gradient_stops(lex)?;
+                        }
+                    }
+                    // Direction anchors: `.top`/`.bottom`/`.leading`/… or
+                    // `UnitPoint(x:…,y:…)` (recorded by name only).
+                    "startPoint" | "center" => spec.start = read_unit_point(lex)?,
+                    "endPoint" => spec.end = read_unit_point(lex)?,
+                    // Radii / angle have no scalar home in the descriptor yet — skip
+                    // their values cleanly.
+                    _ => {
+                        let _ = parse_value(lex);
+                    }
+                }
+            }
+            _ => {
+                lex.advance();
+            }
+        }
+    }
+    Ok(spec)
+}
+
+/// Read a gradient direction anchor: a dotted `.top`/`.center`/… name, or a
+/// `UnitPoint(...)` call (returned by the name `"unitPoint"`). Returns the
+/// anchor name, if any.
+fn read_unit_point(lex: &mut Lexer<'_>) -> Result<Option<String>, SwiftUIImportError> {
+    lex.skip_ws();
+    if lex.peek() == Some(b'.') {
+        lex.advance(); // .
+        return Ok(Some(lex.read_ident()));
+    }
+    if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+        let ident = lex.read_ident();
+        lex.skip_ws();
+        if lex.peek() == Some(b'(') {
+            lex.advance();
+            lex.skip_balanced(b'(', b')');
+        }
+        // `UnitPoint.top` member access.
+        if lex.peek() == Some(b'.') {
+            lex.advance();
+            return Ok(Some(lex.read_ident()));
+        }
+        return Ok(Some(ident));
+    }
+    Ok(None)
+}
+
 /// Parse a SwiftUI view starting just AFTER the kind name has been read.
 /// `kind` is already consumed.
 fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, SwiftUIImportError> {
@@ -379,6 +629,29 @@ fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, Swift
     };
 
     lex.skip_ws();
+
+    // `Path { p in p.move(to:…) … }` / `Path(…)` and `Canvas { ctx, size in … }`
+    // are free-form drawing surfaces, not view containers — their closure body is
+    // imperative drawing code, never child views. Handle them before the generic
+    // arg/closure machinery so the drawing ops are captured (Path) or the draw
+    // closure is skipped (Canvas) rather than mis-read.
+    if view.kind == "Path" {
+        parse_path_body(lex, &mut view)?;
+        return apply_modifiers(lex, view);
+    }
+    if view.kind == "Canvas" {
+        // Optional `(opaque:…, …)` arg list, then the draw closure.
+        if lex.peek() == Some(b'(') {
+            lex.advance();
+            lex.skip_balanced(b'(', b')');
+            lex.skip_ws();
+        }
+        if lex.peek() == Some(b'{') {
+            lex.advance();
+            lex.skip_balanced(b'{', b'}');
+        }
+        return apply_modifiers(lex, view);
+    }
 
     // Optional inline args: `("label")` or `(cornerRadius: 16)`
     if lex.peek() == Some(b'(') {
@@ -458,6 +731,189 @@ fn parse_view_body(lex: &mut Lexer<'_>, kind: String) -> Result<SwiftView, Swift
     apply_modifiers(lex, view)
 }
 
+/// Read a `CGPoint(x: N, y: N)` / `(x: N, y: N)` / `CGPoint(N, N)` argument and
+/// return it as an `"x,y"` string. Assumes `lex` is positioned at the opening
+/// `(`; consumes the matching `)`.
+fn read_point_arg(lex: &mut Lexer<'_>) -> Option<String> {
+    lex.skip_ws();
+    // An optional leading `CGPoint` type name.
+    if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+        lex.read_ident();
+        lex.skip_ws();
+    }
+    if lex.peek() != Some(b'(') {
+        return None;
+    }
+    lex.advance(); // (
+    let mut x: Option<f64> = None;
+    let mut y: Option<f64> = None;
+    let mut positional = 0usize;
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') | None => {
+                if lex.peek() == Some(b')') {
+                    lex.advance();
+                }
+                break;
+            }
+            Some(b',') => {
+                lex.advance();
+            }
+            Some(c) if c.is_ascii_alphabetic() => {
+                let key = lex.read_ident();
+                lex.skip_ws();
+                if lex.peek() == Some(b':') {
+                    lex.advance();
+                }
+                lex.skip_ws();
+                let v = lex.read_number();
+                match key.as_str() {
+                    "x" => x = Some(v),
+                    "y" => y = Some(v),
+                    _ => {}
+                }
+            }
+            Some(c) if c.is_ascii_digit() => {
+                let v = lex.read_number();
+                if positional == 0 {
+                    x = Some(v);
+                } else {
+                    y = Some(v);
+                }
+                positional += 1;
+            }
+            _ => {
+                lex.advance();
+            }
+        }
+    }
+    match (x, y) {
+        (Some(x), Some(y)) => Some(format!("{x},{y}")),
+        _ => None,
+    }
+}
+
+/// Parse a `Path` body: either a `Path(existingCGPath)` arg form, or the closure
+/// `Path { p in p.move(to:…); p.addLine(to:…); p.closeSubpath() }`. Recognized
+/// `move`/`addLine`/`closeSubpath`/`addQuadCurve`/`addCurve` ops are captured (as
+/// far as their points parse) into a `path_ops` list prop; an op whose points we
+/// cannot read is still recorded by name. `path_op_count` carries the total.
+fn parse_path_body(lex: &mut Lexer<'_>, view: &mut SwiftView) -> Result<(), SwiftUIImportError> {
+    let mut ops: Vec<String> = Vec::new();
+    lex.skip_ws();
+    // `Path(...)` arg form — an existing CGPath/rect. Record that a path was
+    // built from an argument; we cannot enumerate its ops in a clean-room parse.
+    if lex.peek() == Some(b'(') {
+        lex.advance();
+        lex.skip_balanced(b'(', b')');
+        view.props
+            .push(("path_source".into(), SwiftValue::Ident("arg".into())));
+        // A `Path(...) { … }` trailing closure is unusual; if present, fall
+        // through to read it too.
+        lex.skip_ws();
+    }
+    if lex.peek() == Some(b'{') {
+        lex.advance(); // {
+        loop {
+            lex.skip_ws();
+            match lex.peek() {
+                Some(b'}') => {
+                    lex.advance();
+                    break;
+                }
+                None => break,
+                Some(b'.') => {
+                    // `.move(to:…)` member call on the path builder.
+                    lex.advance();
+                    let op = lex.read_ident();
+                    record_path_op(lex, &op, &mut ops);
+                }
+                Some(c) if c.is_ascii_alphabetic() || c == b'_' => {
+                    let ident = lex.read_ident();
+                    lex.skip_ws();
+                    // `p.move(to:…)` — `ident` is the builder binding; the op
+                    // follows after a `.`.
+                    if lex.peek() == Some(b'.') {
+                        lex.advance();
+                        let op = lex.read_ident();
+                        record_path_op(lex, &op, &mut ops);
+                    } else {
+                        let _ = ident;
+                    }
+                }
+                _ => {
+                    lex.advance();
+                }
+            }
+        }
+    }
+    if !ops.is_empty() {
+        view.props.push((
+            "path_op_count".into(),
+            SwiftValue::Float(ops.len() as f64),
+        ));
+        // Join ops into a single descriptor string (List would need SwiftValue
+        // list support); `;`-separated, each `op[:x,y]`.
+        view.props
+            .push(("path_ops".into(), SwiftValue::Str(ops.join(";"))));
+    }
+    Ok(())
+}
+
+/// Record one path-builder op (`move`/`addLine`/`closeSubpath`/…). Reads the op's
+/// argument list (if any) for a leading `to:`/positional point and appends an
+/// `op` or `op:x,y` descriptor. Assumes `lex` is just after the op identifier.
+fn record_path_op(lex: &mut Lexer<'_>, op: &str, ops: &mut Vec<String>) {
+    lex.skip_ws();
+    if lex.peek() != Some(b'(') {
+        // A no-arg op such as `closeSubpath()` written without parens, or a stray
+        // member; record the name only.
+        match op {
+            "move" | "addLine" | "addQuadCurve" | "addCurve" | "closeSubpath" | "addRect"
+            | "addEllipse" | "addArc" => ops.push(op.to_string()),
+            _ => {}
+        }
+        return;
+    }
+    lex.advance(); // (
+    // Look for a leading `to:` label, then a point; otherwise drain the args.
+    lex.skip_ws();
+    let mut point: Option<String> = None;
+    // Peek for `to:` / `x:`-style first label.
+    let saved_pos = lex.pos;
+    let saved_line = lex.line;
+    if lex.peek().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        let label = lex.read_ident();
+        lex.skip_ws();
+        if label == "to" && lex.peek() == Some(b':') {
+            lex.advance(); // :
+            point = read_point_arg(lex);
+        } else {
+            lex.pos = saved_pos;
+            lex.line = saved_line;
+        }
+    } else if lex.peek() == Some(b'(') || lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+    {
+        // Positional point: `move(CGPoint(...))` is unusual but handle it.
+        point = read_point_arg(lex);
+    }
+    // Drain the rest of the op's args to the matching `)`.
+    lex.skip_balanced(b'(', b')');
+    match (op, point) {
+        (_, Some(p)) if matches!(op, "move" | "addLine" | "addQuadCurve" | "addCurve") => {
+            ops.push(format!("{op}:{p}"));
+        }
+        ("closeSubpath", _) => ops.push("closeSubpath".to_string()),
+        (
+            "move" | "addLine" | "addQuadCurve" | "addCurve" | "addRect" | "addEllipse"
+            | "addArc",
+            _,
+        ) => ops.push(op.to_string()),
+        _ => {}
+    }
+}
+
 /// Parse a `{ View View ... }` content block, returning its child views.
 /// Assumes `lex` is positioned at the opening `{`.
 fn parse_children_block(lex: &mut Lexer<'_>) -> Result<Vec<SwiftView>, SwiftUIImportError> {
@@ -531,6 +987,15 @@ fn parse_value(lex: &mut Lexer<'_>) -> Result<SwiftValue, SwiftUIImportError> {
                 "true" => Ok(SwiftValue::Bool(true)),
                 "false" => Ok(SwiftValue::Bool(false)),
                 "Color" => parse_color_arg(lex),
+                "LinearGradient" => {
+                    Ok(SwiftValue::Gradient(parse_gradient_args(lex, "linear")?))
+                }
+                "RadialGradient" => {
+                    Ok(SwiftValue::Gradient(parse_gradient_args(lex, "radial")?))
+                }
+                "AngularGradient" => {
+                    Ok(SwiftValue::Gradient(parse_gradient_args(lex, "angular")?))
+                }
                 // A view-valued argument such as `Section(header: Text("Settings"))`
                 // or `Picker(... ) { }` with a `Text(...)` label. Pull the inner
                 // string literal out as the value; if there is none, fall back to
@@ -776,8 +1241,12 @@ fn background_is_view_layer(lex: &mut Lexer<'_>) -> bool {
         lex.skip_ws();
         if lex.peek().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
             let ident = lex.read_ident();
-            // `Color(...)` is a style, not a view layer.
-            decided = ident != "Color";
+            // `Color(...)` and the gradient constructors are *styles*, not view
+            // layers — they lower to background style props, not an underlay.
+            decided = !matches!(
+                ident.as_str(),
+                "Color" | "LinearGradient" | "RadialGradient" | "AngularGradient"
+            );
         }
     } else {
         lex.skip_ws();
@@ -1461,6 +1930,39 @@ fn apply_modifiers(
             "italic" => {
                 view.props.push(("italic".into(), SwiftValue::Bool(true)));
             }
+            "dynamicTypeSize" => {
+                // `.dynamicTypeSize(.large)` → a `type_scale` prop naming the size;
+                // `.dynamicTypeSize(.xSmall ... .accessibility5)` (a clamp range) →
+                // `type_scale_min` / `type_scale_max`. The leading dotted name is
+                // the (lower) bound; an optional `...` range gives the upper.
+                let lo = parse_value(lex)?;
+                let lo_name = match lo {
+                    SwiftValue::Ident(s) => Some(s),
+                    _ => None,
+                };
+                lex.skip_ws();
+                // A range form: `.xSmall ... .large`.
+                if lex.peek() == Some(b'.') && lex.src.get(lex.pos + 1).copied() == Some(b'.') {
+                    while lex.peek() == Some(b'.') {
+                        lex.advance();
+                    }
+                    if lex.peek() == Some(b'<') {
+                        lex.advance();
+                    }
+                    let hi = parse_value(lex)?;
+                    if let Some(name) = lo_name {
+                        view.props
+                            .push(("type_scale_min".into(), SwiftValue::Ident(name)));
+                    }
+                    if let SwiftValue::Ident(name) = hi {
+                        view.props
+                            .push(("type_scale_max".into(), SwiftValue::Ident(name)));
+                    }
+                } else if let Some(name) = lo_name {
+                    view.props
+                        .push(("type_scale".into(), SwiftValue::Ident(name)));
+                }
+            }
             "hidden" => {
                 // `.hidden()` — empty parens.
                 view.props.push(("hidden".into(), SwiftValue::Bool(true)));
@@ -1592,6 +2094,32 @@ fn swiftval_to_ir(v: SwiftValue) -> Value {
         SwiftValue::Ident(s) => Value::Text(s),
         // A bare range that escaped split-lowering — represent both bounds.
         SwiftValue::Range(lo, hi) => Value::List(vec![Value::Float(lo), Value::Float(hi)]),
+        // A gradient is split across several props in `lower_view`; if one ever
+        // reaches here as a bare value, fall back to its kind name.
+        SwiftValue::Gradient(g) => Value::Text(format!("gradient:{}", g.kind)),
+    }
+}
+
+/// Emit a gradient fill as a family of `<prefix>` / `<prefix>_stops` /
+/// `<prefix>_start` / `<prefix>_end` props on the node `id`. `prefix` is the
+/// base prop name the gradient fills (e.g. `"fill"` or `"background"`).
+fn lower_gradient(doc: &mut Document, id: NodeId, prefix: &str, g: &GradientSpec) {
+    let set = |doc: &mut Document, key: String, value: Value| {
+        doc.apply_from(Origin::System, Mutation::SetProp { id, key, value })
+            .ok();
+    };
+    // Base prop names the gradient kind so a consumer can branch on it.
+    set(doc, prefix.to_string(), Value::Text(format!("gradient:{}", g.kind)));
+    set(
+        doc,
+        format!("{prefix}_stops"),
+        Value::List(g.stops.iter().map(|c| Value::Color(*c)).collect()),
+    );
+    if let Some(s) = &g.start {
+        set(doc, format!("{prefix}_start"), Value::Text(s.clone()));
+    }
+    if let Some(e) = &g.end {
+        set(doc, format!("{prefix}_end"), Value::Text(e.clone()));
     }
 }
 
@@ -1638,6 +2166,20 @@ fn lower_view(
         _ => {}
     }
 
+    // Drawing primitives carry a `shape` prop so a renderer can dispatch the
+    // right path regardless of the (sometimes shared) IR `kind`.
+    if let Some(shape) = shape_name(&view.kind) {
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id,
+                key: "shape".into(),
+                value: Value::Text(shape.into()),
+            },
+        )
+        .ok();
+    }
+
     // Label → content prop. A `Section`'s positional string is its *header*,
     // not generic content, so it lands under `header` instead.
     if let Some(label) = &view.label {
@@ -1655,6 +2197,29 @@ fn lower_view(
             },
         )
         .ok();
+        // `Text("greeting")` takes a `LocalizedStringKey` — the literal is a
+        // lookup key, not raw display text. Flag it localizable and carry the key
+        // so a consumer can resolve it against a string table.
+        if view.kind == "Text" {
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "localizable".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .ok();
+            doc.apply_from(
+                Origin::System,
+                Mutation::SetProp {
+                    id,
+                    key: "l10n_key".into(),
+                    value: Value::Text(label.clone()),
+                },
+            )
+            .ok();
+        }
     }
 
     for (key, val) in &view.props {
@@ -1662,8 +2227,17 @@ fn lower_view(
         // shows — normalize to one `content` prop in our vocabulary.
         let key: &str = match (view.kind.as_str(), key.as_str()) {
             ("Image", "name") | ("Image", "systemName") => "content",
+            // `RoundedRectangle(cornerRadius:)` inline arg → our `corner_radius`.
+            (_, "cornerRadius") => "corner_radius",
             _ => key.as_str(),
         };
+
+        // A gradient fill (`.fill(LinearGradient(...))`, `Rectangle(...).fill(...)`,
+        // a gradient `background`) lowers to a family of `<key>*` props.
+        if let SwiftValue::Gradient(g) = val {
+            lower_gradient(doc, id, key, g);
+            continue;
+        }
 
         // A range bound (`Slider(in: 0...100)`) is two scalars in the IR.
         if let SwiftValue::Range(lo, hi) = val {
@@ -2767,5 +3341,319 @@ mod tests {
         let node = root_node(&doc);
         assert!(node.callbacks.contains_key("drag_changed"));
         assert_eq!(node.props.get("padding"), Some(&Value::Px(8.0)));
+    }
+
+    // ── DRW: drawing shapes → shape kinds + props ─────────────────────────────
+
+    #[test]
+    fn parse_rectangle_sets_shape_rect() {
+        let doc = parse("Rectangle()").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Rect");
+        assert_eq!(node.props.get("shape"), Some(&Value::Text("rect".into())));
+    }
+
+    #[test]
+    fn parse_rounded_rectangle_shape_and_corner_radius() {
+        let doc = parse("RoundedRectangle(cornerRadius: 16)").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Rect");
+        assert_eq!(
+            node.props.get("shape"),
+            Some(&Value::Text("rounded_rect".into()))
+        );
+        // The inline cornerRadius arg now surfaces as corner_radius (Px).
+        assert_eq!(node.props.get("corner_radius"), Some(&Value::Px(16.0)));
+    }
+
+    #[test]
+    fn parse_circle_shape() {
+        let doc = parse("Circle()").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Circle");
+        assert_eq!(node.props.get("shape"), Some(&Value::Text("circle".into())));
+    }
+
+    #[test]
+    fn parse_ellipse_shape() {
+        let doc = parse("Ellipse()").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Ellipse");
+        assert_eq!(
+            node.props.get("shape"),
+            Some(&Value::Text("ellipse".into()))
+        );
+    }
+
+    #[test]
+    fn parse_capsule_shape() {
+        let doc = parse("Capsule()").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Capsule");
+        assert_eq!(
+            node.props.get("shape"),
+            Some(&Value::Text("capsule".into()))
+        );
+    }
+
+    #[test]
+    fn parse_shape_with_fill_color() {
+        // `.fill(.blue)` on a shape stays a color background, not a gradient.
+        let doc = parse("Circle().fill(.blue)").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Circle");
+        assert_eq!(node.props.get("background"), Some(&Value::Color(0x0000_FFFF)));
+        // No gradient props leaked in.
+        assert!(!node.props.contains_key("background_stops"));
+    }
+
+    // ── DRW: Path & Canvas ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_path_closure_captures_ops() {
+        let src = r#"Path { p in
+            p.move(to: CGPoint(x: 0, y: 0))
+            p.addLine(to: CGPoint(x: 10, y: 20))
+            p.closeSubpath()
+        }"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Path");
+        assert_eq!(node.props.get("path_op_count"), Some(&Value::Float(3.0)));
+        assert_eq!(
+            node.props.get("path_ops"),
+            Some(&Value::Text("move:0,0;addLine:10,20;closeSubpath".into()))
+        );
+    }
+
+    #[test]
+    fn parse_path_dotted_op_form() {
+        // The trailing-builder `.move(to:)` form (no explicit binding name).
+        let src = r#"Path { .move(to: CGPoint(x: 1, y: 2)) .addLine(to: CGPoint(x: 3, y: 4)) }"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Path");
+        assert_eq!(
+            node.props.get("path_ops"),
+            Some(&Value::Text("move:1,2;addLine:3,4".into()))
+        );
+    }
+
+    #[test]
+    fn parse_path_arg_form_records_source() {
+        let doc = parse("Path(existingPath)").unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Path");
+        assert_eq!(
+            node.props.get("path_source"),
+            Some(&Value::Text("arg".into()))
+        );
+    }
+
+    #[test]
+    fn parse_path_then_modifier_parses_clean() {
+        // A modifier after the Path body still applies (cursor left clean).
+        let doc = parse(r#"Path { p in p.move(to: CGPoint(x: 0, y: 0)) }.fill(.red)"#).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Path");
+        assert_eq!(node.props.get("background"), Some(&Value::Color(0xFF00_00FF)));
+    }
+
+    #[test]
+    fn parse_canvas_lowers_to_canvas() {
+        let src = r#"Canvas { context, size in
+            context.fill(Path(CGRect(x: 0, y: 0, width: 10, height: 10)), with: .color(.red))
+        }"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Canvas");
+    }
+
+    #[test]
+    fn parse_canvas_then_modifier_parses_clean() {
+        let doc = parse(r#"Canvas { ctx, size in draw(ctx) }.frame(width: 100, height: 100)"#)
+            .unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.kind, "Canvas");
+        assert_eq!(node.props.get("width"), Some(&Value::Px(100.0)));
+        assert_eq!(node.props.get("height"), Some(&Value::Px(100.0)));
+    }
+
+    // ── DRW: gradients → gradient fill props ──────────────────────────────────
+
+    #[test]
+    fn parse_linear_gradient_fill() {
+        let src = r#"Rectangle().fill(LinearGradient(colors: [.red, .blue], startPoint: .top, endPoint: .bottom))"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        // fill maps onto the `background` prop family.
+        assert_eq!(
+            node.props.get("background"),
+            Some(&Value::Text("gradient:linear".into()))
+        );
+        assert_eq!(
+            node.props.get("background_stops"),
+            Some(&Value::List(vec![
+                Value::Color(0xFF00_00FF),
+                Value::Color(0x0000_FFFF),
+            ]))
+        );
+        assert_eq!(
+            node.props.get("background_start"),
+            Some(&Value::Text("top".into()))
+        );
+        assert_eq!(
+            node.props.get("background_end"),
+            Some(&Value::Text("bottom".into()))
+        );
+    }
+
+    #[test]
+    fn parse_radial_gradient_background() {
+        let src = r#"Text("Hi").background(RadialGradient(colors: [.white, .black], center: .center, startRadius: 0, endRadius: 100))"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("background"),
+            Some(&Value::Text("gradient:radial".into()))
+        );
+        assert_eq!(
+            node.props.get("background_stops"),
+            Some(&Value::List(vec![
+                Value::Color(0xFFFF_FFFF),
+                Value::Color(0x0000_00FF),
+            ]))
+        );
+        // center lands as the `start` anchor.
+        assert_eq!(
+            node.props.get("background_start"),
+            Some(&Value::Text("center".into()))
+        );
+    }
+
+    #[test]
+    fn parse_linear_gradient_via_gradient_arg() {
+        // The `gradient: Gradient(colors:[…])` form is unwrapped to its stops.
+        let src = r#"Rectangle().fill(LinearGradient(gradient: Gradient(colors: [.red, .green]), startPoint: .leading, endPoint: .trailing))"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("background"),
+            Some(&Value::Text("gradient:linear".into()))
+        );
+        assert_eq!(
+            node.props.get("background_stops"),
+            Some(&Value::List(vec![
+                Value::Color(0xFF00_00FF),
+                Value::Color(0x00FF_00FF),
+            ]))
+        );
+        assert_eq!(
+            node.props.get("background_start"),
+            Some(&Value::Text("leading".into()))
+        );
+    }
+
+    #[test]
+    fn parse_gradient_foreground_style() {
+        // `.foregroundStyle(LinearGradient(...))` lowers onto the `color` family.
+        let src = r#"Text("Hi").foregroundStyle(LinearGradient(colors: [.red, .blue], startPoint: .top, endPoint: .bottom))"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("color"),
+            Some(&Value::Text("gradient:linear".into()))
+        );
+        assert_eq!(
+            node.props.get("color_stops"),
+            Some(&Value::List(vec![
+                Value::Color(0xFF00_00FF),
+                Value::Color(0x0000_FFFF),
+            ]))
+        );
+    }
+
+    #[test]
+    fn gradient_does_not_pollute_unsupported() {
+        let report = parse_with_report(
+            r#"Rectangle().fill(LinearGradient(colors: [.red, .blue], startPoint: .top, endPoint: .bottom))"#,
+        )
+        .unwrap();
+        assert!(
+            report.unsupported.is_empty(),
+            "gradient fill should lower, not report: {:?}",
+            report.unsupported
+        );
+    }
+
+    // ── DRW: Text as LocalizedStringKey ───────────────────────────────────────
+
+    #[test]
+    fn parse_text_is_localizable_with_key() {
+        let doc = parse(r#"Text("greeting.hello")"#).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(node.props.get("localizable"), Some(&Value::Bool(true)));
+        assert_eq!(
+            node.props.get("l10n_key"),
+            Some(&Value::Text("greeting.hello".into()))
+        );
+        // The displayed content is still present.
+        assert_eq!(
+            node.props.get("content"),
+            Some(&Value::Text("greeting.hello".into()))
+        );
+    }
+
+    #[test]
+    fn non_text_label_is_not_localizable() {
+        // A Button label is not a LocalizedStringKey in our vocabulary here.
+        let doc = parse(r#"Button("Tap") { }"#).unwrap();
+        let node = root_node(&doc);
+        assert!(!node.props.contains_key("localizable"));
+        assert!(!node.props.contains_key("l10n_key"));
+    }
+
+    // ── DRW: dynamicTypeSize → type_scale ─────────────────────────────────────
+
+    #[test]
+    fn parse_dynamic_type_size_single() {
+        let v = root_prop(r#"Text("Hi").dynamicTypeSize(.large)"#, "type_scale");
+        assert_eq!(v, Some(Value::Text("large".into())));
+    }
+
+    #[test]
+    fn parse_dynamic_type_size_range_clamp() {
+        let doc = parse(r#"Text("Hi").dynamicTypeSize(.xSmall ... .accessibility1)"#).unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("type_scale_min"),
+            Some(&Value::Text("xSmall".into()))
+        );
+        assert_eq!(
+            node.props.get("type_scale_max"),
+            Some(&Value::Text("accessibility1".into()))
+        );
+        // The single-value form prop is not set for a range.
+        assert!(!node.props.contains_key("type_scale"));
+    }
+
+    #[test]
+    fn dynamic_type_size_not_reported_unsupported() {
+        let report = parse_with_report(r#"Text("Hi").dynamicTypeSize(.large)"#).unwrap();
+        assert!(
+            report.unsupported.is_empty(),
+            "dynamicTypeSize should lower, not report: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn unknown_drawing_like_modifier_still_reported() {
+        // A genuinely-unknown shape/drawing modifier is still surfaced.
+        let report = parse_with_report(r#"Circle().strokeBorder(.red, lineWidth: 2)"#).unwrap();
+        assert!(report
+            .unsupported
+            .iter()
+            .any(|u| u.text == "modifier .strokeBorder"));
     }
 }

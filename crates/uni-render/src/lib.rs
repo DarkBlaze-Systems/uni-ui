@@ -33,7 +33,7 @@ pub use color::Rgba;
 mod blur;
 
 mod scene;
-pub use scene::{DrawCmd, Scene};
+pub use scene::{DrawCmd, Fill, PathOp, Scene, Shape};
 
 mod renderer;
 pub use renderer::{RenderError, Renderer};

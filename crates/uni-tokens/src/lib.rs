@@ -311,6 +311,108 @@ impl Type {
     pub fn scaled(&self, size: f32) -> f32 {
         size * self.font_scale
     }
+
+    /// Set `font_scale` from a [`DynamicTypeSize`] preference.
+    ///
+    /// Mirrors SwiftUI's Dynamic Type: the user picks a named size and the
+    /// whole type ramp scales uniformly. Equivalent to assigning
+    /// `font_scale = size.scale_factor()`.
+    pub fn with_type_size(mut self, size: DynamicTypeSize) -> Self {
+        self.font_scale = size.scale_factor();
+        self
+    }
+}
+
+// =============================================================================
+// DynamicTypeSize
+// =============================================================================
+
+/// A user-selectable Dynamic-Type size, mirroring SwiftUI's `DynamicTypeSize`.
+///
+/// Seven standard content sizes (`XSmall`..=`XXXLarge`) plus five
+/// accessibility sizes (`Accessibility1`..=`Accessibility5`). The standard
+/// default — matching iOS — is [`DynamicTypeSize::Large`], whose
+/// [`scale_factor`](DynamicTypeSize::scale_factor) is exactly `1.0`. Larger
+/// sizes scale up; the accessibility band scales up steeply for low-vision
+/// users. Every step is strictly larger than the one before it.
+///
+/// Feed [`scale_factor`](DynamicTypeSize::scale_factor) into a [`Type`]'s
+/// `font_scale` (see [`Type::with_type_size`]) so the entire type ramp grows
+/// uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DynamicTypeSize {
+    /// Extra-small content size.
+    XSmall,
+    /// Small content size.
+    Small,
+    /// Medium content size.
+    Medium,
+    /// Large content size — the default; `scale_factor() == 1.0`.
+    #[default]
+    Large,
+    /// Extra-large content size.
+    XLarge,
+    /// Double extra-large content size.
+    XXLarge,
+    /// Triple extra-large content size.
+    XXXLarge,
+    /// Accessibility size 1.
+    Accessibility1,
+    /// Accessibility size 2.
+    Accessibility2,
+    /// Accessibility size 3.
+    Accessibility3,
+    /// Accessibility size 4.
+    Accessibility4,
+    /// Accessibility size 5 — the largest.
+    Accessibility5,
+}
+
+impl DynamicTypeSize {
+    /// All sizes, in ascending order (smallest to largest).
+    pub const ALL: [DynamicTypeSize; 12] = [
+        DynamicTypeSize::XSmall,
+        DynamicTypeSize::Small,
+        DynamicTypeSize::Medium,
+        DynamicTypeSize::Large,
+        DynamicTypeSize::XLarge,
+        DynamicTypeSize::XXLarge,
+        DynamicTypeSize::XXXLarge,
+        DynamicTypeSize::Accessibility1,
+        DynamicTypeSize::Accessibility2,
+        DynamicTypeSize::Accessibility3,
+        DynamicTypeSize::Accessibility4,
+        DynamicTypeSize::Accessibility5,
+    ];
+
+    /// The multiplier this size applies to base type sizes.
+    ///
+    /// `Large` (the default) is exactly `1.0`. Smaller sizes shrink below it,
+    /// larger sizes grow above it, and the accessibility band grows steeply.
+    /// The values are strictly monotonically increasing across [`ALL`].
+    ///
+    /// [`ALL`]: DynamicTypeSize::ALL
+    pub fn scale_factor(self) -> f32 {
+        match self {
+            DynamicTypeSize::XSmall => 0.82,
+            DynamicTypeSize::Small => 0.88,
+            DynamicTypeSize::Medium => 0.94,
+            DynamicTypeSize::Large => 1.0,
+            DynamicTypeSize::XLarge => 1.12,
+            DynamicTypeSize::XXLarge => 1.24,
+            DynamicTypeSize::XXXLarge => 1.36,
+            DynamicTypeSize::Accessibility1 => 1.6,
+            DynamicTypeSize::Accessibility2 => 1.9,
+            DynamicTypeSize::Accessibility3 => 2.35,
+            DynamicTypeSize::Accessibility4 => 2.75,
+            DynamicTypeSize::Accessibility5 => 3.1,
+        }
+    }
+
+    /// Whether this size is in the accessibility band (`Accessibility1`..=`5`).
+    pub fn is_accessibility(self) -> bool {
+        self as u8 >= DynamicTypeSize::Accessibility1 as u8
+    }
 }
 
 // =============================================================================
@@ -440,6 +542,86 @@ impl Default for Shape {
             large: 16.0,
             full: 9999.0,
         }
+    }
+}
+
+// =============================================================================
+// LocalizationTable
+// =============================================================================
+
+use std::collections::HashMap;
+
+/// A string table mapping `(locale, key)` to a localized value, with
+/// **key-as-fallback** lookup — the same contract as SwiftUI's
+/// `LocalizedStringKey`.
+///
+/// When a key is missing for the current locale, [`get`](LocalizationTable::get)
+/// returns the *key itself*. This means an un-localized build still renders
+/// readable (if untranslated) text, and adding a translation never requires
+/// touching call sites — exactly how `Text("Some key")` degrades in SwiftUI.
+///
+/// Locales are plain `String`s (e.g. `"en"`, `"fr"`, `"en-GB"`); matching is
+/// exact. A [`current`](LocalizationTable::current_locale) locale is carried so call
+/// sites can do a one-argument [`localized`](LocalizationTable::localized)
+/// lookup without repeating the locale everywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalizationTable {
+    /// `locale -> (key -> value)`.
+    entries: HashMap<String, HashMap<String, String>>,
+    /// The locale [`localized`](LocalizationTable::localized) reads from.
+    current: String,
+}
+
+impl LocalizationTable {
+    /// A new, empty table whose current locale is `current`.
+    pub fn new(current: impl Into<String>) -> Self {
+        LocalizationTable {
+            entries: HashMap::new(),
+            current: current.into(),
+        }
+    }
+
+    /// Insert (or overwrite) a `key -> value` mapping for `locale`.
+    ///
+    /// Returns `self` for fluent table construction.
+    pub fn insert(
+        mut self,
+        locale: impl Into<String>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.entries
+            .entry(locale.into())
+            .or_default()
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// The current locale all [`localized`](LocalizationTable::localized)
+    /// lookups read from.
+    pub fn current_locale(&self) -> &str {
+        &self.current
+    }
+
+    /// Switch the current locale used by [`localized`](LocalizationTable::localized).
+    pub fn set_current_locale(&mut self, locale: impl Into<String>) {
+        self.current = locale.into();
+    }
+
+    /// Look up `key` in `locale`, falling back to **the key itself** when no
+    /// translation exists — the `LocalizedStringKey` contract.
+    pub fn get(&self, locale: &str, key: &str) -> String {
+        self.entries
+            .get(locale)
+            .and_then(|m| m.get(key))
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    /// Look up `key` in the [current locale](LocalizationTable::current_locale),
+    /// falling back to the key itself when missing.
+    pub fn localized(&self, key: &str) -> String {
+        self.get(&self.current, key)
     }
 }
 
@@ -610,5 +792,97 @@ mod tests {
             lr > 150 && lg > 150,
             "lime should be yellow-green, not emerald"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // LocalizationTable
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn localization_lookup_hits_translation() {
+        let table = LocalizationTable::new("en")
+            .insert("en", "greeting", "Hello")
+            .insert("fr", "greeting", "Bonjour");
+
+        assert_eq!(table.get("en", "greeting"), "Hello");
+        assert_eq!(table.get("fr", "greeting"), "Bonjour");
+    }
+
+    #[test]
+    fn localization_falls_back_to_key_when_missing() {
+        let table = LocalizationTable::new("en").insert("en", "greeting", "Hello");
+
+        // Missing key in a known locale -> the key itself.
+        assert_eq!(table.get("en", "farewell"), "farewell");
+        // Entirely unknown locale -> the key itself, too.
+        assert_eq!(table.get("de", "greeting"), "greeting");
+    }
+
+    #[test]
+    fn localization_uses_current_locale() {
+        let mut table = LocalizationTable::new("en")
+            .insert("en", "greeting", "Hello")
+            .insert("fr", "greeting", "Bonjour");
+
+        assert_eq!(table.current_locale(), "en");
+        assert_eq!(table.localized("greeting"), "Hello");
+
+        table.set_current_locale("fr");
+        assert_eq!(table.current_locale(), "fr");
+        assert_eq!(table.localized("greeting"), "Bonjour");
+
+        // Current-locale lookup still falls back to the key when missing.
+        assert_eq!(table.localized("missing"), "missing");
+    }
+
+    // -------------------------------------------------------------------------
+    // DynamicTypeSize
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn dynamic_type_large_is_identity() {
+        assert_eq!(DynamicTypeSize::default(), DynamicTypeSize::Large);
+        assert_eq!(DynamicTypeSize::Large.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn dynamic_type_scale_factors_are_strictly_monotonic() {
+        let factors: Vec<f32> = DynamicTypeSize::ALL
+            .iter()
+            .map(|s| s.scale_factor())
+            .collect();
+        for pair in factors.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "scale factors must strictly increase: {} !< {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Sub-default sizes shrink; super-default sizes grow.
+        assert!(DynamicTypeSize::XSmall.scale_factor() < 1.0);
+        assert!(DynamicTypeSize::XLarge.scale_factor() > 1.0);
+        // Accessibility band scales up steeply.
+        assert!(DynamicTypeSize::Accessibility5.scale_factor() > 2.0);
+    }
+
+    #[test]
+    fn dynamic_type_accessibility_flag() {
+        assert!(!DynamicTypeSize::Large.is_accessibility());
+        assert!(!DynamicTypeSize::XXXLarge.is_accessibility());
+        assert!(DynamicTypeSize::Accessibility1.is_accessibility());
+        assert!(DynamicTypeSize::Accessibility5.is_accessibility());
+    }
+
+    #[test]
+    fn dynamic_type_drives_type_font_scale() {
+        // Layout's `type_scale` (font_scale) can be set from a DynamicTypeSize.
+        let ty = Type::default().with_type_size(DynamicTypeSize::Large);
+        assert_eq!(ty.font_scale, 1.0);
+
+        let big = Type::default().with_type_size(DynamicTypeSize::Accessibility3);
+        assert_eq!(big.font_scale, DynamicTypeSize::Accessibility3.scale_factor());
+        // Effective sizes follow the chosen Dynamic-Type size.
+        assert_eq!(big.scaled(10.0), 10.0 * big.font_scale);
     }
 }

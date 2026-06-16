@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use taffy::prelude::*;
 
 use uni_ir::{Document, Node, NodeId, Value};
-use uni_render::{DrawCmd, Scene};
+use uni_render::{DrawCmd, Fill, PathOp, Scene, Shape};
 
 // ---------------------------------------------------------------------------
 // Prop readers
@@ -104,6 +104,258 @@ fn scale_alpha(color: u32, factor: f32) -> u32 {
     let a = (color & 0xff) as f32;
     let scaled = (a * factor).round().clamp(0.0, 255.0) as u32;
     (color & 0xffffff00) | scaled
+}
+
+/// Read a plain `Float`/`Int` (no clamping) — used for unbounded scalars like
+/// `type_scale`. Falls back to `None` if absent or the wrong type.
+fn float_of(node: &Node, key: &str) -> Option<f32> {
+    match node.props.get(key) {
+        Some(Value::Float(v)) => Some(*v as f32),
+        Some(Value::Int(v)) => Some(*v as f32),
+        Some(Value::Px(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Map a SwiftUI shape `kind` to a [`Shape`] outline. `RoundedRectangle` reads
+/// its corner radius from `corner_radius`/`cornerRadius`/`radius` (default 0,
+/// i.e. a plain rect). Returns `None` for non-shape kinds.
+fn shape_of(node: &Node) -> Option<Shape> {
+    match node.kind.as_str() {
+        "Circle" => Some(Shape::Circle),
+        "Ellipse" => Some(Shape::Ellipse),
+        "Capsule" => Some(Shape::Capsule),
+        "Rectangle" => Some(Shape::Rect),
+        "RoundedRectangle" => {
+            let radius = px_of(node, "corner_radius")
+                .or_else(|| px_of(node, "cornerRadius"))
+                .or_else(|| px_of(node, "radius"))
+                .unwrap_or(0.0);
+            Some(Shape::RoundedRect { radius })
+        }
+        _ => None,
+    }
+}
+
+/// Read gradient stops from a node. Accepts a `stops` prop as a `List` whose
+/// items pair offsets and colors, OR explicit `colors` (a `List` of `Color`)
+/// spread evenly 0..1. Returns `None` if no usable stops are found.
+fn stops_of(node: &Node, key: &str) -> Option<Vec<(f32, u32)>> {
+    match node.props.get(key) {
+        Some(Value::List(items)) => {
+            // Two encodings: a flat [off, color, off, color, ...] list, or a list
+            // of `Color` (evenly spaced). Detect by whether any Float/Int is present.
+            let has_offsets = items
+                .iter()
+                .any(|v| matches!(v, Value::Float(_) | Value::Int(_) | Value::Px(_)));
+            if has_offsets {
+                let mut stops = Vec::new();
+                let mut i = 0;
+                while i + 1 < items.len() {
+                    let off = match &items[i] {
+                        Value::Float(f) => *f as f32,
+                        Value::Int(n) => *n as f32,
+                        Value::Px(p) => *p,
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    if let Value::Color(c) = items[i + 1] {
+                        stops.push((off.clamp(0.0, 1.0), c));
+                    }
+                    i += 2;
+                }
+                if stops.is_empty() {
+                    None
+                } else {
+                    stops.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    Some(stops)
+                }
+            } else {
+                let colors: Vec<u32> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Color(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect();
+                if colors.is_empty() {
+                    return None;
+                }
+                let n = colors.len();
+                let stops = colors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let off = if n == 1 { 0.0 } else { i as f32 / (n - 1) as f32 };
+                        (off, c)
+                    })
+                    .collect();
+                Some(stops)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Read a 2-component unit point prop (`Value::List` of two numbers), default
+/// `(dx, dy)`.
+fn point_of(node: &Node, key: &str, default: (f32, f32)) -> (f32, f32) {
+    match node.props.get(key) {
+        Some(Value::List(items)) if items.len() >= 2 => {
+            let num = |v: &Value| match v {
+                Value::Float(f) => Some(*f as f32),
+                Value::Int(n) => Some(*n as f32),
+                Value::Px(p) => Some(*p),
+                _ => None,
+            };
+            match (num(&items[0]), num(&items[1])) {
+                (Some(a), Some(b)) => (a, b),
+                _ => default,
+            }
+        }
+        _ => default,
+    }
+}
+
+/// Resolve a node's fill: a gradient if `gradient` (or `fill_kind`) names one
+/// and stops are present, else the solid color (`color`/`background`/fallback).
+fn fill_of(node: &Node, solid_default: u32) -> Fill {
+    let kind = str_of(node, "gradient").or_else(|| str_of(node, "fill_kind"));
+    if let Some(k) = kind {
+        if let Some(stops) = stops_of(node, "stops").or_else(|| stops_of(node, "colors")) {
+            match k {
+                "linear" | "Linear" | "LinearGradient" => {
+                    let start = point_of(node, "start", (0.0, 0.0));
+                    let end = point_of(node, "end", (0.0, 1.0));
+                    return Fill::Linear { start, end, stops };
+                }
+                "radial" | "Radial" | "RadialGradient" => {
+                    let center = point_of(node, "center", (0.5, 0.5));
+                    let start_radius = float_of(node, "start_radius").unwrap_or(0.0);
+                    let end_radius = float_of(node, "end_radius").unwrap_or(0.5);
+                    return Fill::Radial {
+                        center,
+                        start_radius,
+                        end_radius,
+                        stops,
+                    };
+                }
+                "angular" | "Angular" | "AngularGradient" | "conic" => {
+                    let center = point_of(node, "center", (0.5, 0.5));
+                    return Fill::Angular { center, stops };
+                }
+                _ => {}
+            }
+        }
+    }
+    let color = color_of(node, "color")
+        .or_else(|| color_of(node, "background"))
+        .unwrap_or(solid_default);
+    Fill::Solid(color)
+}
+
+/// Apply an opacity factor to a [`Fill`] by scaling each stop/solid alpha.
+fn scale_fill_alpha(fill: Fill, factor: f32) -> Fill {
+    if factor >= 1.0 {
+        return fill;
+    }
+    match fill {
+        Fill::Solid(c) => Fill::Solid(scale_alpha(c, factor)),
+        Fill::Linear { start, end, stops } => Fill::Linear {
+            start,
+            end,
+            stops: stops
+                .into_iter()
+                .map(|(o, c)| (o, scale_alpha(c, factor)))
+                .collect(),
+        },
+        Fill::Radial {
+            center,
+            start_radius,
+            end_radius,
+            stops,
+        } => Fill::Radial {
+            center,
+            start_radius,
+            end_radius,
+            stops: stops
+                .into_iter()
+                .map(|(o, c)| (o, scale_alpha(c, factor)))
+                .collect(),
+        },
+        Fill::Angular { center, stops } => Fill::Angular {
+            center,
+            stops: stops
+                .into_iter()
+                .map(|(o, c)| (o, scale_alpha(c, factor)))
+                .collect(),
+        },
+    }
+}
+
+/// Parse an SVG-ish path string into [`PathOp`]s, offset by `(ox, oy)` (the
+/// shape's laid-out origin) so frame-relative path data lands in the node's
+/// rect. Supported commands: `M x y`, `L x y`, `Q cx cy x y`, `Z`. Numbers may
+/// be separated by spaces or commas. Unknown tokens are skipped (best-effort).
+fn parse_path(data: &str, ox: f32, oy: f32) -> Vec<PathOp> {
+    let mut ops = Vec::new();
+    let toks: Vec<&str> = data
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut i = 0;
+    // Consume the next token as a number, stopping if it's a command letter.
+    let getf = |toks: &[&str], i: &mut usize| -> Option<f32> {
+        if *i < toks.len() {
+            if let Ok(v) = toks[*i].parse::<f32>() {
+                *i += 1;
+                return Some(v);
+            }
+        }
+        None
+    };
+    while i < toks.len() {
+        let cmd = toks[i];
+        i += 1;
+        match cmd {
+            "M" | "m" => {
+                if let (Some(x), Some(y)) = (getf(&toks, &mut i), getf(&toks, &mut i)) {
+                    ops.push(PathOp::MoveTo {
+                        x: ox + x,
+                        y: oy + y,
+                    });
+                }
+            }
+            "L" | "l" => {
+                if let (Some(x), Some(y)) = (getf(&toks, &mut i), getf(&toks, &mut i)) {
+                    ops.push(PathOp::LineTo {
+                        x: ox + x,
+                        y: oy + y,
+                    });
+                }
+            }
+            "Q" | "q" => {
+                if let (Some(cx), Some(cy), Some(x), Some(y)) = (
+                    getf(&toks, &mut i),
+                    getf(&toks, &mut i),
+                    getf(&toks, &mut i),
+                    getf(&toks, &mut i),
+                ) {
+                    ops.push(PathOp::QuadTo {
+                        cx: ox + cx,
+                        cy: oy + cy,
+                        x: ox + x,
+                        y: oy + y,
+                    });
+                }
+            }
+            "Z" | "z" => ops.push(PathOp::Close),
+            _ => {}
+        }
+    }
+    ops
 }
 
 /// Is this a flex/grid container kind (as opposed to a drawing leaf)?
@@ -228,14 +480,32 @@ impl TextMeasurer for CosmicTextMeasurer {
 }
 
 /// Intrinsic size of a `Text` leaf, via `measurer`. Non-`Text` leaves are zero.
-fn text_intrinsic_size(node: &Node, measurer: &dyn TextMeasurer) -> Size<f32> {
+fn text_intrinsic_size(
+    node: &Node,
+    measurer: &dyn TextMeasurer,
+    doc_type_scale: f32,
+) -> Size<f32> {
     let content = text_of(node, "content").unwrap_or_default();
-    let size = px_of(node, "size").unwrap_or(16.0);
+    let base = px_of(node, "size").unwrap_or(16.0);
+    // SwiftUI Dynamic Type: the node's own `type_scale` overrides the document
+    // default; both multiply the base font size for measurement *and* paint.
+    let scale = float_of(node, "type_scale").unwrap_or(doc_type_scale);
+    let size = base * scale.max(0.0);
     let (w, h) = measurer.measure(&content, size);
     Size {
         width: w,
         height: h,
     }
+}
+
+/// The document-wide Dynamic Type scale: the root node's `type_scale` prop
+/// (default `1.0`). A per-`Text` `type_scale` overrides this.
+fn doc_type_scale(doc: &Document) -> f32 {
+    doc.root()
+        .and_then(|r| doc.get(r))
+        .and_then(|n| float_of(n, "type_scale"))
+        .unwrap_or(1.0)
+        .max(0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +908,7 @@ pub fn layout_with_measure(
         height: AvailableSpace::Definite(viewport.1),
     };
 
+    let dts = doc_type_scale(doc);
     let compute = tree.compute_layout_with_measure(
         root_taffy,
         available,
@@ -653,7 +924,7 @@ pub fn layout_with_measure(
                 .and_then(|&mut ir_id| {
                     doc.get(ir_id)
                         .filter(|n| n.kind == "Text")
-                        .map(|n| text_intrinsic_size(n, measurer))
+                        .map(|n| text_intrinsic_size(n, measurer, dts))
                 })
                 .unwrap_or(Size::ZERO);
             Size {
@@ -885,6 +1156,7 @@ impl LayoutCache {
             width: AvailableSpace::Definite(viewport.0),
             height: AvailableSpace::Definite(viewport.1),
         };
+        let dts = doc_type_scale(doc);
         let res = self.tree.compute_layout_with_measure(
             root_taffy,
             available,
@@ -896,7 +1168,7 @@ impl LayoutCache {
                     .and_then(|&mut ir_id| {
                         doc.get(ir_id)
                             .filter(|n| n.kind == "Text")
-                            .map(|n| text_intrinsic_size(n, measurer))
+                            .map(|n| text_intrinsic_size(n, measurer, dts))
                     })
                     .unwrap_or(Size::ZERO);
                 Size {
@@ -1095,6 +1367,129 @@ fn paint_presentation_surface(node: &Node, rect: ComputedRect, vw: f32, vh: f32,
     ));
 }
 
+/// Paint a `Canvas` node's imperative draw list straight into `scene`.
+///
+/// SwiftUI's `Canvas { ctx, size in ... }` is an immediate-mode drawing surface.
+/// We model it declaratively: the node carries a `commands` prop — a
+/// `Value::List` of per-command sub-lists, each `[opcode, args...]`:
+///
+/// * `["rect", x, y, w, h, color]` / `["rrect", x, y, w, h, radius, color]`
+/// * `["circle", x, y, w, h, color]` / `["ellipse", …]` / `["capsule", …]`
+/// * `["text", x, y, size, color, "content"]`
+/// * `["path", color, "M x y L x y Z"]`  (filled with `color`)
+///
+/// Coordinates are relative to the Canvas's laid-out origin. Opcodes/args that
+/// don't parse are skipped (best-effort, never panics).
+fn paint_canvas(
+    doc: &Document,
+    node: &Node,
+    rect: ComputedRect,
+    opacity: f32,
+    dts: f32,
+    scene: &mut Scene,
+) {
+    let _ = (doc, dts); // reserved for child-node Canvas content in a later rung.
+    let Some(Value::List(cmds)) = node.props.get("commands") else {
+        return;
+    };
+    // Helpers to pull typed fields out of a command's argument list.
+    let num = |v: &Value| -> Option<f32> {
+        match v {
+            Value::Float(f) => Some(*f as f32),
+            Value::Int(n) => Some(*n as f32),
+            Value::Px(p) => Some(*p),
+            _ => None,
+        }
+    };
+    let col = |v: &Value| -> Option<u32> {
+        match v {
+            Value::Color(c) => Some(*c),
+            _ => None,
+        }
+    };
+    for cmd in cmds {
+        let Value::List(parts) = cmd else { continue };
+        let Some(Value::Text(op)) = parts.first() else {
+            continue;
+        };
+        let a = &parts[1..];
+        match op.as_str() {
+            "rect" | "rrect" | "circle" | "ellipse" | "capsule" => {
+                // rect/shape share x,y,w,h then (radius for rrect) then color.
+                if a.len() < 5 {
+                    continue;
+                }
+                let (x, y, w, h) = match (num(&a[0]), num(&a[1]), num(&a[2]), num(&a[3])) {
+                    (Some(x), Some(y), Some(w), Some(h)) => (x, y, w, h),
+                    _ => continue,
+                };
+                let (shape, color) = if op == "rrect" {
+                    if a.len() < 6 {
+                        continue;
+                    }
+                    let radius = num(&a[4]).unwrap_or(0.0);
+                    (Shape::RoundedRect { radius }, col(&a[5]))
+                } else {
+                    let shape = match op.as_str() {
+                        "circle" => Shape::Circle,
+                        "ellipse" => Shape::Ellipse,
+                        "capsule" => Shape::Capsule,
+                        _ => Shape::Rect,
+                    };
+                    (shape, col(&a[4]))
+                };
+                let Some(color) = color else { continue };
+                scene.push(DrawCmd::filled_shape(
+                    rect.x + x,
+                    rect.y + y,
+                    w,
+                    h,
+                    shape,
+                    Fill::Solid(scale_alpha(color, opacity)),
+                ));
+            }
+            "text" => {
+                // ["text", x, y, size, color, "content"]
+                if a.len() < 5 {
+                    continue;
+                }
+                let (x, y, size) = match (num(&a[0]), num(&a[1]), num(&a[2])) {
+                    (Some(x), Some(y), Some(s)) => (x, y, s),
+                    _ => continue,
+                };
+                let Some(color) = col(&a[3]) else { continue };
+                let Value::Text(content) = &a[4] else {
+                    continue;
+                };
+                scene.push(DrawCmd::Text {
+                    x: rect.x + x,
+                    y: rect.y + y,
+                    content: content.clone(),
+                    size,
+                    color: scale_alpha(color, opacity),
+                });
+            }
+            "path" => {
+                // ["path", color, "M x y L x y Z"]
+                if a.len() < 2 {
+                    continue;
+                }
+                let Some(color) = col(&a[0]) else { continue };
+                let Value::Text(data) = &a[1] else { continue };
+                let ops = parse_path(data, rect.x, rect.y);
+                if !ops.is_empty() {
+                    scene.push(DrawCmd::Path {
+                        ops,
+                        fill: Some(Fill::Solid(scale_alpha(color, opacity))),
+                        stroke: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SwiftUI paint-time transforms: offset / scaleEffect / rotationEffect
 // ---------------------------------------------------------------------------
@@ -1219,6 +1614,8 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
     let mut scene: Scene = Vec::new();
     let (vw, vh) = layout.viewport;
     let root = doc.root();
+    // Document-wide Dynamic Type scale (per-Text `type_scale` overrides it).
+    let dts = doc_type_scale(doc);
 
     // Nodes suppressed by a `hidden` ancestor (the whole subtree is skipped).
     let mut hidden_subtree: std::collections::HashSet<NodeId> =
@@ -1453,15 +1850,73 @@ pub fn paint(doc: &Document, layout: &Layout) -> Scene {
             }
             "Text" => {
                 let content = text_of(node, "content").unwrap_or_default();
-                let size = px_of(node, "size").unwrap_or(16.0);
+                let base = px_of(node, "size").unwrap_or(16.0);
+                // Dynamic Type: node `type_scale` overrides the document default,
+                // multiplying the painted font size to match the measured size.
+                let scale = float_of(node, "type_scale").unwrap_or(dts).max(0.0);
                 let color = color_of(node, "color").unwrap_or(0xffffffff);
                 scene.push(DrawCmd::Text {
                     x: rect.x,
                     y: rect.y,
                     content,
-                    size,
+                    size: base * scale,
                     color: scale_alpha(color, opacity),
                 });
+            }
+            "Circle" | "Ellipse" | "Capsule" | "Rectangle" | "RoundedRectangle" => {
+                // SwiftUI primitive shapes: fill the frame with a solid color or
+                // gradient (LinearGradient/RadialGradient/AngularGradient).
+                let shape = shape_of(node).unwrap_or(Shape::Rect);
+                let fill = scale_fill_alpha(fill_of(node, 0xffffffff), opacity);
+                scene.push(DrawCmd::FilledShape {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    shape,
+                    fill,
+                    rotation: node_rot,
+                });
+            }
+            "Path" => {
+                // A vector path. Ops come from a `path` string (SVG-ish M/L/Q/Z),
+                // resolved relative to the node's laid-out origin. `fill` (a solid
+                // color or gradient) and/or `stroke` (color + `stroke_width`).
+                let data = str_of(node, "path")
+                    .or_else(|| str_of(node, "d"))
+                    .unwrap_or("");
+                let ops = parse_path(data, rect.x, rect.y);
+                if !ops.is_empty() {
+                    let has_fill = node.props.contains_key("color")
+                        || node.props.contains_key("background")
+                        || str_of(node, "gradient").is_some()
+                        || str_of(node, "fill_kind").is_some();
+                    let fill = if has_fill {
+                        Some(scale_fill_alpha(fill_of(node, 0xffffffff), opacity))
+                    } else {
+                        None
+                    };
+                    let stroke = color_of(node, "stroke").map(|c| {
+                        let w = px_of(node, "stroke_width")
+                            .or_else(|| px_of(node, "line_width"))
+                            .unwrap_or(1.0);
+                        (scale_alpha(c, opacity), w)
+                    });
+                    // Default to a fill if neither was specified (a bare path).
+                    let (fill, stroke) = if fill.is_none() && stroke.is_none() {
+                        (Some(Fill::Solid(scale_alpha(0xffffffff, opacity))), None)
+                    } else {
+                        (fill, stroke)
+                    };
+                    scene.push(DrawCmd::Path { ops, fill, stroke });
+                }
+            }
+            "Canvas" => {
+                // An imperative draw list: child draw nodes emitted straight into
+                // the scene, positioned relative to the Canvas origin. Each child
+                // is a `Rect`/`RoundedRectangle`/shape/`Path`/`Text` spec read from
+                // its props (the Canvas's `commands` List, or its child nodes).
+                paint_canvas(doc, node, rect, opacity, dts, &mut scene);
             }
             _ => {}
         }
@@ -2791,5 +3246,285 @@ mod tests {
         let (x_base, ..) = find_rect(&lower(&doc, vp), color).expect("child painted");
 
         assert_eq!(x_off, x_base + 25.0, "child inherits parent's offset");
+    }
+
+    // -----------------------------------------------------------------------
+    // SwiftUI shapes / gradients / paths / canvas / dynamic type
+    // -----------------------------------------------------------------------
+
+    /// Build a single-shape document and return its emitted `FilledShape`.
+    fn paint_shape_node(kind: &str, w: f32, h: f32, set: impl FnOnce(&mut Document, NodeId)) -> DrawCmd {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let s = node(&mut doc, kind);
+        prop(&mut doc, s, "width", Value::Px(w));
+        prop(&mut doc, s, "height", Value::Px(h));
+        set(&mut doc, s);
+        child(&mut doc, root, s);
+        let scene = lower(&doc, (200.0, 200.0));
+        scene
+            .into_iter()
+            .find(|c| matches!(c, DrawCmd::FilledShape { .. }))
+            .expect("a FilledShape was painted")
+    }
+
+    #[test]
+    fn circle_lowers_to_filled_circle_shape() {
+        let cmd = paint_shape_node("Circle", 40.0, 40.0, |doc, id| {
+            prop(doc, id, "color", Value::Color(0x00ff00ff));
+        });
+        match cmd {
+            DrawCmd::FilledShape { shape, fill, w, h, .. } => {
+                assert_eq!(shape, Shape::Circle);
+                assert_eq!(fill, Fill::Solid(0x00ff00ff));
+                assert_eq!((w, h), (40.0, 40.0), "honors the frame");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn capsule_and_rounded_rect_lower_to_their_shapes() {
+        let cap = paint_shape_node("Capsule", 80.0, 30.0, |_, _| {});
+        assert!(matches!(cap, DrawCmd::FilledShape { shape: Shape::Capsule, .. }));
+
+        let rr = paint_shape_node("RoundedRectangle", 60.0, 60.0, |doc, id| {
+            prop(doc, id, "corner_radius", Value::Px(12.0));
+        });
+        match rr {
+            DrawCmd::FilledShape { shape: Shape::RoundedRect { radius }, .. } => {
+                assert_eq!(radius, 12.0);
+            }
+            _ => panic!("expected a RoundedRect shape, got {rr:?}"),
+        }
+    }
+
+    #[test]
+    fn rectangle_and_ellipse_lower_to_their_shapes() {
+        assert!(matches!(
+            paint_shape_node("Rectangle", 50.0, 20.0, |_, _| {}),
+            DrawCmd::FilledShape { shape: Shape::Rect, .. }
+        ));
+        assert!(matches!(
+            paint_shape_node("Ellipse", 50.0, 20.0, |_, _| {}),
+            DrawCmd::FilledShape { shape: Shape::Ellipse, .. }
+        ));
+    }
+
+    #[test]
+    fn linear_gradient_fill_on_shape() {
+        let cmd = paint_shape_node("Rectangle", 100.0, 20.0, |doc, id| {
+            prop(doc, id, "gradient", Value::Text("linear".into()));
+            prop(doc, id, "start", Value::List(vec![Value::Float(0.0), Value::Float(0.0)]));
+            prop(doc, id, "end", Value::List(vec![Value::Float(1.0), Value::Float(0.0)]));
+            prop(
+                doc,
+                id,
+                "stops",
+                Value::List(vec![
+                    Value::Float(0.0),
+                    Value::Color(0xff0000ff),
+                    Value::Float(1.0),
+                    Value::Color(0x0000ffff),
+                ]),
+            );
+        });
+        match cmd {
+            DrawCmd::FilledShape { fill: Fill::Linear { start, end, stops }, .. } => {
+                assert_eq!(start, (0.0, 0.0));
+                assert_eq!(end, (1.0, 0.0));
+                assert_eq!(stops, vec![(0.0, 0xff0000ff), (1.0, 0x0000ffff)]);
+            }
+            _ => panic!("expected a LinearGradient fill, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn radial_gradient_fill_on_shape() {
+        let cmd = paint_shape_node("Circle", 60.0, 60.0, |doc, id| {
+            prop(doc, id, "gradient", Value::Text("radial".into()));
+            prop(
+                doc,
+                id,
+                "colors",
+                Value::List(vec![Value::Color(0xffffffff), Value::Color(0x000000ff)]),
+            );
+        });
+        match cmd {
+            DrawCmd::FilledShape { fill: Fill::Radial { stops, .. }, .. } => {
+                // Two colors spread evenly -> offsets 0.0 and 1.0.
+                assert_eq!(stops, vec![(0.0, 0xffffffff), (1.0, 0x000000ff)]);
+            }
+            _ => panic!("expected a RadialGradient fill, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn path_node_lowers_to_path_cmd() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let p = node(&mut doc, "Path");
+        prop(&mut doc, p, "width", Value::Px(40.0));
+        prop(&mut doc, p, "height", Value::Px(40.0));
+        prop(&mut doc, p, "path", Value::Text("M 0 0 L 40 0 L 20 40 Z".into()));
+        prop(&mut doc, p, "color", Value::Color(0x00ff00ff));
+        child(&mut doc, root, p);
+
+        let scene = lower(&doc, (200.0, 200.0));
+        let cmd = scene
+            .iter()
+            .find(|c| matches!(c, DrawCmd::Path { .. }))
+            .expect("a Path was painted");
+        match cmd {
+            DrawCmd::Path { ops, fill, stroke } => {
+                // M/L/L/Z -> 3 explicit ops + Close.
+                assert_eq!(ops.len(), 4, "M L L Z parsed");
+                assert!(matches!(ops[0], PathOp::MoveTo { .. }));
+                assert!(matches!(ops[3], PathOp::Close));
+                assert_eq!(*fill, Some(Fill::Solid(0x00ff00ff)));
+                assert!(stroke.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn path_stroke_only() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let p = node(&mut doc, "Path");
+        prop(&mut doc, p, "width", Value::Px(40.0));
+        prop(&mut doc, p, "height", Value::Px(40.0));
+        prop(&mut doc, p, "path", Value::Text("M 0 20 L 40 20".into()));
+        prop(&mut doc, p, "stroke", Value::Color(0xffffffff));
+        prop(&mut doc, p, "stroke_width", Value::Px(3.0));
+        child(&mut doc, root, p);
+
+        let scene = lower(&doc, (200.0, 200.0));
+        let cmd = scene.iter().find(|c| matches!(c, DrawCmd::Path { .. })).unwrap();
+        match cmd {
+            DrawCmd::Path { fill, stroke, .. } => {
+                assert!(fill.is_none(), "no fill requested");
+                assert_eq!(*stroke, Some((0xffffffff, 3.0)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn canvas_emits_imperative_draw_list() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let c = node(&mut doc, "Canvas");
+        prop(&mut doc, c, "width", Value::Px(100.0));
+        prop(&mut doc, c, "height", Value::Px(100.0));
+        prop(
+            &mut doc,
+            c,
+            "commands",
+            Value::List(vec![
+                Value::List(vec![
+                    Value::Text("rect".into()),
+                    Value::Px(0.0),
+                    Value::Px(0.0),
+                    Value::Px(10.0),
+                    Value::Px(10.0),
+                    Value::Color(0xff0000ff),
+                ]),
+                Value::List(vec![
+                    Value::Text("circle".into()),
+                    Value::Px(20.0),
+                    Value::Px(20.0),
+                    Value::Px(8.0),
+                    Value::Px(8.0),
+                    Value::Color(0x00ff00ff),
+                ]),
+                Value::List(vec![
+                    Value::Text("text".into()),
+                    Value::Px(5.0),
+                    Value::Px(50.0),
+                    Value::Px(14.0),
+                    Value::Color(0xffffffff),
+                    Value::Text("hi".into()),
+                ]),
+            ]),
+        );
+        child(&mut doc, root, c);
+
+        let scene = lower(&doc, (200.0, 200.0));
+        let shapes: Vec<_> = scene
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::FilledShape { .. }))
+            .collect();
+        assert_eq!(shapes.len(), 2, "rect + circle emitted as shapes");
+        assert!(
+            scene.iter().any(|c| matches!(c, DrawCmd::Text { content, .. } if content == "hi")),
+            "canvas text emitted"
+        );
+        // The circle command (x=20) lands at the canvas origin + 20.
+        assert!(scene.iter().any(
+            |c| matches!(c, DrawCmd::FilledShape { shape: Shape::Circle, fill: Fill::Solid(0x00ff00ff), .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_type_scales_text_size_in_paint() {
+        let mut doc = Document::new();
+        let root = node(&mut doc, "Stack");
+        set_root(&mut doc, root);
+        let t = node(&mut doc, "Text");
+        prop(&mut doc, t, "content", Value::Text("scale me".into()));
+        prop(&mut doc, t, "size", Value::Px(20.0));
+        child(&mut doc, root, t);
+
+        // Baseline: no scale -> painted size == base.
+        let base_size = text_size(&lower(&doc, (300.0, 300.0)), "scale me");
+        assert_eq!(base_size, 20.0);
+
+        // Document-level type_scale multiplies every Text.
+        prop(&mut doc, root, "type_scale", Value::Float(1.5));
+        let scaled = text_size(&lower(&doc, (300.0, 300.0)), "scale me");
+        assert_eq!(scaled, 30.0, "doc type_scale 1.5 -> 20*1.5");
+
+        // A per-node type_scale overrides the document default.
+        prop(&mut doc, t, "type_scale", Value::Float(2.0));
+        let overridden = text_size(&lower(&doc, (300.0, 300.0)), "scale me");
+        assert_eq!(overridden, 40.0, "node type_scale 2.0 wins -> 20*2.0");
+    }
+
+    #[test]
+    fn dynamic_type_scales_text_layout_size() {
+        // Larger type_scale makes the Text leaf measure bigger, so it occupies
+        // more layout height.
+        let build = |scale: f64| {
+            let mut doc = Document::new();
+            let root = node(&mut doc, "Stack");
+            set_root(&mut doc, root);
+            prop(&mut doc, root, "type_scale", Value::Float(scale));
+            let t = node(&mut doc, "Text");
+            prop(&mut doc, t, "content", Value::Text("measure".into()));
+            prop(&mut doc, t, "size", Value::Px(16.0));
+            child(&mut doc, root, t);
+            let lo = layout(&doc, (300.0, 300.0));
+            lo.rect(t).expect("text laid out").h
+        };
+        let small = build(1.0);
+        let large = build(2.0);
+        assert!(large > small, "type_scale grows the measured text box ({large} > {small})");
+    }
+
+    /// The painted font `size` of the first `Text` whose content matches.
+    fn text_size(scene: &Scene, want: &str) -> f32 {
+        scene
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text { content, size, .. } if content == want => Some(*size),
+                _ => None,
+            })
+            .expect("text painted")
     }
 }

@@ -16,7 +16,7 @@
 **Navigation:** NavigationStack ✅ · TabView ✅ · Sheet/Alert/Popover/Menu ✅
 **Animation:** spring core ✅ · timing/easing curves ✅ · implicit ✅ · explicit ✅ · transitions ✅ · matchedGeometry ⬜
 **Gestures:** tap ✅ · longPress ✅ · drag ✅ · magnify ✅ · rotation ✅ · combined(simultaneous/sequenced) ✅
-**Drawing/Text:** Path/Shape/Canvas/gradients ⬜ · dynamic type/localization/bidi 🟡
+**Drawing/Text:** Shape ✅ · Path ✅(+ quad bezier) · Canvas ✅ · gradients ✅(linear/radial; angular partial) · dynamic type ✅ · localization ✅ · bidi 🟡
 
 ## Milestones
 - **S1 — Essential views + modifier surface.** Image, Divider, Spacer, Toggle, Slider, ProgressView rendered; modifiers `opacity`/`hidden`/`shadow` honored in paint; matching `swiftui-import` coverage + differential tests; `uni-widgets` builders. ← ✅ **DONE** (258 tests / 0 fail, clippy+doc clean).
@@ -24,7 +24,7 @@
 - **S3 — Navigation + presentation.** NavigationStack, TabView, Sheet/Alert/Popover/Menu, overlay/background-view modifiers. ← ✅ **DONE** (313 tests / 0 fail, clippy+doc clean).
 - **S4 — Animation + transforms.** Implicit/explicit animation, transitions, offset/rotation/scale effects (on uni-spring). ← ✅ **DONE** (348 tests / 0 fail, clippy+doc clean; rotation full for rects, text axis-aligned in v0).
 - **S5 — Gestures.** tap/longPress/drag/magnify/rotation, combined, gesture state. ← ✅ **DONE** (379 tests / 0 fail, clippy+doc clean; magnify/rotation driven programmatically — headless has no multitouch).
-- **S6 — Drawing + text.** Path/Shape/Canvas/gradients; dynamic type, localization.
+- **S6 — Drawing + text.** Path/Shape/Canvas/gradients; dynamic type, localization. ← ✅ **DONE** (430 tests / 0 fail, clippy+doc clean; angular gradient partial, bidi later).
 - **S7 — Tooling + ergonomics.** Preview harness, inspector, hot-reload-ish; docs/examples.
 
 _Each milestone ships green (cargo test + clippy + doc) and updates this matrix. No "equivalent" claim without the matrix backing it._

@@ -34,7 +34,10 @@ use bytemuck::{Pod, Zeroable};
 use lyon::math::{Box2D, Point};
 use lyon::path::builder::BorderRadii;
 use lyon::path::Winding;
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
+use lyon::tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator,
+    StrokeVertex, VertexBuffers,
+};
 use wgpu::util::DeviceExt;
 
 use glyphon::{
@@ -45,7 +48,7 @@ use glyphon::{
 use crate::blur;
 use crate::color::Rgba;
 use crate::renderer::{RenderError, Renderer};
-use crate::scene::{DrawCmd, Scene};
+use crate::scene::{DrawCmd, Fill, PathOp, Scene, Shape};
 
 /// Downsample factor for the blur backdrop. Blurring at half resolution on each
 /// axis quarters the work and is invisible after a Gaussian — good for Intel
@@ -575,74 +578,267 @@ impl WgpuRenderer {
         })
     }
 
-    /// Tessellate the given `FilledRect` commands into one vertex/index buffer.
+    /// Tessellate the given draw commands (`FilledRect`, `FilledShape`, `Path`)
+    /// into one vertex/index buffer. `FrostedRect`/`Text` are handled elsewhere.
     fn tessellate_rects(&self, cmds: &[&DrawCmd]) -> (Vec<Vertex>, Vec<u32>) {
         let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
         let mut tessellator = FillTessellator::new();
+        let mut stroker = StrokeTessellator::new();
 
         for cmd in cmds {
-            if let DrawCmd::FilledRect {
-                x,
-                y,
-                w,
-                h,
-                color,
-                corner_radius,
-                rotation,
-            } = cmd
-            {
-                if *w <= 0.0 || *h <= 0.0 {
-                    continue;
-                }
-                let linear = Rgba::from_u32(*color).to_linear_array();
-                let radius = corner_radius.max(0.0).min(w.min(*h) / 2.0);
-
-                let mut builder = lyon::path::Path::builder();
-                let rect = Box2D::new(Point::new(*x, *y), Point::new(*x + *w, *y + *h));
-                if radius > 0.0 {
-                    builder.add_rounded_rectangle(
-                        &rect,
-                        &BorderRadii::new(radius),
-                        Winding::Positive,
+            match cmd {
+                DrawCmd::FilledRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    corner_radius,
+                    rotation,
+                } => {
+                    if *w <= 0.0 || *h <= 0.0 {
+                        continue;
+                    }
+                    let radius = corner_radius.max(0.0).min(w.min(*h) / 2.0);
+                    let shape = if radius > 0.0 {
+                        Shape::RoundedRect { radius }
+                    } else {
+                        Shape::Rect
+                    };
+                    self.tess_shape(
+                        &mut tessellator,
+                        &mut geometry,
+                        *x,
+                        *y,
+                        *w,
+                        *h,
+                        &shape,
+                        &Fill::Solid(*color),
+                        *rotation,
                     );
-                } else {
-                    builder.add_rectangle(&rect, Winding::Positive);
                 }
-                let path = builder.build();
-
-                // `rotationEffect`: rotate the emitted geometry clockwise by
-                // `rotation` degrees about the rect's own center. `0.0` leaves
-                // every vertex untouched (the identity), so un-rotated rects
-                // tessellate exactly as before.
-                let rotate = *rotation != 0.0;
-                let (sin, cos, cx, cy) = if rotate {
-                    let r = rotation.to_radians();
-                    (r.sin(), r.cos(), *x + *w * 0.5, *y + *h * 0.5)
-                } else {
-                    (0.0, 1.0, 0.0, 0.0)
-                };
-
-                tessellator
-                    .tessellate_path(
-                        &path,
-                        &FillOptions::tolerance(0.1),
-                        &mut BuffersBuilder::new(&mut geometry, move |v: FillVertex| {
-                            let [px, py] = v.position().to_array();
-                            let pos = if rotate {
-                                let dx = px - cx;
-                                let dy = py - cy;
-                                [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
-                            } else {
-                                [px, py]
-                            };
-                            Vertex { pos, color: linear }
-                        }),
-                    )
-                    .expect("lyon tessellation failed");
+                DrawCmd::FilledShape {
+                    x,
+                    y,
+                    w,
+                    h,
+                    shape,
+                    fill,
+                    rotation,
+                } => {
+                    if *w <= 0.0 || *h <= 0.0 {
+                        continue;
+                    }
+                    self.tess_shape(
+                        &mut tessellator,
+                        &mut geometry,
+                        *x,
+                        *y,
+                        *w,
+                        *h,
+                        shape,
+                        fill,
+                        *rotation,
+                    );
+                }
+                DrawCmd::Path { ops, fill, stroke } => {
+                    self.tess_path(
+                        &mut tessellator,
+                        &mut stroker,
+                        &mut geometry,
+                        ops,
+                        fill,
+                        stroke,
+                    );
+                }
+                _ => {}
             }
         }
 
         (geometry.vertices, geometry.indices)
+    }
+
+    /// Tessellate a single filled [`Shape`] into `geometry`, sampling `fill`
+    /// per vertex (gradients ramp by vertex color) and rotating about center.
+    #[allow(clippy::too_many_arguments)]
+    fn tess_shape(
+        &self,
+        tessellator: &mut FillTessellator,
+        geometry: &mut VertexBuffers<Vertex, u32>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        shape: &Shape,
+        fill: &Fill,
+        rotation: f32,
+    ) {
+        let mut builder = lyon::path::Path::builder();
+        let rect = Box2D::new(Point::new(x, y), Point::new(x + w, y + h));
+        let cx = x + w * 0.5;
+        let cy = y + h * 0.5;
+        match shape {
+            Shape::Rect => {
+                builder.add_rectangle(&rect, Winding::Positive);
+            }
+            Shape::RoundedRect { radius } => {
+                let r = radius.max(0.0).min(w.min(h) / 2.0);
+                if r > 0.0 {
+                    builder.add_rounded_rectangle(&rect, &BorderRadii::new(r), Winding::Positive);
+                } else {
+                    builder.add_rectangle(&rect, Winding::Positive);
+                }
+            }
+            Shape::Capsule => {
+                let r = w.min(h) / 2.0;
+                builder.add_rounded_rectangle(&rect, &BorderRadii::new(r), Winding::Positive);
+            }
+            Shape::Circle => {
+                let r = (w.min(h)) / 2.0;
+                builder.add_circle(Point::new(cx, cy), r, Winding::Positive);
+            }
+            Shape::Ellipse => {
+                builder.add_ellipse(
+                    Point::new(cx, cy),
+                    lyon::math::Vector::new(w * 0.5, h * 0.5),
+                    lyon::math::Angle::radians(0.0),
+                    Winding::Positive,
+                );
+            }
+        }
+        let path = builder.build();
+
+        let rotate = rotation != 0.0;
+        let (sin, cos) = if rotate {
+            let r = rotation.to_radians();
+            (r.sin(), r.cos())
+        } else {
+            (0.0, 1.0)
+        };
+        // Capture fill by clone for the per-vertex closure (sampled in frame UVs).
+        let fill = fill.clone();
+        tessellator
+            .tessellate_path(
+                &path,
+                &FillOptions::tolerance(0.1),
+                &mut BuffersBuilder::new(geometry, move |v: FillVertex| {
+                    let [px, py] = v.position().to_array();
+                    // Sample the fill in the shape's *unrotated* frame UVs so the
+                    // gradient rotates with the shape.
+                    let u = if w > 0.0 { (px - x) / w } else { 0.0 };
+                    let vv = if h > 0.0 { (py - y) / h } else { 0.0 };
+                    let color = Rgba::from_u32(fill.sample(u, vv)).to_linear_array();
+                    let pos = if rotate {
+                        let dx = px - cx;
+                        let dy = py - cy;
+                        [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
+                    } else {
+                        [px, py]
+                    };
+                    Vertex { pos, color }
+                }),
+            )
+            .expect("lyon tessellation failed");
+    }
+
+    /// Tessellate a [`DrawCmd::Path`] (fill then stroke) into `geometry`.
+    fn tess_path(
+        &self,
+        tessellator: &mut FillTessellator,
+        stroker: &mut StrokeTessellator,
+        geometry: &mut VertexBuffers<Vertex, u32>,
+        ops: &[PathOp],
+        fill: &Option<Fill>,
+        stroke: &Option<(u32, f32)>,
+    ) {
+        // Build a lyon path from the ops, tracking the frame bounds for gradient
+        // UVs.
+        let mut builder = lyon::path::Path::builder();
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut open = false;
+        let bump = |px: f32, py: f32, mnx: &mut f32, mny: &mut f32, mxx: &mut f32, mxy: &mut f32| {
+            *mnx = mnx.min(px);
+            *mny = mny.min(py);
+            *mxx = mxx.max(px);
+            *mxy = mxy.max(py);
+        };
+        for op in ops {
+            match *op {
+                PathOp::MoveTo { x, y } => {
+                    if open {
+                        builder.end(false);
+                    }
+                    builder.begin(Point::new(x, y));
+                    open = true;
+                    bump(x, y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                }
+                PathOp::LineTo { x, y } => {
+                    if open {
+                        builder.line_to(Point::new(x, y));
+                        bump(x, y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                    }
+                }
+                PathOp::QuadTo { cx, cy, x, y } => {
+                    if open {
+                        builder.quadratic_bezier_to(Point::new(cx, cy), Point::new(x, y));
+                        bump(x, y, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                        bump(cx, cy, &mut min_x, &mut min_y, &mut max_x, &mut max_y);
+                    }
+                }
+                PathOp::Close => {
+                    if open {
+                        builder.end(true);
+                        open = false;
+                    }
+                }
+            }
+        }
+        if open {
+            builder.end(false);
+        }
+        let path = builder.build();
+        let w = (max_x - min_x).max(f32::EPSILON);
+        let h = (max_y - min_y).max(f32::EPSILON);
+
+        if let Some(fill) = fill {
+            let fill = fill.clone();
+            tessellator
+                .tessellate_path(
+                    &path,
+                    &FillOptions::tolerance(0.1),
+                    &mut BuffersBuilder::new(geometry, move |v: FillVertex| {
+                        let [px, py] = v.position().to_array();
+                        let u = (px - min_x) / w;
+                        let vv = (py - min_y) / h;
+                        let color = Rgba::from_u32(fill.sample(u, vv)).to_linear_array();
+                        Vertex {
+                            pos: [px, py],
+                            color,
+                        }
+                    }),
+                )
+                .expect("lyon path fill failed");
+        }
+        if let Some((color, width)) = stroke {
+            let linear = Rgba::from_u32(*color).to_linear_array();
+            let opts = StrokeOptions::tolerance(0.1).with_line_width(width.max(0.1));
+            stroker
+                .tessellate_path(
+                    &path,
+                    &opts,
+                    &mut BuffersBuilder::new(geometry, move |v: StrokeVertex| {
+                        let [px, py] = v.position().to_array();
+                        Vertex {
+                            pos: [px, py],
+                            color: linear,
+                        }
+                    }),
+                )
+                .expect("lyon path stroke failed");
+        }
     }
 
     /// Bind a texture view as group(0) for the blur/blit/frost pipelines.
