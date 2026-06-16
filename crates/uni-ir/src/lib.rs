@@ -49,6 +49,30 @@ pub enum Value {
     Px(f32),
 }
 
+/// A named action invoked when an event fires on a node (rung 3: interaction).
+///
+/// An `Action` is *intent*, not execution: it names a handler and carries its
+/// literal arguments. A later interaction/runtime layer maps `name` to actual
+/// behavior. Keeping it declarative means a fired callback is just another
+/// auditable record on the cowork surface — see [`Document::fire`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+/// A dynamic property binding (rung 4: bindings).
+///
+/// `expr` is a state-key or expression string that a later reactive layer
+/// resolves to a [`Value`]. Bindings live *alongside* literal [`Node::props`],
+/// never replacing them: a node may carry both `props["width"]` (a literal)
+/// and `bindings["width"]` (a dynamic source). Resolution order is the
+/// reactive layer's concern, not the IR's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binding {
+    pub expr: String,
+}
+
 /// A single element in the UI tree.
 ///
 /// `kind` is a normalized element name in *our* vocabulary (e.g. `"Stack"`,
@@ -60,6 +84,11 @@ pub struct Node {
     pub props: BTreeMap<String, Value>,
     pub children: Vec<NodeId>,
     pub parent: Option<NodeId>,
+    /// Event name -> action to invoke. Empty by default, so existing
+    /// `Node { kind, ..default() }` construction is unaffected.
+    pub callbacks: BTreeMap<String, Action>,
+    /// Property key -> dynamic binding. Empty by default.
+    pub bindings: BTreeMap<String, Binding>,
 }
 
 /// Who authored an edit. The cowork-contract provenance tag.
@@ -89,6 +118,14 @@ pub enum Mutation {
     /// Delete a node and detach it from its parent. Children are orphaned,
     /// not recursively deleted (callers compose deletes explicitly).
     RemoveNode { id: NodeId },
+    /// Register (or overwrite) the [`Action`] fired for `event` on a node.
+    SetCallback { id: NodeId, event: String, action: Action },
+    /// Bind (or overwrite) a dynamic [`Binding`] for `key` on a node.
+    SetBinding { id: NodeId, key: String, binding: Binding },
+    /// Audited record that a callback was *fired* (not registered). Emitted by
+    /// [`Document::fire`] so human- and AI-fired invocations are both
+    /// attributable in the log. Applying it does not mutate the tree.
+    Invoke { id: NodeId, event: String },
 }
 
 /// An audited edit: a mutation plus who authored it.
@@ -207,6 +244,20 @@ impl Document {
                     self.root = None;
                 }
             }
+            Mutation::SetCallback { id, event, action } => {
+                let node = self.nodes.get_mut(id).ok_or(IrError::NoSuchNode(*id))?;
+                node.callbacks.insert(event.clone(), action.clone());
+            }
+            Mutation::SetBinding { id, key, binding } => {
+                let node = self.nodes.get_mut(id).ok_or(IrError::NoSuchNode(*id))?;
+                node.bindings.insert(key.clone(), binding.clone());
+            }
+            Mutation::Invoke { id, event: _ } => {
+                // Pure audit record: the node must exist, but the tree is
+                // unchanged. The Edit's Origin (carried by apply) is what makes
+                // a fired callback attributable.
+                self.expect(*id)?;
+            }
         }
         Ok(())
     }
@@ -238,6 +289,30 @@ impl Document {
     /// The append-only edit history — the cowork audit trail.
     pub fn audit_log(&self) -> &[Edit] {
         &self.log
+    }
+
+    /// Fire the callback registered for `event` on node `id`.
+    ///
+    /// This is the rung-3 interaction surface, and it honors the cowork
+    /// contract: a human-fired and an AI-fired invocation travel the *same*
+    /// path. Firing records an audited [`Edit`] carrying the given [`Origin`]
+    /// and a [`Mutation::Invoke`], so every invocation is attributable in the
+    /// log — neither party has a back door.
+    ///
+    /// Returns a clone of the [`Action`] to run, or `None` if the node has no
+    /// callback for `event` (in which case nothing is logged).
+    pub fn fire(&mut self, id: NodeId, event: &str, origin: Origin) -> Option<Action> {
+        let action = self.nodes.get(&id)?.callbacks.get(event)?.clone();
+        // Same audited path for everyone; the Invoke is a pure record.
+        self.apply_from(
+            origin,
+            Mutation::Invoke {
+                id,
+                event: event.to_string(),
+            },
+        )
+        .ok()?;
+        Some(action)
     }
 }
 
@@ -312,5 +387,82 @@ mod tests {
         assert!(doc.get(a).unwrap().children.is_empty());
         assert_eq!(doc.get(b).unwrap().parent, None);
         assert!(doc.get(b).is_some(), "detached node still exists");
+    }
+
+    /// Register a callback, then fire it as both a human and the AI. Each fire
+    /// returns the Action AND appends an audited Edit with the correct Origin —
+    /// the cowork contract: same path, both attributable, no back door.
+    #[test]
+    fn fire_returns_action_and_audits_the_invocation() {
+        let mut doc = Document::new();
+        let btn = doc.fresh_id();
+        doc.apply_from(Origin::Human, Mutation::CreateNode { id: btn, kind: "Button".into() })
+            .unwrap();
+
+        let action = Action { name: "submit".into(), args: vec![Value::Int(7)] };
+        doc.apply_from(Origin::Human, Mutation::SetCallback {
+            id: btn,
+            event: "tap".into(),
+            action: action.clone(),
+        })
+        .unwrap();
+
+        // It's stored on the node.
+        assert_eq!(doc.get(btn).unwrap().callbacks.get("tap"), Some(&action));
+
+        // Human fires it: gets the Action back.
+        let fired = doc.fire(btn, "tap", Origin::Human);
+        assert_eq!(fired, Some(action.clone()));
+
+        // AI fires the very same callback: same path, also gets the Action.
+        let fired_ai = doc.fire(btn, "tap", Origin::Ai);
+        assert_eq!(fired_ai, Some(action.clone()));
+
+        // Firing a non-existent event logs nothing and returns None.
+        assert_eq!(doc.fire(btn, "nope", Origin::Ai), None);
+
+        // The two invocations are both in the audit log with correct origins.
+        let invokes: Vec<&Edit> = doc
+            .audit_log()
+            .iter()
+            .filter(|e| matches!(e.mutation, Mutation::Invoke { .. }))
+            .collect();
+        assert_eq!(invokes.len(), 2);
+        assert_eq!(invokes[0].origin, Origin::Human);
+        assert_eq!(invokes[1].origin, Origin::Ai);
+        assert_eq!(
+            invokes[0].mutation,
+            Mutation::Invoke { id: btn, event: "tap".into() }
+        );
+    }
+
+    /// SetBinding stores a dynamic binding that reads back, and lives alongside
+    /// (not replacing) any literal prop on the same key.
+    #[test]
+    fn set_binding_stores_and_reads_alongside_literals() {
+        let mut doc = Document::new();
+        let n = doc.fresh_id();
+        doc.apply_from(Origin::Ai, Mutation::CreateNode { id: n, kind: "Rect".into() })
+            .unwrap();
+
+        // A literal width...
+        doc.apply_from(Origin::Ai, Mutation::SetProp {
+            id: n,
+            key: "width".into(),
+            value: Value::Px(100.0),
+        })
+        .unwrap();
+        // ...and a binding for the same key.
+        let binding = Binding { expr: "state.width".into() };
+        doc.apply_from(Origin::Ai, Mutation::SetBinding {
+            id: n,
+            key: "width".into(),
+            binding: binding.clone(),
+        })
+        .unwrap();
+
+        // Both coexist.
+        assert_eq!(doc.get(n).unwrap().props.get("width"), Some(&Value::Px(100.0)));
+        assert_eq!(doc.get(n).unwrap().bindings.get("width"), Some(&binding));
     }
 }
