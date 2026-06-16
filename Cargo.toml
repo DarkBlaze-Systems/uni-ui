@@ -4,15 +4,14 @@
 # for the BSL "Sanity License". NOT a Slint fork — we share none of Slint's
 # (or any copyleft) source. Every dependency is permissive (MIT/Apache/BSD).
 #
+# Architecture: organized by THE FLOW — own the trait spine, isolate every
+# backend as a swappable leaf behind it. See ./FLOW.md.
+#
 # Clean-room rule, binding: no crate here may read, vendor, or port GPL
-# `i-slint-*` code or Apple-private framework internals. Frontends are
-# reconstructed from public documentation only.
+# `i-slint-*` code or Apple-private framework internals.
 #
 # Build note: build on the home filesystem (engine/target), NEVER /tmp
 # (a 3GB tmpfs that quota-fails on the GPU dependency tree).
-#
-# Architecture: ../research/engine/00-ENGINE-ARCHITECTURE.md
-# Dev plan:     ./DEV-PLAN.md
 
 [workspace]
 resolver = "2"
@@ -26,6 +25,8 @@ members = [
     "crates/uni-spring",
     "crates/uni-env",
     "crates/uni-simd",
+    "crates/uni-a11y",
+    "crates/uni-webframe",
 ]
 
 [workspace.package]
@@ -35,8 +36,6 @@ authors = ["DarkBlaze"]
 publish = false
 # license: LicenseRef-DarkBlaze-Sanity (BSL 1.1 + no-compete grant) — to be finalized.
 
-# Release profile tuned for low-resource + fast: thin LTO, single codegen unit,
-# panic=abort for a smaller binary. (CPU target features via .cargo/config.toml.)
 [profile.release]
 opt-level = 3
 lto = "thin"
