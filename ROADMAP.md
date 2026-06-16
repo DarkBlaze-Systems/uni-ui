@@ -3,7 +3,7 @@
 Tracked from the construction-review suggestions. Goal: all items to 100%, workspace green.
 Sequence keystone first: **A1 → B1 → A2 → C1 → D2** (A1 unblocks the AGI-facing path).
 
-**STATUS 2026-06-16: A1→G2 delivered. 227 tests pass / 0 fail; clippy `-D warnings`, fmt, and doc `-D warnings` all clean. D3 landed as its spec'd foundation (see note).**
+**STATUS: A1→G2 complete (incl. D3 full clean-subtree skipping). 228 tests pass / 0 fail; clippy `-D warnings`, fmt, and doc `-D warnings` all clean.**
 
 ## A — IR / spine durability
 - [x] **A1** Serializable IR (`serde`) + JSON wire format + round-trip test — `uni-ir` `[L]`
@@ -25,7 +25,7 @@ Sequence keystone first: **A1 → B1 → A2 → C1 → D2** (A1 unblocks the AGI
 ## D — Performance
 - [x] **D1** Route `uni-spring` batch integration through `uni-simd` + criterion bench — `[M]`
 - [x] **D2** `TextMeasurer` trait; cosmic-text backend behind feature; feed layout — `uni-core` `[M]`
-- [x] **D3** Incremental layout: dirty-`NodeId` set from mutations, skip clean subtrees — `uni-reactor`/`uni-runtime` `[L]` — _landed as dirty-set foundation + test (spec-accepted minimum); full clean-subtree skip is future work._
+- [x] **D3** Incremental layout: dirty-`NodeId` set from mutations, skip clean subtrees — `uni-core` `LayoutCache` (persistent taffy tree; only dirty nodes restyled, clean leaves never re-measured) wired into `uni-runtime` `[L]` — _complete: skipping proven by a measure-counter test; incremental result asserted equal to a full layout._
 
 ## E — Importer roadmap
 - [x] **E1** `Unsupported{line,text}` telemetry on importers + coverage table — `[S/M]`

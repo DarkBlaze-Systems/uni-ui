@@ -494,6 +494,214 @@ pub fn layout_with_measure(
 }
 
 // ---------------------------------------------------------------------------
+// D3 — incremental layout
+// ---------------------------------------------------------------------------
+
+/// Every node reachable from the document root (its live node set).
+fn reachable_set(doc: &Document) -> std::collections::HashSet<NodeId> {
+    let mut set = std::collections::HashSet::new();
+    if let Some(r) = doc.root() {
+        let mut stack = vec![r];
+        while let Some(id) = stack.pop() {
+            if set.insert(id) {
+                if let Some(n) = doc.get(id) {
+                    stack.extend(n.children.iter().copied());
+                }
+            }
+        }
+    }
+    set
+}
+
+/// A persistent layout context that **skips clean subtrees** between frames.
+///
+/// [`layout`] rebuilds the whole taffy tree on every call. `LayoutCache` keeps
+/// the tree alive: [`compute`](LayoutCache::compute) re-styles *only* the nodes
+/// named in the `dirty` set, and taffy reuses its cached result for every clean
+/// subtree. taffy's measure function is invoked **only** for nodes it actually
+/// recomputes, so a clean `Text` leaf is never re-measured — the observable
+/// proof that the clean subtree was skipped.
+///
+/// The tree is rebuilt from scratch only when the document's *structure* changes
+/// (root swapped, nodes added/removed, or a child list reordered); pure property
+/// edits take the cheap incremental path. Results are identical to [`layout`].
+pub struct LayoutCache {
+    tree: TaffyTree<NodeId>,
+    fwd: HashMap<NodeId, taffy::NodeId>,
+    map: HashMap<taffy::NodeId, NodeId>,
+    root_taffy: Option<taffy::NodeId>,
+    root_id: Option<NodeId>,
+    viewport: (f32, f32),
+    children_sig: HashMap<NodeId, Vec<NodeId>>,
+}
+
+impl Default for LayoutCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayoutCache {
+    pub fn new() -> Self {
+        LayoutCache {
+            tree: TaffyTree::new(),
+            fwd: HashMap::new(),
+            map: HashMap::new(),
+            root_taffy: None,
+            root_id: None,
+            viewport: (0.0, 0.0),
+            children_sig: HashMap::new(),
+        }
+    }
+
+    /// Incrementally compute layout, re-styling only `dirty` nodes and letting
+    /// taffy reuse cached results for clean subtrees. Uses [`HeuristicMeasurer`].
+    pub fn compute(
+        &mut self,
+        doc: &Document,
+        viewport: (f32, f32),
+        dirty: &std::collections::BTreeSet<NodeId>,
+    ) -> Layout {
+        self.compute_with_measure(doc, viewport, dirty, &HeuristicMeasurer)
+    }
+
+    /// Like [`compute`](LayoutCache::compute) but routes `Text` sizing through
+    /// `measurer`.
+    pub fn compute_with_measure(
+        &mut self,
+        doc: &Document,
+        viewport: (f32, f32),
+        dirty: &std::collections::BTreeSet<NodeId>,
+        measurer: &dyn TextMeasurer,
+    ) -> Layout {
+        if self.needs_rebuild(doc) {
+            self.rebuild(doc, viewport);
+        } else {
+            // A viewport change re-flows from the root down.
+            if viewport != self.viewport {
+                if let (Some(rid), Some(&rt)) =
+                    (self.root_id, self.root_id.and_then(|r| self.fwd.get(&r)))
+                {
+                    if let Some(node) = doc.get(rid) {
+                        let _ = self.tree.set_style(rt, style_for(node, viewport, true));
+                    }
+                }
+            }
+            // Re-style only the dirty nodes that still exist. taffy's `set_style`
+            // marks the node (and its ancestors) dirty, so clean subtrees keep
+            // their cached layout and are never re-measured.
+            for &id in dirty {
+                if let (Some(&tid), Some(node)) = (self.fwd.get(&id), doc.get(id)) {
+                    let is_root = Some(id) == self.root_id;
+                    let _ = self
+                        .tree
+                        .set_style(tid, style_for(node, viewport, is_root));
+                }
+            }
+        }
+        self.viewport = viewport;
+        self.run(doc, viewport, measurer)
+    }
+
+    /// A structural change (not a mere property edit) forces a full rebuild.
+    fn needs_rebuild(&self, doc: &Document) -> bool {
+        if self.root_taffy.is_none() || doc.root() != self.root_id {
+            return true;
+        }
+        let reachable = reachable_set(doc);
+        if reachable.len() != self.fwd.len() {
+            return true;
+        }
+        for id in &reachable {
+            if !self.fwd.contains_key(id) {
+                return true;
+            }
+            let cur = doc.get(*id).map(|n| n.children.clone()).unwrap_or_default();
+            if self.children_sig.get(id) != Some(&cur) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn rebuild(&mut self, doc: &Document, viewport: (f32, f32)) {
+        self.tree = TaffyTree::new();
+        self.fwd.clear();
+        self.map.clear();
+        self.children_sig.clear();
+        self.root_id = doc.root();
+        self.root_taffy = match doc.root() {
+            Some(r) => self.build_cached(doc, r, viewport, true),
+            None => None,
+        };
+    }
+
+    fn build_cached(
+        &mut self,
+        doc: &Document,
+        id: NodeId,
+        viewport: (f32, f32),
+        is_root: bool,
+    ) -> Option<taffy::NodeId> {
+        let node = doc.get(id)?;
+        let style = style_for(node, viewport, is_root);
+        let taffy_id = if is_container(&node.kind) {
+            let children: Vec<taffy::NodeId> = node
+                .children
+                .iter()
+                .filter_map(|&c| self.build_cached(doc, c, viewport, false))
+                .collect();
+            self.tree.new_with_children(style, &children).ok()?
+        } else {
+            self.tree.new_leaf_with_context(style, id).ok()?
+        };
+        self.fwd.insert(id, taffy_id);
+        self.map.insert(taffy_id, id);
+        self.children_sig.insert(id, node.children.clone());
+        Some(taffy_id)
+    }
+
+    fn run(&mut self, doc: &Document, viewport: (f32, f32), measurer: &dyn TextMeasurer) -> Layout {
+        let mut out = Layout {
+            viewport,
+            ..Layout::default()
+        };
+        let Some(root_taffy) = self.root_taffy else {
+            return out;
+        };
+        let available = Size {
+            width: AvailableSpace::Definite(viewport.0),
+            height: AvailableSpace::Definite(viewport.1),
+        };
+        let res = self.tree.compute_layout_with_measure(
+            root_taffy,
+            available,
+            |known, _avail, _node, context, _style| {
+                if let (Some(w), Some(h)) = (known.width, known.height) {
+                    return Size { width: w, height: h };
+                }
+                let intrinsic = context
+                    .and_then(|&mut ir_id| {
+                        doc.get(ir_id)
+                            .filter(|n| n.kind == "Text")
+                            .map(|n| text_intrinsic_size(n, measurer))
+                    })
+                    .unwrap_or(Size::ZERO);
+                Size {
+                    width: known.width.unwrap_or(intrinsic.width),
+                    height: known.height.unwrap_or(intrinsic.height),
+                }
+            },
+        );
+        if res.is_err() {
+            return out;
+        }
+        collect_rects(&self.tree, root_taffy, &self.map, (0.0, 0.0), &mut out);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Paint pass
 // ---------------------------------------------------------------------------
 
@@ -632,6 +840,75 @@ pub fn lower(doc: &Document, viewport: (f32, f32)) -> Scene {
 mod tests {
     use super::*;
     use uni_ir::{Mutation, Origin};
+
+    /// D3: incremental relayout re-measures ONLY the dirty node — clean
+    /// subtrees are skipped — and the result equals a full layout.
+    #[test]
+    fn incremental_layout_skips_clean_subtrees() {
+        use std::cell::RefCell;
+        use std::collections::BTreeSet;
+
+        // Records which text strings taffy actually asked us to measure.
+        struct Recorder {
+            seen: RefCell<Vec<String>>,
+        }
+        impl TextMeasurer for Recorder {
+            fn measure(&self, text: &str, size: f32) -> (f32, f32) {
+                self.seen.borrow_mut().push(text.to_string());
+                HeuristicMeasurer.measure(text, size)
+            }
+        }
+
+        // A Column of three fixed-width Text leaves.
+        let mut doc = Document::new();
+        let col = doc.fresh_id();
+        doc.apply_from(Origin::System, Mutation::CreateNode { id: col, kind: "Column".into() })
+            .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: col }).unwrap();
+        let mut texts = Vec::new();
+        for s in ["alpha", "beta", "gamma"] {
+            let t = doc.fresh_id();
+            doc.apply_from(Origin::System, Mutation::CreateNode { id: t, kind: "Text".into() })
+                .unwrap();
+            doc.apply_from(Origin::System, Mutation::SetProp { id: t, key: "content".into(), value: Value::Text(s.into()) })
+                .unwrap();
+            doc.apply_from(Origin::System, Mutation::SetProp { id: t, key: "width".into(), value: Value::Px(100.0) })
+                .unwrap();
+            doc.apply_from(Origin::System, Mutation::AppendChild { parent: col, child: t }).unwrap();
+            texts.push(t);
+        }
+
+        let vp = (200.0, 400.0);
+        let mut cache = LayoutCache::new();
+        let rec = Recorder { seen: RefCell::new(Vec::new()) };
+
+        // First compute: full build → every text leaf is measured.
+        let _ = cache.compute_with_measure(&doc, vp, &BTreeSet::new(), &rec);
+        assert!(
+            rec.seen.borrow().iter().any(|t| t == "beta"),
+            "first pass measures all texts"
+        );
+
+        // Change ONLY the first text; mark only it dirty.
+        doc.apply_from(Origin::Ai, Mutation::SetProp { id: texts[0], key: "content".into(), value: Value::Text("alpha-CHANGED".into()) })
+            .unwrap();
+        rec.seen.borrow_mut().clear();
+        let mut dirty = BTreeSet::new();
+        dirty.insert(texts[0]);
+        let inc = cache.compute_with_measure(&doc, vp, &dirty, &rec);
+
+        let seen = rec.seen.borrow().clone();
+        assert!(seen.iter().any(|t| t == "alpha-CHANGED"), "dirty node IS re-measured");
+        assert!(!seen.iter().any(|t| t == "beta"), "clean 'beta' skipped, got {seen:?}");
+        assert!(!seen.iter().any(|t| t == "gamma"), "clean 'gamma' skipped, got {seen:?}");
+
+        // Correctness: incremental layout matches a fresh full layout exactly.
+        let fresh = layout_with_measure(&doc, vp, &HeuristicMeasurer);
+        for &t in &texts {
+            assert_eq!(inc.rect(t), fresh.rect(t), "incremental rect matches full layout");
+        }
+        assert_eq!(inc.rect(col), fresh.rect(col));
+    }
 
     fn prop(doc: &mut Document, id: NodeId, key: &str, value: Value) {
         doc.apply_from(

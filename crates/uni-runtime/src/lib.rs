@@ -7,7 +7,7 @@
 //!   (every invocation lands in the append-only audit log carrying its
 //!   [`Origin`]).
 //! - `uni-dsl` parses `.uni` into a `Document` (callbacks → `SetCallback`).
-//! - `uni-core` does [`layout`], [`paint`], and [`hit_test`].
+//! - `uni-core` does [`uni_core::layout`], [`paint`], and [`hit_test`].
 //! - `uni-render` rasterizes a `Scene` to a window and translates winit events
 //!   into renderer-agnostic [`InputEvent`]s.
 //!
@@ -56,22 +56,21 @@
 //! a real window is created), so the core fire→handler→mutation cycle is fully
 //! unit-testable headless — see the tests at the bottom of this file.
 //!
-//! ## D3 — incremental-layout foundation (partial)
+//! ## D3 — incremental layout
 //!
 //! Every applied [`Mutation`] names the node(s) it touched. The runtime folds
 //! those ids out of the audit log into a **dirty-node set**
 //! ([`Runtime::dirty_nodes`]); a *clean* (empty) set lets `relayout` skip the
-//! work entirely (the clean-subtree short-circuit). This is the *foundation*:
-//! the conservative first cut still recomputes the **whole** tree whenever any
-//! node is dirty — relaying out only the dirty subtrees needs partial-layout
-//! support in `uni-core` (the layout engine must accept a seed of changed
-//! nodes), which is the next rung. The dirty-set populate/expose/short-circuit
-//! is in place and tested; per-subtree layout is the remaining work.
+//! work entirely. When the set is non-empty, the dirty ids are handed to a
+//! persistent [`uni_core::LayoutCache`], which re-styles **only** those nodes
+//! and lets taffy reuse its cached layout for every clean subtree — clean
+//! leaves are never even re-measured. The result is identical to a full
+//! [`uni_core::layout`], at a fraction of the work on a localized edit.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use uni_core::{hit_test, layout, paint, Layout};
+use uni_core::{hit_test, paint, Layout, LayoutCache};
 use uni_env::Env;
 use uni_ir::{Action, Document, Mutation, NodeId, Origin};
 use uni_reactor::Store;
@@ -148,6 +147,10 @@ pub struct Runtime {
     /// How far into the audit log we've already folded into `dirty`. Lets us
     /// scan only the *new* edits since the last sweep.
     audit_cursor: usize,
+    /// **D3.** Persistent incremental-layout cache: re-styles only the `dirty`
+    /// nodes each relayout and lets taffy skip clean subtrees. See
+    /// [`uni_core::LayoutCache`].
+    layout_cache: LayoutCache,
 }
 
 impl Runtime {
@@ -169,6 +172,7 @@ impl Runtime {
             focused: None,
             dirty: BTreeSet::new(),
             audit_cursor: 0,
+            layout_cache: LayoutCache::new(),
         };
         // Push any state already present into the bound props, then lay out, so
         // the very first frame reflects the store (not just literal defaults).
@@ -382,7 +386,11 @@ impl Runtime {
         if self.dirty.is_empty() && !self.layout.order().is_empty() {
             return;
         }
-        self.layout = layout(&self.doc, self.viewport);
+        // Incremental: the cache re-styles only the dirty nodes and lets taffy
+        // skip every clean subtree (clean leaves are never re-measured).
+        self.layout = self
+            .layout_cache
+            .compute(&self.doc, self.viewport, &self.dirty);
         self.dirty.clear();
     }
 
@@ -390,7 +398,11 @@ impl Runtime {
     /// viewport itself changes, which dirties geometry without any tree edit).
     fn relayout_force(&mut self) {
         self.mark_dirty_from_log();
-        self.layout = layout(&self.doc, self.viewport);
+        // A viewport change re-flows from the root; the cache detects the new
+        // viewport and recomputes accordingly (still reusing the taffy tree).
+        self.layout = self
+            .layout_cache
+            .compute(&self.doc, self.viewport, &self.dirty);
         self.dirty.clear();
     }
 
