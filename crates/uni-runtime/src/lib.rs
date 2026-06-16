@@ -67,6 +67,9 @@
 //! leaves are never even re-measured. The result is identical to a full
 //! [`uni_core::layout`], at a fraction of the work on a localized edit.
 
+mod gesture;
+pub use gesture::{GestureEvent, GestureKind, Recognizer};
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -300,6 +303,12 @@ pub struct Runtime {
     /// be. Drives screen/destination selection in a router-style UI; both edits
     /// ride the same audited action path (see [`Runtime::navigate`]).
     nav_stack: Vec<String>,
+    /// **S5 — gesture recognizers.** SwiftUI-style tap/long-press/drag/magnify/
+    /// rotation recognizers attached to nodes. Each consumes the same
+    /// [`InputEvent`]s the pointer path does (plus time, via [`Runtime::tick`])
+    /// and dispatches its recognized event through the *same* audited
+    /// `dispatch` path a click takes. See [`gesture`].
+    gestures: Vec<Recognizer>,
 }
 
 impl Runtime {
@@ -327,6 +336,7 @@ impl Runtime {
             audit_cursor: 0,
             layout_cache: LayoutCache::new(),
             nav_stack: Vec::new(),
+            gestures: Vec::new(),
         };
         // Push any state already present into the bound props, then lay out, so
         // the very first frame reflects the store (not just literal defaults).
@@ -1182,6 +1192,209 @@ impl Runtime {
     /// Get the current a11y tree update reflecting the current focus state.
     pub fn a11y_update(&self) -> uni_a11y::TreeUpdate {
         uni_a11y::build_tree(&self.doc, &self.layout, self.focused)
+    }
+
+    // -- S5: SwiftUI-style gesture recognizers --------------------------------
+
+    /// **Attach a gesture recognizer to a node** (SwiftUI's `.gesture(...)` /
+    /// `.onTapGesture(...)`). `action` is the base event name the recognizer
+    /// fires through the audited dispatch path: the bare name for a discrete
+    /// recognition (tap, long-press), `"<action>_changed"`/`"<action>_ended"` for
+    /// a continuous one (drag/magnify/rotation). Register a [`Handler`] under the
+    /// same name(s) with [`Runtime::register`] to give it behavior.
+    ///
+    /// Returns the index of the recognizer in the runtime's gesture set, so a
+    /// caller can read its live state ([`Runtime::gesture`]) — e.g. a drag's
+    /// translation or a magnify's scale.
+    pub fn add_gesture(
+        &mut self,
+        node: NodeId,
+        action: impl Into<String>,
+        kind: GestureKind,
+    ) -> usize {
+        self.gestures.push(Recognizer::new(node, action, kind));
+        self.gestures.len() - 1
+    }
+
+    /// Immutable access to a registered recognizer by index (its live
+    /// translation/scale/angle + phase). See [`Runtime::add_gesture`].
+    pub fn gesture(&self, idx: usize) -> Option<&Recognizer> {
+        self.gestures.get(idx)
+    }
+
+    /// Number of registered gesture recognizers.
+    pub fn gesture_count(&self) -> usize {
+        self.gestures.len()
+    }
+
+    /// **Feed one [`InputEvent`] to the gesture recognizers**, firing every
+    /// recognized gesture through the *same* audited `dispatch` path a
+    /// click takes — tagged with `origin` (a human's real input is
+    /// [`Origin::Human`]; an AI feeding synthetic input passes [`Origin::Ai`]).
+    /// Returns `true` if any gesture fired a handler.
+    ///
+    /// Each pointer event is hit-tested once (bubbling to the recognizer's node),
+    /// so a press only arms recognizers whose node it actually lands on. Pinch /
+    /// rotate events are not positional — they drive every magnify/rotation
+    /// recognizer (the caller targets by registering only the intended ones).
+    ///
+    /// **Combined-gesture precedence.** After feeding, if a drag on a node has
+    /// become *active*, any pending tap/long-press recognizer on that **same
+    /// node** is cancelled — a drag past its threshold wins over a not-yet-fired
+    /// tap/long-press, mirroring SwiftUI's `exclusively(before:)`/simultaneous
+    /// resolution for the common case.
+    pub fn feed_gesture(&mut self, input: &InputEvent, origin: Origin) -> bool {
+        // Which node (if any) this pointer event bubbles to, by recognizer node.
+        // We resolve hits up-front so the borrow of `self` for hit-testing ends
+        // before we mutate the recognizers.
+        let point = match input {
+            InputEvent::PointerDown { x, y, .. }
+            | InputEvent::PointerUp { x, y, .. }
+            | InputEvent::PointerMoved { x, y } => Some((*x, *y)),
+            _ => None,
+        };
+        // For a press, a recognizer's node is "hit" if the pointer hit-tests into
+        // it or a descendant (bubbling). Movement/release reuse whichever
+        // recognizers are already tracking, so we mark them hit too.
+        let mut hits: Vec<bool> = Vec::with_capacity(self.gestures.len());
+        for rec in &self.gestures {
+            let hit = match point {
+                Some(p) => self.point_hits_node(p, rec.node) || rec.is_tracking(),
+                None => false,
+            };
+            hits.push(hit);
+        }
+
+        // Drive each recognizer, collecting (idx, node, action, event) to fire.
+        let mut fired: Vec<(usize, NodeId, String, GestureEvent)> = Vec::new();
+        for (i, rec) in self.gestures.iter_mut().enumerate() {
+            for ev in rec.feed(input, hits[i]) {
+                fired.push((i, rec.node, rec.action.clone(), ev));
+            }
+        }
+
+        // Combined precedence: an active drag cancels pending tap/long-press on
+        // the same node.
+        self.apply_drag_precedence();
+
+        self.fire_gesture_events(fired, origin)
+    }
+
+    /// **Advance gesture time by `dt` seconds**, firing any long-press that has
+    /// now been held past its `minimumDuration` through the audited dispatch path
+    /// (tagged `origin`). Returns `true` if a long-press fired a handler. Call
+    /// this from the frame loop alongside [`Runtime::tick`].
+    pub fn tick_gestures(&mut self, dt: f32, origin: Origin) -> bool {
+        let mut fired: Vec<(usize, NodeId, String, GestureEvent)> = Vec::new();
+        for (i, rec) in self.gestures.iter_mut().enumerate() {
+            for ev in rec.tick(dt) {
+                fired.push((i, rec.node, rec.action.clone(), ev));
+            }
+        }
+        // A long-press that fires should also cancel a pending tap on the same
+        // node, so a release after it does not double-register.
+        let firing_nodes: Vec<NodeId> = fired.iter().map(|(_, n, _, _)| *n).collect();
+        for rec in &mut self.gestures {
+            if matches!(rec.kind, GestureKind::Tap { .. }) && firing_nodes.contains(&rec.node) {
+                rec.cancel();
+            }
+        }
+        self.fire_gesture_events(fired, origin)
+    }
+
+    /// **Feed a pinch (magnify) delta programmatically** to every
+    /// [`GestureKind::Magnify`] recognizer (SwiftUI's `MagnifyGesture`). The
+    /// headless/desktop input path has no multitouch, so magnification is driven
+    /// by feeding deltas here (a trackpad backend, a test, or an AI). Each step
+    /// fires `"<action>_changed"` through the audited path; the live factor is on
+    /// [`Recognizer::scale`]. Returns `true` if a handler fired.
+    pub fn pinch(&mut self, delta: f32, origin: Origin) -> bool {
+        self.feed_gesture(&InputEvent::Pinch { delta }, origin)
+    }
+
+    /// **Feed a rotation delta programmatically** to every
+    /// [`GestureKind::Rotation`] recognizer (SwiftUI's `RotationGesture`); see
+    /// [`Runtime::pinch`]. Each step fires `"<action>_changed"`; the live angle
+    /// (radians) is on [`Recognizer::rotation`]. Returns `true` if a handler
+    /// fired.
+    pub fn rotate(&mut self, delta: f32, origin: Origin) -> bool {
+        self.feed_gesture(&InputEvent::Rotate { delta }, origin)
+    }
+
+    /// **Conclude every active continuous (magnify/rotation) gesture**, firing
+    /// their `"<action>_ended"` event through the audited path. Drags end on a
+    /// `PointerUp`; pinch/rotate have no natural "up" in the headless vocabulary,
+    /// so this is how a caller signals the gesture is over. Returns `true` if a
+    /// handler fired.
+    pub fn end_continuous_gestures(&mut self, origin: Origin) -> bool {
+        let mut fired: Vec<(usize, NodeId, String, GestureEvent)> = Vec::new();
+        for (i, rec) in self.gestures.iter_mut().enumerate() {
+            for ev in rec.end_continuous() {
+                fired.push((i, rec.node, rec.action.clone(), ev));
+            }
+        }
+        self.fire_gesture_events(fired, origin)
+    }
+
+    /// Combined precedence: for any drag recognizer that is now active, cancel
+    /// every *pending* tap/long-press recognizer on the **same node** so a drag
+    /// past its threshold wins over a not-yet-fired tap/long-press.
+    fn apply_drag_precedence(&mut self) {
+        let dragging: Vec<NodeId> = self
+            .gestures
+            .iter()
+            .filter(|r| matches!(r.kind, GestureKind::Drag { .. }) && r.is_active())
+            .map(|r| r.node)
+            .collect();
+        if dragging.is_empty() {
+            return;
+        }
+        for rec in &mut self.gestures {
+            let cancelable = matches!(
+                rec.kind,
+                GestureKind::Tap { .. } | GestureKind::LongPress { .. }
+            );
+            if cancelable && rec.is_tracking() && dragging.contains(&rec.node) {
+                rec.cancel();
+            }
+        }
+    }
+
+    /// Fire a batch of recognized gesture events through the audited dispatch
+    /// path, composing each concrete event name. Returns `true` if any handler
+    /// ran. (`idx` is kept in the tuple for symmetry with the recognizer set; the
+    /// node + action are what dispatch needs.)
+    fn fire_gesture_events(
+        &mut self,
+        fired: Vec<(usize, NodeId, String, GestureEvent)>,
+        origin: Origin,
+    ) -> bool {
+        let mut any = false;
+        for (_idx, node, action, ev) in fired {
+            let event = gesture::event_name(&action, &ev);
+            if self.dispatch(node, &event, origin) {
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Whether `point` (logical px) hit-tests into `node` or one of its
+    /// descendants — i.e. a pointer there would bubble to `node`. Used to decide
+    /// which recognizers a press arms.
+    fn point_hits_node(&self, point: (f32, f32), node: NodeId) -> bool {
+        let Some(mut current) = hit_test(&self.layout, point) else {
+            return false;
+        };
+        loop {
+            if current == node {
+                return true;
+            }
+            match self.doc.get(current).and_then(|n| n.parent) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
     }
 }
 
@@ -2598,6 +2811,359 @@ mod tests {
             Some(btns[2]),
             "backward from first should wrap to last"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5 — SwiftUI-style gesture recognizers
+    // -----------------------------------------------------------------------
+
+    /// Build a runtime with a single big node (a `Stack` that fills the viewport)
+    /// carrying a `click` callback so it's hit-testable, plus a shared counter
+    /// every gesture handler bumps. Returns `(runtime, node, hits)`.
+    fn gesture_runtime() -> (Runtime, NodeId, Rc<RefCell<Vec<String>>>) {
+        let mut doc = Document::new();
+        let node = doc.fresh_id();
+        doc.apply_from(
+            Origin::System,
+            Mutation::CreateNode {
+                id: node,
+                kind: "Stack".into(),
+            },
+        )
+        .unwrap();
+        doc.apply_from(Origin::System, Mutation::SetRoot { id: node })
+            .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id: node,
+                key: "width".into(),
+                value: Value::Px(400.0),
+            },
+        )
+        .unwrap();
+        doc.apply_from(
+            Origin::System,
+            Mutation::SetProp {
+                id: node,
+                key: "height".into(),
+                value: Value::Px(400.0),
+            },
+        )
+        .unwrap();
+        let rt = Runtime::new(doc, (400.0, 400.0));
+        let hits = Rc::new(RefCell::new(Vec::<String>::new()));
+        (rt, node, hits)
+    }
+
+    /// Register a gesture callback on `node` for `event`, whose handler records
+    /// `event` in the shared log. Returns nothing; the action name == event.
+    fn bind_gesture(
+        rt: &mut Runtime,
+        node: NodeId,
+        event: &str,
+        log: Rc<RefCell<Vec<String>>>,
+    ) {
+        rt.doc
+            .apply_from(
+                Origin::System,
+                Mutation::SetCallback {
+                    id: node,
+                    event: event.into(),
+                    action: uni_ir::Action {
+                        name: event.into(),
+                        args: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        let ev = event.to_string();
+        rt.register(
+            event,
+            Box::new(move |_store: &mut Store, _origin: Origin| {
+                log.borrow_mut().push(ev.clone());
+            }),
+        );
+    }
+
+    fn down(x: f32, y: f32) -> InputEvent {
+        InputEvent::PointerDown {
+            x,
+            y,
+            button: PointerButton::Left,
+        }
+    }
+    fn up(x: f32, y: f32) -> InputEvent {
+        InputEvent::PointerUp {
+            x,
+            y,
+            button: PointerButton::Left,
+        }
+    }
+    fn moved(x: f32, y: f32) -> InputEvent {
+        InputEvent::PointerMoved { x, y }
+    }
+
+    /// `TapGesture(count: 1)` — a press→release within slop fires the bare action
+    /// once, through the audited path as `Origin::Human`.
+    #[test]
+    fn tap_gesture_single_fires_on_press_release() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "tap", log.clone());
+        rt.add_gesture(node, "tap", GestureKind::Tap { count: 1 });
+
+        assert!(!rt.feed_gesture(&down(100.0, 100.0), Origin::Human));
+        let fired = rt.feed_gesture(&up(102.0, 101.0), Origin::Human);
+        assert!(fired, "release within slop recognizes the tap");
+        assert_eq!(*log.borrow(), vec!["tap".to_string()]);
+        // Audited as a Human invoke on the gesture's node.
+        let (human, ai) = rt.invoke_counts();
+        assert_eq!((human, ai), (1, 0));
+    }
+
+    /// `onTapGesture(count: 2)` — only the second press→release recognizes;
+    /// a single tap does not fire.
+    #[test]
+    fn tap_gesture_double_requires_two() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "dbl", log.clone());
+        rt.add_gesture(node, "dbl", GestureKind::Tap { count: 2 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        assert!(!rt.feed_gesture(&up(100.0, 100.0), Origin::Human));
+        assert!(log.borrow().is_empty(), "one tap is not a double tap");
+
+        rt.feed_gesture(&down(101.0, 101.0), Origin::Human);
+        let fired = rt.feed_gesture(&up(101.0, 101.0), Origin::Human);
+        assert!(fired, "second tap completes the double");
+        assert_eq!(*log.borrow(), vec!["dbl".to_string()]);
+    }
+
+    /// A press that moves out of slop before release does not register a tap.
+    #[test]
+    fn tap_gesture_cancelled_by_movement() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "tap", log.clone());
+        rt.add_gesture(node, "tap", GestureKind::Tap { count: 1 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        rt.feed_gesture(&moved(180.0, 100.0), Origin::Human); // far past slop
+        let fired = rt.feed_gesture(&up(180.0, 100.0), Origin::Human);
+        assert!(!fired);
+        assert!(log.borrow().is_empty(), "moved-away press is not a tap");
+    }
+
+    /// `LongPressGesture(minimumDuration:)` — a held press fires once `tick`
+    /// advances past the duration; a short hold never fires.
+    #[test]
+    fn long_press_fires_after_min_duration() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "long", log.clone());
+        rt.add_gesture(node, "long", GestureKind::LongPress { min_duration: 0.5 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        // Not yet held long enough.
+        assert!(!rt.tick_gestures(0.2, Origin::Human));
+        assert!(log.borrow().is_empty());
+        // Cross the threshold.
+        let fired = rt.tick_gestures(0.4, Origin::Human);
+        assert!(fired, "held past 0.5s recognizes the long-press");
+        assert_eq!(*log.borrow(), vec!["long".to_string()]);
+        // Idempotent: it fires exactly once.
+        assert!(!rt.tick_gestures(1.0, Origin::Human));
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    /// A long-press released before its duration never fires.
+    #[test]
+    fn long_press_cancelled_by_early_release() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "long", log.clone());
+        rt.add_gesture(node, "long", GestureKind::LongPress { min_duration: 0.5 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        rt.tick_gestures(0.2, Origin::Human);
+        rt.feed_gesture(&up(100.0, 100.0), Origin::Human);
+        assert!(!rt.tick_gestures(1.0, Origin::Human), "released early");
+        assert!(log.borrow().is_empty());
+    }
+
+    /// `DragGesture` — once movement passes the minimum distance the drag is
+    /// active, each move fires `_changed` (with the live translation) and the
+    /// release fires `_ended`. The recognizer exposes the live translation.
+    #[test]
+    fn drag_gesture_changed_and_ended_with_translation() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "drag_changed", log.clone());
+        bind_gesture(&mut rt, node, "drag_ended", log.clone());
+        let g = rt.add_gesture(node, "drag", GestureKind::Drag { min_distance: 10.0 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        // A tiny move inside the threshold: no _changed yet.
+        assert!(!rt.feed_gesture(&moved(103.0, 100.0), Origin::Human));
+        assert!(log.borrow().is_empty());
+
+        // Move past the threshold: drag becomes active, fires _changed.
+        assert!(rt.feed_gesture(&moved(140.0, 130.0), Origin::Human));
+        assert_eq!(rt.gesture(g).unwrap().translation(), (40.0, 30.0));
+        assert!(rt.gesture(g).unwrap().is_active());
+
+        // A further move fires another _changed with the new translation.
+        assert!(rt.feed_gesture(&moved(150.0, 100.0), Origin::Human));
+        assert_eq!(rt.gesture(g).unwrap().translation(), (50.0, 0.0));
+
+        // Release fires _ended.
+        assert!(rt.feed_gesture(&up(150.0, 100.0), Origin::Human));
+        assert!(!rt.gesture(g).unwrap().is_active());
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "drag_changed".to_string(),
+                "drag_changed".to_string(),
+                "drag_ended".to_string()
+            ]
+        );
+    }
+
+    /// `MagnifyGesture` — driven programmatically (no headless multitouch): each
+    /// `pinch` delta fires `_changed` and composes the live scale multiplicatively;
+    /// concluding fires `_ended`.
+    #[test]
+    fn magnify_gesture_accumulates_scale_programmatically() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "zoom_changed", log.clone());
+        bind_gesture(&mut rt, node, "zoom_ended", log.clone());
+        let g = rt.add_gesture(node, "zoom", GestureKind::Magnify);
+
+        assert!(rt.pinch(0.5, Origin::Human)); // scale 1.5
+        assert!((rt.gesture(g).unwrap().scale() - 1.5).abs() < 1e-6);
+        assert!(rt.pinch(0.2, Origin::Human)); // scale 1.5 * 1.2 = 1.8
+        assert!((rt.gesture(g).unwrap().scale() - 1.8).abs() < 1e-6);
+
+        assert!(rt.end_continuous_gestures(Origin::Human));
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "zoom_changed".to_string(),
+                "zoom_changed".to_string(),
+                "zoom_ended".to_string()
+            ]
+        );
+    }
+
+    /// `RotationGesture` — driven programmatically: each `rotate` delta fires
+    /// `_changed` and sums the live angle; concluding fires `_ended`. The AI can
+    /// drive it via `Origin::Ai` on the same audited path.
+    #[test]
+    fn rotation_gesture_accumulates_angle_programmatically() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "spin_changed", log.clone());
+        bind_gesture(&mut rt, node, "spin_ended", log.clone());
+        let g = rt.add_gesture(node, "spin", GestureKind::Rotation);
+
+        assert!(rt.rotate(0.5, Origin::Ai));
+        assert!(rt.rotate(0.25, Origin::Ai));
+        assert!((rt.gesture(g).unwrap().rotation() - 0.75).abs() < 1e-6);
+        assert!(rt.end_continuous_gestures(Origin::Ai));
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "spin_changed".to_string(),
+                "spin_changed".to_string(),
+                "spin_ended".to_string()
+            ]
+        );
+        // All on the audited path as AI.
+        let (human, ai) = rt.invoke_counts();
+        assert_eq!((human, ai), (0, 3));
+    }
+
+    /// **Combined / simultaneous.** A tap and a magnify on the same node coexist:
+    /// a pinch drives the magnify (firing `_changed`) while a separate
+    /// press→release still recognizes the tap — neither cancels the other.
+    #[test]
+    fn simultaneous_tap_and_magnify_coexist() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "tap", log.clone());
+        bind_gesture(&mut rt, node, "zoom_changed", log.clone());
+        rt.add_gesture(node, "tap", GestureKind::Tap { count: 1 });
+        rt.add_gesture(node, "zoom", GestureKind::Magnify);
+
+        rt.pinch(0.3, Origin::Human);
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        rt.feed_gesture(&up(100.0, 100.0), Origin::Human);
+
+        let fired = log.borrow().clone();
+        assert!(fired.contains(&"zoom_changed".to_string()));
+        assert!(fired.contains(&"tap".to_string()));
+    }
+
+    /// **Combined / sequenced precedence.** A drag and a tap on the same node:
+    /// once the drag crosses its threshold it wins, cancelling the pending tap so
+    /// the release does NOT also fire a tap. Only the drag's events fire.
+    #[test]
+    fn drag_beyond_threshold_cancels_pending_tap() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "tap", log.clone());
+        bind_gesture(&mut rt, node, "drag_changed", log.clone());
+        bind_gesture(&mut rt, node, "drag_ended", log.clone());
+        rt.add_gesture(node, "tap", GestureKind::Tap { count: 1 });
+        rt.add_gesture(node, "drag", GestureKind::Drag { min_distance: 10.0 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        // Cross the drag threshold: drag activates, pending tap is cancelled.
+        rt.feed_gesture(&moved(140.0, 100.0), Origin::Human);
+        rt.feed_gesture(&up(140.0, 100.0), Origin::Human);
+
+        let fired = log.borrow().clone();
+        assert!(
+            fired.contains(&"drag_changed".to_string()) && fired.contains(&"drag_ended".to_string()),
+            "drag fired its events"
+        );
+        assert!(
+            !fired.contains(&"tap".to_string()),
+            "a winning drag cancels the pending tap"
+        );
+    }
+
+    /// A short press→release below the drag threshold (with both a tap and a drag
+    /// bound) still recognizes the tap — the drag never activated, so it does not
+    /// suppress the tap.
+    #[test]
+    fn tap_survives_when_drag_does_not_activate() {
+        let (mut rt, node, log) = gesture_runtime();
+        bind_gesture(&mut rt, node, "tap", log.clone());
+        bind_gesture(&mut rt, node, "drag_changed", log.clone());
+        rt.add_gesture(node, "tap", GestureKind::Tap { count: 1 });
+        rt.add_gesture(node, "drag", GestureKind::Drag { min_distance: 20.0 });
+
+        rt.feed_gesture(&down(100.0, 100.0), Origin::Human);
+        rt.feed_gesture(&moved(105.0, 100.0), Origin::Human); // within both slops
+        rt.feed_gesture(&up(105.0, 100.0), Origin::Human);
+
+        assert_eq!(*log.borrow(), vec!["tap".to_string()]);
+    }
+
+    /// A press that misses the recognizer's node does not arm it (hit-testing
+    /// bubbles, but a point outside the node is not a hit).
+    #[test]
+    fn gesture_only_arms_on_a_hit() {
+        // A small 60x40 node placed inside a larger viewport, so there is empty
+        // space to press in.
+        let (doc, btns) = focusable_doc(1);
+        let target = btns[0];
+        let mut rt = Runtime::new(doc, (800.0, 600.0));
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        bind_gesture(&mut rt, target, "tap", log.clone());
+        rt.add_gesture(target, "tap", GestureKind::Tap { count: 1 });
+
+        // Press far away from the node, then release: no tap.
+        rt.feed_gesture(&down(790.0, 590.0), Origin::Human);
+        let fired = rt.feed_gesture(&up(790.0, 590.0), Origin::Human);
+        assert!(!fired);
+        assert!(log.borrow().is_empty(), "a miss does not arm the tap");
     }
 }
 

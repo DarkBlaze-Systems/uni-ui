@@ -15,7 +15,7 @@
 **State:** reactive store ✅ + bindings ✅ + Expr grammar ✅ · `State<T>`/`Binding<T>` handles ✅(@State/@Binding-style) · `@Environment` ⬜
 **Navigation:** NavigationStack ✅ · TabView ✅ · Sheet/Alert/Popover/Menu ✅
 **Animation:** spring core ✅ · timing/easing curves ✅ · implicit ✅ · explicit ✅ · transitions ✅ · matchedGeometry ⬜
-**Gestures:** tap 🟡 · longPress/drag/magnify/rotation ⬜
+**Gestures:** tap ✅ · longPress ✅ · drag ✅ · magnify ✅ · rotation ✅ · combined(simultaneous/sequenced) ✅
 **Drawing/Text:** Path/Shape/Canvas/gradients ⬜ · dynamic type/localization/bidi 🟡
 
 ## Milestones
@@ -23,7 +23,7 @@
 - **S2 — Containers + state ergonomics.** List virtualization, LazyVStack/HStack, real Grid, Form/Section; `@State`/`@Binding`-style API over the store; Picker/Stepper. ← ✅ **DONE** (283 tests / 0 fail, clippy+doc clean).
 - **S3 — Navigation + presentation.** NavigationStack, TabView, Sheet/Alert/Popover/Menu, overlay/background-view modifiers. ← ✅ **DONE** (313 tests / 0 fail, clippy+doc clean).
 - **S4 — Animation + transforms.** Implicit/explicit animation, transitions, offset/rotation/scale effects (on uni-spring). ← ✅ **DONE** (348 tests / 0 fail, clippy+doc clean; rotation full for rects, text axis-aligned in v0).
-- **S5 — Gestures.** tap/longPress/drag/magnify/rotation, combined, gesture state.
+- **S5 — Gestures.** tap/longPress/drag/magnify/rotation, combined, gesture state. ← ✅ **DONE** (379 tests / 0 fail, clippy+doc clean; magnify/rotation driven programmatically — headless has no multitouch).
 - **S6 — Drawing + text.** Path/Shape/Canvas/gradients; dynamic type, localization.
 - **S7 — Tooling + ergonomics.** Preview harness, inspector, hot-reload-ish; docs/examples.
 

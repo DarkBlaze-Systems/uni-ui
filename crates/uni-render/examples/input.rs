@@ -116,6 +116,8 @@ impl ApplicationHandler for App {
                 }
                 InputEvent::KeyDown { key } => eprintln!("input: KeyDown {key:?}"),
                 InputEvent::KeyUp { key } => eprintln!("input: KeyUp {key:?}"),
+                InputEvent::Pinch { delta } => eprintln!("input: Pinch (delta={delta:.3})"),
+                InputEvent::Rotate { delta } => eprintln!("input: Rotate (delta={delta:.3})"),
             }
         }
 

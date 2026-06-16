@@ -18,6 +18,15 @@
 //!   `.alert(title, isPresented:$x)`, `.popover(isPresented:$x)`,
 //!   `.overlay { … }` / `.background(View)` (overlay/underlay layers, distinct
 //!   from `.background(Color)` which stays a style prop)
+//! - Gesture modifiers lowered to callbacks/props on the node:
+//!   `.onTapGesture { }` → a `"click"` callback; `.onTapGesture(count: 2) { }` →
+//!   a `tap_count` prop + `"click"`; `.onLongPressGesture { }` → `"longpress"`;
+//!   `.gesture(DragGesture().onChanged{}.onEnded{})` → `"drag_changed"` /
+//!   `"drag_ended"` (only the phases present); `.gesture(MagnificationGesture())`
+//!   → `"magnify"`; `.gesture(RotationGesture())` → `"rotate"`.
+//!   `.simultaneousGesture` / `.highPriorityGesture` are recognized and tagged
+//!   with a `gesture_priority` prop (`simultaneous` / `high`). An unknown
+//!   recognizer inside `.gesture(...)` is recorded as an [`Unsupported`] drop.
 //! - Transform & animation modifiers: `.offset(x:,y:)` / `.offset(CGSize)` →
 //!   `offset_x`/`offset_y`; `.rotationEffect(.degrees(d))` → `rotation`;
 //!   `.scaleEffect(s)` → `scale`; `.animation(.curve(duration:), value:)` → an
@@ -996,6 +1005,194 @@ fn parse_transition_name(lex: &mut Lexer<'_>) -> Result<String, SwiftUIImportErr
     Ok(id)
 }
 
+/// Read a `key: value` argument list inside a gesture modifier's parens,
+/// collecting an integer `count:` (tap count) if present and any positional
+/// integer (the `.onLongPressGesture` form takes none, but `.onTapGesture` may
+/// be written `.onTapGesture(count: 2)`). Stops at — and consumes — the
+/// matching `)`. Returns the recognized tap `count`, if any.
+fn parse_gesture_count(lex: &mut Lexer<'_>) -> Result<Option<i64>, SwiftUIImportError> {
+    let mut count: Option<i64> = None;
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') => {
+                lex.advance();
+                break;
+            }
+            None => break,
+            Some(c) if c.is_ascii_alphabetic() => {
+                let key = lex.read_ident();
+                lex.skip_ws();
+                if lex.peek() == Some(b':') {
+                    lex.advance();
+                    lex.skip_ws();
+                    let v = parse_value(lex)?;
+                    if key == "count" {
+                        if let SwiftValue::Float(f) = v {
+                            count = Some(f as i64);
+                        }
+                    }
+                }
+            }
+            _ => {
+                lex.advance();
+            }
+        }
+        lex.skip_ws();
+        if lex.peek() == Some(b',') {
+            lex.advance();
+        }
+    }
+    Ok(count)
+}
+
+/// `.onTapGesture { }` → a `"click"` callback; `.onTapGesture(count: 2) { }` →
+/// a `tap_count` prop plus the `"click"` callback. The trailing action closure
+/// (if any) is recognized and skipped. Assumes `lex` is positioned just after
+/// the `onTapGesture` identifier.
+fn parse_tap_gesture(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+) -> Result<(), SwiftUIImportError> {
+    lex.skip_ws();
+    if lex.peek() == Some(b'(') {
+        lex.advance(); // (
+        if let Some(count) = parse_gesture_count(lex)? {
+            view.props
+                .push(("tap_count".into(), SwiftValue::Float(count as f64)));
+        }
+    }
+    lex.skip_ws();
+    if lex.peek() == Some(b'{') {
+        lex.advance();
+        lex.skip_balanced(b'{', b'}');
+    }
+    view.callbacks.push("click".into());
+    Ok(())
+}
+
+/// `.onLongPressGesture { }` (with optional `(minimumDuration:…)` args) → a
+/// `"longpress"` callback. Args and the trailing action closure are skipped.
+/// Assumes `lex` is positioned just after the `onLongPressGesture` identifier.
+fn parse_long_press_gesture(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+) -> Result<(), SwiftUIImportError> {
+    lex.skip_ws();
+    if lex.peek() == Some(b'(') {
+        lex.advance(); // (
+        lex.skip_balanced(b'(', b')');
+    }
+    lex.skip_ws();
+    if lex.peek() == Some(b'{') {
+        lex.advance();
+        lex.skip_balanced(b'{', b'}');
+    }
+    view.callbacks.push("longpress".into());
+    Ok(())
+}
+
+/// `.gesture(DragGesture().onChanged{…}.onEnded{…})` and friends.
+///
+/// Reads the gesture *value* inside `.gesture(...)` / `.simultaneousGesture(...)`
+/// / `.highPriorityGesture(...)`. The leading uppercase identifier names the
+/// recognizer (`DragGesture`, `MagnificationGesture`, `RotationGesture`, …);
+/// each recognizer maps to the callbacks it can emit:
+///   - `DragGesture` → `drag_changed` / `drag_ended` (only the phases that have
+///     an `.onChanged`/`.onEnded` handler in the chain)
+///   - `MagnificationGesture` → `magnify`
+///   - `RotationGesture` → `rotate`
+///
+/// `TapGesture`/`LongPressGesture` recognizers map to `click`/`longpress`.
+///
+/// Unknown recognizers are reported as [`Unsupported`]. Assumes `lex` is
+/// positioned just after the opening `(` of the `.gesture(` call. Reads to — and
+/// consumes — the matching close `)`.
+fn parse_gesture_value(
+    lex: &mut Lexer<'_>,
+    view: &mut SwiftView,
+    modifier_line: usize,
+) -> Result<(), SwiftUIImportError> {
+    lex.skip_ws();
+    // Recognizer name, e.g. `DragGesture`.
+    let recognizer = if lex
+        .peek()
+        .map(|c| c.is_ascii_alphabetic() || c == b'_')
+        .unwrap_or(false)
+    {
+        lex.read_ident()
+    } else {
+        String::new()
+    };
+    // Consume the recognizer's own constructor parens, e.g. `DragGesture()` or
+    // `DragGesture(minimumDistance: 10)`.
+    lex.skip_ws();
+    if lex.peek() == Some(b'(') {
+        lex.advance(); // (
+        lex.skip_balanced(b'(', b')');
+    }
+    // Walk the `.onChanged{…}.onEnded{…}` (or `.updating{…}`) handler chain,
+    // noting which phases are present, until the gesture call's close `)`.
+    let mut has_changed = false;
+    let mut has_ended = false;
+    loop {
+        lex.skip_ws();
+        match lex.peek() {
+            Some(b')') => {
+                lex.advance();
+                break;
+            }
+            None => break,
+            Some(b'.') => {
+                lex.advance(); // .
+                let phase = lex.read_ident();
+                match phase.as_str() {
+                    "onChanged" | "updating" => has_changed = true,
+                    "onEnded" => has_ended = true,
+                    _ => {}
+                }
+                lex.skip_ws();
+                if lex.peek() == Some(b'(') {
+                    lex.advance(); // (
+                    lex.skip_balanced(b'(', b')');
+                    lex.skip_ws();
+                }
+                if lex.peek() == Some(b'{') {
+                    lex.advance();
+                    lex.skip_balanced(b'{', b'}');
+                }
+            }
+            _ => {
+                lex.advance();
+            }
+        }
+    }
+    match recognizer.as_str() {
+        "DragGesture" => {
+            // Default to both phases if the chain named no handler at all.
+            if !has_changed && !has_ended {
+                has_changed = true;
+                has_ended = true;
+            }
+            if has_changed {
+                view.callbacks.push("drag_changed".into());
+            }
+            if has_ended {
+                view.callbacks.push("drag_ended".into());
+            }
+        }
+        "MagnificationGesture" | "MagnifyGesture" => view.callbacks.push("magnify".into()),
+        "RotationGesture" | "RotateGesture" => view.callbacks.push("rotate".into()),
+        "TapGesture" => view.callbacks.push("click".into()),
+        "LongPressGesture" => view.callbacks.push("longpress".into()),
+        other => view.unsupported.push(Unsupported {
+            line: modifier_line,
+            text: format!("gesture {other}"),
+        }),
+    }
+    Ok(())
+}
+
 /// After parsing a view's block/args, consume any `.modifier(...)` chains.
 fn apply_modifiers(
     lex: &mut Lexer<'_>,
@@ -1031,6 +1228,38 @@ fn apply_modifiers(
             }
             "tabItem" => {
                 parse_tab_item_modifier(lex, &mut view)?;
+                continue;
+            }
+            // ── gesture modifiers ────────────────────────────────────────────
+            // These carry a trailing action `{ … }` closure (and possibly an
+            // argument list) that has no view content — we recognize the gesture
+            // and lower it to callbacks/props rather than feed it to the generic
+            // `(args)` drain below.
+            "onTapGesture" => {
+                parse_tap_gesture(lex, &mut view)?;
+                continue;
+            }
+            "onLongPressGesture" => {
+                parse_long_press_gesture(lex, &mut view)?;
+                continue;
+            }
+            // `.gesture(...)` / `.simultaneousGesture(...)` / `.highPriorityGesture(...)`.
+            // The recognizer inside the parens decides the callbacks; the variant
+            // decides a `gesture_priority` prop (`simultaneous` / `high`).
+            "gesture" | "simultaneousGesture" | "highPriorityGesture" => {
+                let priority = match modifier.as_str() {
+                    "simultaneousGesture" => Some("simultaneous"),
+                    "highPriorityGesture" => Some("high"),
+                    _ => None,
+                };
+                if let Some(p) = priority {
+                    view.props
+                        .push(("gesture_priority".into(), SwiftValue::Ident(p.into())));
+                }
+                if lex.peek() == Some(b'(') {
+                    lex.advance(); // (
+                    parse_gesture_value(lex, &mut view, modifier_line)?;
+                }
                 continue;
             }
             // `.background` is overloaded: `.background(Color)` → a background
@@ -1235,9 +1464,6 @@ fn apply_modifiers(
             "hidden" => {
                 // `.hidden()` — empty parens.
                 view.props.push(("hidden".into(), SwiftValue::Bool(true)));
-            }
-            "onTapGesture" | "onLongPressGesture" => {
-                view.callbacks.push("click".into());
             }
             other => {
                 // A modifier with no IR home (e.g. .shadow, .animation,
@@ -2389,5 +2615,157 @@ mod tests {
             .unsupported
             .iter()
             .any(|u| u.text == "modifier .rotation3DEffect"));
+    }
+
+    // ── GST: gesture modifiers → callbacks / props ────────────────────────────
+
+    fn root_node(doc: &Document) -> &uni_ir::Node {
+        doc.get(doc.root().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn parse_on_tap_gesture_sets_click_callback() {
+        let doc = parse(r#"Text("Hi").onTapGesture { doThing() }"#).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("click"));
+        // No tap_count for the single-tap form.
+        assert!(!node.props.contains_key("tap_count"));
+    }
+
+    #[test]
+    fn parse_on_tap_gesture_count_sets_prop_and_callback() {
+        // `.onTapGesture(count: 2) { }` → tap_count prop + click callback.
+        let doc = parse(r#"Text("Hi").onTapGesture(count: 2) { doThing() }"#).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("click"));
+        assert_eq!(node.props.get("tap_count"), Some(&Value::Float(2.0)));
+    }
+
+    #[test]
+    fn parse_on_long_press_gesture_sets_longpress_callback() {
+        let doc = parse(r#"Text("Hi").onLongPressGesture { doThing() }"#).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("longpress"));
+        // A long press is NOT a click.
+        assert!(!node.callbacks.contains_key("click"));
+    }
+
+    #[test]
+    fn parse_on_long_press_gesture_with_args() {
+        // `.onLongPressGesture(minimumDuration: 1.0) { }` still lowers cleanly.
+        let doc =
+            parse(r#"Text("Hi").onLongPressGesture(minimumDuration: 1.0) { doThing() }"#).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("longpress"));
+    }
+
+    #[test]
+    fn parse_drag_gesture_changed_and_ended() {
+        let src = r#"Text("Hi").gesture(DragGesture().onChanged { v in handle(v) }.onEnded { v in done(v) })"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("drag_changed"));
+        assert!(node.callbacks.contains_key("drag_ended"));
+    }
+
+    #[test]
+    fn parse_drag_gesture_only_on_changed() {
+        // Only the `.onChanged` phase is present → only `drag_changed`.
+        let src = r#"Text("Hi").gesture(DragGesture().onChanged { v in handle(v) })"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("drag_changed"));
+        assert!(!node.callbacks.contains_key("drag_ended"));
+    }
+
+    #[test]
+    fn parse_drag_gesture_bare_defaults_both_phases() {
+        // `.gesture(DragGesture())` with no handlers → both phases offered.
+        let doc = parse(r#"Text("Hi").gesture(DragGesture())"#).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("drag_changed"));
+        assert!(node.callbacks.contains_key("drag_ended"));
+    }
+
+    #[test]
+    fn parse_magnification_gesture_sets_magnify() {
+        let src = r#"Image("photo").gesture(MagnificationGesture().onChanged { s in zoom(s) })"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("magnify"));
+    }
+
+    #[test]
+    fn parse_rotation_gesture_sets_rotate() {
+        let src = r#"Image("photo").gesture(RotationGesture().onChanged { a in spin(a) })"#;
+        let doc = parse(src).unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("rotate"));
+    }
+
+    #[test]
+    fn parse_simultaneous_gesture_priority_prop() {
+        let doc =
+            parse(r#"Text("Hi").simultaneousGesture(DragGesture().onEnded { v in done(v) })"#)
+                .unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("gesture_priority"),
+            Some(&Value::Text("simultaneous".into()))
+        );
+        assert!(node.callbacks.contains_key("drag_ended"));
+    }
+
+    #[test]
+    fn parse_high_priority_gesture_priority_prop() {
+        let doc = parse(
+            r#"Text("Hi").highPriorityGesture(TapGesture().onEnded { tapped() })"#,
+        )
+        .unwrap();
+        let node = root_node(&doc);
+        assert_eq!(
+            node.props.get("gesture_priority"),
+            Some(&Value::Text("high".into()))
+        );
+        // A TapGesture recognizer lowers to a click.
+        assert!(node.callbacks.contains_key("click"));
+    }
+
+    #[test]
+    fn unknown_gesture_recognizer_is_reported() {
+        // `HoverGesture` has no IR home — recorded, not silently eaten.
+        let report =
+            parse_with_report(r#"Text("Hi").gesture(HoverGesture().onChanged { h() })"#).unwrap();
+        assert!(
+            report.unsupported.iter().any(|u| u.text == "gesture HoverGesture"),
+            "expected unknown gesture report, got {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn gesture_modifiers_not_reported_unsupported() {
+        // Regression: supported gesture modifiers must not be flagged as drops.
+        let report = parse_with_report(
+            r#"Text("Hi").onTapGesture { a() }.gesture(DragGesture().onEnded { b() })"#,
+        )
+        .unwrap();
+        assert!(
+            report.unsupported.is_empty(),
+            "gestures should lower, not report: {:?}",
+            report.unsupported
+        );
+    }
+
+    #[test]
+    fn gesture_chain_continues_to_following_modifier() {
+        // A modifier after the gesture chain still parses (cursor left clean).
+        let doc = parse(
+            r#"Text("Hi").gesture(DragGesture().onChanged { v() }).padding(8)"#,
+        )
+        .unwrap();
+        let node = root_node(&doc);
+        assert!(node.callbacks.contains_key("drag_changed"));
+        assert_eq!(node.props.get("padding"), Some(&Value::Px(8.0)));
     }
 }

@@ -62,4 +62,45 @@ pub enum InputEvent {
     KeyDown { key: String },
     /// A key was released. See [`InputEvent::KeyDown`] for the `key` naming.
     KeyUp { key: String },
+    /// A **pinch/magnify** gesture step: `delta` is the incremental change in
+    /// magnification factor since the previous step (so successive deltas
+    /// *multiply* into a running scale; `0.0` is no change, `+0.1` grows by 10%).
+    ///
+    /// Desktop winit has no first-class multitouch pinch in the renderer-agnostic
+    /// path, so this variant is **additive and default-safe**: the winit
+    /// translator never emits it today. It exists so a trackpad/touch backend —
+    /// or a test / an AI driving the surface programmatically — can feed a pinch
+    /// to the gesture recognizers without inventing a side channel.
+    Pinch { delta: f32 },
+    /// A **rotation** gesture step: `delta` is the incremental change in angle
+    /// (radians, counter-clockwise positive) since the previous step; successive
+    /// deltas *sum* into a running rotation.
+    ///
+    /// Like [`InputEvent::Pinch`], this is additive and default-safe — emitted by
+    /// a touch/trackpad backend or fed programmatically, never by the desktop
+    /// winit translator in v0.
+    Rotate { delta: f32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The additive pinch/rotate variants carry their delta and compare by value
+    /// (so a recognizer can pattern-match and a test can assert on them).
+    #[test]
+    fn pinch_and_rotate_carry_delta() {
+        assert_eq!(
+            InputEvent::Pinch { delta: 0.25 },
+            InputEvent::Pinch { delta: 0.25 }
+        );
+        assert_ne!(
+            InputEvent::Rotate { delta: 0.1 },
+            InputEvent::Rotate { delta: 0.2 }
+        );
+        match (InputEvent::Pinch { delta: -0.3 }) {
+            InputEvent::Pinch { delta } => assert_eq!(delta, -0.3),
+            _ => unreachable!("constructed a Pinch"),
+        }
+    }
 }
