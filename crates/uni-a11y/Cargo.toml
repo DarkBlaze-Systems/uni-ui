@@ -6,3 +6,6 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+uni-ir = { path = "../uni-ir" }
+uni-core = { path = "../uni-core" }
+accesskit = "0.24"
