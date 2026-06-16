@@ -1,0 +1,6 @@
+/target
+**/target
+*-target/
+*.env
+mcp.env
+darkai_api-approved.md

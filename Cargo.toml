@@ -1,0 +1,30 @@
+# DarkBlaze Uni-UI — engine workspace.
+#
+# A clean-room, Rust-native declarative UI engine. Owned outright; destined
+# for the BSL "Sanity License". NOT a Slint fork — we share none of Slint's
+# (or any copyleft) source. Every dependency is permissive (MIT/Apache/BSD).
+#
+# Clean-room rule, binding: no crate here may read, vendor, or port GPL
+# `i-slint-*` code or Apple-private framework internals. Frontends are
+# reconstructed from public documentation only.
+#
+# Architecture: ../research/engine/00-ENGINE-ARCHITECTURE.md
+# Dev plan:     ./DEV-PLAN.md
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/uni-ir",
+    "crates/uni-tokens",
+    "crates/uni-react",
+    "crates/uni-render",
+    "crates/uni-dsl",
+    "crates/uni-core",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+authors = ["DarkBlaze"]
+publish = false
+# license: LicenseRef-DarkBlaze-Sanity (BSL 1.1 + no-compete grant) — to be finalized.
