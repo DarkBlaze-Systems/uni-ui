@@ -2,6 +2,62 @@ DarkBlaze Sanity License, Version 1.0
 
 Copyright (c) 2026 T. Billy Ekkerd, trading as DarkBlaze Systems.
 
+================================================================================
+                     PLAIN-LANGUAGE SUMMARY — READ THIS FIRST
+================================================================================
+
+This summary is written in plain words on purpose. You should not need a lawyer
+to understand what we mean. The numbered legal sections further down are the
+binding text in a courtroom, but we wrote both halves to say the SAME thing —
+the summary does not hide anything the legal text does. (If a court ever finds a
+genuine conflict between the two, the detailed legal sections control.)
+
+OUR INTENT — plainly.
+  We built DarkBlaze Uni-UI to be open: open to read, to study, to learn from,
+  and to use. We are not locking it in a vault. We WANT you to use it.
+
+THE ONE RULE.
+  Do not take this engine — or a copy or fork of it — and sell or offer it to
+  other people as a competing UI engine, or as a hosted "UI-as-a-service."
+  That single reserved right is the whole point of this license, and we only
+  hold it until the Change Date below.
+
+WHY THIS RULE EXISTS — our reasons.
+  So the engine stays coherent and well-stewarded instead of being splintered
+  into a dozen incompatible commercial clones, and so the people building it can
+  keep building it. This is stewardship, not a cage.
+
+WHAT YOU MAY DO (freely, no permission needed).
+  Use it. Modify it. Fork it. Build and ship your own apps and products on top
+  of it — including commercial ones. Use it internally, for research, for
+  education, for evaluation. Run it anywhere. None of that needs to ask us.
+
+THE FINALITY — this is not forever.
+  On 16 June 2030 (the Change Date) EVERY restriction in this license ends, and
+  the software converts permanently to the Apache License 2.0 — fully free, for
+  everyone, forever. We cannot quietly take that back; the conversion is built
+  in and irreversible.
+
+CAUSE AND EFFECT — what happens if you break the one rule.
+  Cause: you use the Licensed Work outside the permission above (i.e. you offer
+         it to third parties as a competing UI engine or UI-as-a-service).
+  Effect: your rights under this license END AUTOMATICALLY, the instant the
+         violation occurs — no notice, no warning, no grace period. From that
+         moment you have NO right to use, copy, modify, or distribute this
+         software, and continued use is infringement. Where we find misuse, we
+         will act on it. The protective terms (warranty, liability, etc.) keep
+         applying to you even after your rights end.
+
+NO SURPRISES.
+  We give NO warranty — the software is provided "as is" — except for the things
+  the law of your country says we are not allowed to disclaim. We respect your
+  local consumer and author-protection rights; this license bends to those, not
+  the other way around.
+
+That is the whole deal, in plain sight. The detailed terms follow.
+
+================================================================================
+
                              == PARAMETERS ==
 
 Licensor:             T. Billy Ekkerd, trading as DarkBlaze Systems.
