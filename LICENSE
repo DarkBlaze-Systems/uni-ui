@@ -1,0 +1,28 @@
+DarkBlaze Uni-UI — License Notice (INTERIM)
+
+Copyright (c) 2026 DarkBlaze Systems. All rights reserved.
+
+This source is published publicly for transparency and provenance. It is
+destined to be released under the "DarkBlaze Sanity License" — a Business
+Source License (BSL 1.1) variant carrying a no-compete Additional Use Grant
+and a Change Date on which it converts to an open-source license.
+
+UNTIL that license is finalized and applied, this is published under
+all-rights-reserved terms: no rights to use, copy, modify, or distribute this
+software are granted, except (a) viewing the source, and (b) any rights
+required by the licenses of its third-party dependencies. A permissive license
+will only ever broaden these terms, never narrow your viewing rights.
+
+CLEAN-ROOM NOTICE
+-----------------
+Uni-UI is an independent, clean-room implementation. It depends only on
+permissively licensed (MIT / Apache-2.0 / BSD / Zlib) crates and contains no
+source copied from GPL/copyleft projects — including, explicitly, none of
+Slint's `i-slint-*` crates — and none from any proprietary framework. Any
+language or API surface it accepts (e.g. importers) is reconstructed from
+public documentation only.
+
+Third-party permissive components retain their own licenses; their required
+attribution / NOTICE accompanies distributed builds.
+
+Questions: open an issue, or contact DarkBlaze Systems.
