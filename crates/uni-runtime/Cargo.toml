@@ -1,0 +1,15 @@
+[package]
+name = "uni-runtime"
+description = "DarkBlaze Uni-UI — the app/event-loop layer: closes the accountability circle (input -> hit-test -> fire(Origin) -> handler -> re-render) into the live UI."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-ir = { path = "../uni-ir" }
+uni-core = { path = "../uni-core" }
+uni-render = { path = "../uni-render" }
+uni-react = { path = "../uni-react" }
+uni-dsl = { path = "../uni-dsl" }
+winit = "0.30"

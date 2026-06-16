@@ -7,9 +7,6 @@
 # Architecture: organized by THE FLOW — own the trait spine, isolate every
 # backend as a swappable leaf behind it. See ./FLOW.md.
 #
-# Clean-room rule, binding: no crate here may read, vendor, or port GPL
-# `i-slint-*` code or Apple-private framework internals.
-#
 # Build note: build on the home filesystem (engine/target), NEVER /tmp
 # (a 3GB tmpfs that quota-fails on the GPU dependency tree).
 
@@ -27,6 +24,7 @@ members = [
     "crates/uni-simd",
     "crates/uni-a11y",
     "crates/uni-webframe",
+    "crates/uni-runtime",
 ]
 
 [workspace.package]
