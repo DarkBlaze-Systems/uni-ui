@@ -4,5 +4,28 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 publish.workspace = true
+description = "Uni-UI rendering backend — renderer-agnostic Scene/DrawCmd API + a wgpu backend (lyon tessellation + cosmic-text/glyphon)."
+
+# All dependencies are permissive (MIT / Apache-2.0 / BSD), per the workspace
+# clean-room rule. No copyleft, no i-slint-* source.
 
 [dependencies]
+# Windowing + surface handle abstraction.
+winit = "0.30"
+raw-window-handle = "0.6"
+
+# GPU.
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+
+# Vector path tessellation (rounded rects -> triangles).
+lyon = "1.0"
+
+# Text shaping/layout + GPU atlas drawing.
+cosmic-text = "0.12"
+glyphon = "0.6"
+
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
