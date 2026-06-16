@@ -1,0 +1,12 @@
+[package]
+name = "uni-reactor"
+description = "DarkBlaze Uni-UI — reactive evaluation: a state store that resolves $bindings and expands If/For, making the DSL live."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-ir = { path = "../uni-ir" }
+uni-react = { path = "../uni-react" }
+uni-core = { path = "../uni-core" }

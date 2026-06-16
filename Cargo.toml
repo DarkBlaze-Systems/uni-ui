@@ -25,6 +25,8 @@ members = [
     "crates/uni-a11y",
     "crates/uni-webframe",
     "crates/uni-runtime",
+    "crates/uni-widgets",
+    "crates/uni-reactor",
 ]
 
 [workspace.package]
